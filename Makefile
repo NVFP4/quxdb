@@ -73,3 +73,7 @@ stop-prom: ## Stop monitoring services
 reset-prom: ## Reset monitoring services
 	# make sure this is docker & podman friendly
 	docker compose -f $(MONITORING_COMPOSE) down --remove-orphans --volumes
+
+.PHONY: build-stress
+build-stress:
+	$(MAKE) -C stress build
