@@ -31,3 +31,7 @@ go.work.sum
 # OS Garbage
 .DS_Store
 Thumbs.db
+
+# project files
+quxdata
+
