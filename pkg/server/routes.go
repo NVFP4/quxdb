@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/metrics"
 
 	"github.com/yashgorana/quxdb/pkg/db"
 )
@@ -13,6 +14,10 @@ func setupHttpRoutes(db *db.QuxDB) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
+	r.Use(metrics.Collector(metrics.CollectorOpts{
+		Host:  false,
+		Proto: true,
+	}))
 
 	r.Get("/", indexHandler)
 	r.Get("/health", healthHandler)
@@ -22,6 +27,7 @@ func setupHttpRoutes(db *db.QuxDB) http.Handler {
 		r.Put("/{key}", hPutKey(db))
 		r.Delete("/{key}", hDeleteKey(db))
 	})
+	r.Handle("/metrics", metrics.Handler())
 
 	return r
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/yashgorana/quxdb/pkg/db"
@@ -16,12 +17,16 @@ func hGetKey(db *db.QuxDB) http.HandlerFunc {
 			return
 		}
 
+		getStart := time.Now()
 		value, ok := db.Get([]byte(key))
+		dur := time.Since(getStart)
+
 		if !ok {
 			http.Error(w, "key not found", http.StatusNotFound)
 			return
 		}
 
+		dbGetDuration.Observe(dur.Seconds())
 
 		RenderBinary(w, r, http.StatusOK, value)
 	}

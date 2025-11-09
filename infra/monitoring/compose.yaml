@@ -1,0 +1,64 @@
+services:
+    prometheus:
+        image: docker.io/prom/prometheus:latest
+        container_name: prometheus
+        ports:
+            - "9090:9090"
+        volumes:
+            - ./prometheus.yml:/etc/prometheus/prometheus.yml
+            - prometheus-data:/prometheus
+        extra_hosts:
+            - "host.containers.internal:host-gateway"
+        healthcheck:
+            test:
+                [
+                    "CMD-SHELL",
+                    "wget -q -O /dev/null http://localhost:9090/-/ready || exit 1",
+                ]
+            interval: 30s
+            timeout: 5s
+            retries: 5
+            start_period: 15s
+
+    renderer:
+        image: docker.io/grafana/grafana-image-renderer:latest
+        container_name: renderer
+        healthcheck:
+            test:
+                [
+                    "CMD-SHELL",
+                    "wget -q -O /dev/null http://localhost:8081/metrics || exit 1",
+                ]
+            interval: 30s
+            timeout: 5s
+            retries: 5
+            start_period: 20s
+
+    grafana:
+        image: docker.io/grafana/grafana-oss:latest
+        container_name: grafana
+        ports:
+            - "3000:3000"
+        volumes:
+            - ./grafana.ini:/etc/grafana/grafana.ini:ro
+            - grafana-data:/var/lib/grafana
+        environment:
+            GF_SECURITY_ADMIN_PASSWORD: admin
+            GF_RENDERING_SERVER_URL: http://renderer:8081/render
+            GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+        healthcheck:
+            test:
+                [
+                    "CMD",
+                    "wget -q -O /dev/null http://localhost:3000/api/health || exit 1",
+                ]
+            interval: 30s
+            timeout: 5s
+            retries: 5
+            start_period: 30s
+        depends_on:
+            - renderer
+
+volumes:
+    grafana-data:
+    prometheus-data:

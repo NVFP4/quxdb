@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/yashgorana/quxdb/pkg/db"
@@ -39,11 +40,16 @@ func hPutKey(db *db.QuxDB) http.HandlerFunc {
 		}
 
 		// write to store
-		if err := db.Set([]byte(key), body); err != nil {
+		putStart := time.Now()
+		err = db.Set([]byte(key), body)
+		dur := time.Since(putStart)
+
+		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to set value: %v", err), http.StatusInternalServerError)
 			return
 		}
 
+		dbPutDuration.Observe(dur.Seconds())
 
 		RenderBinary(w, r, http.StatusOK, body)
 	}
