@@ -8,7 +8,7 @@ import (
 const (
 	DefaultHost    = "0.0.0.0"
 	DefaultPort    = 7129
-	DefaultDataDir = "quxdata"
+	DefaultDataDir = "./quxdata"
 )
 
 type QuxServerConfig struct {

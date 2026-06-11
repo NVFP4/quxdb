@@ -6,6 +6,11 @@ import (
 	"net/http"
 )
 
+func RenderAny(w http.ResponseWriter, r *http.Request, status int, v []byte) {
+	w.WriteHeader(status)
+	w.Write(v)
+}
+
 func RenderPlainText(w http.ResponseWriter, r *http.Request, status int, v string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)

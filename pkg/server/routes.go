@@ -6,6 +6,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/yashgorana/quxdb/pkg/db"
 )
@@ -13,7 +15,7 @@ import (
 func setupHttpRoutes(db *db.QuxDB) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Logger)
+	// r.Use(middleware.Logger)
 	r.Use(metrics.Collector(metrics.CollectorOpts{
 		Host:  false,
 		Proto: true,
@@ -27,7 +29,10 @@ func setupHttpRoutes(db *db.QuxDB) http.Handler {
 		r.Put("/{key}", hPutKey(db))
 		r.Delete("/{key}", hDeleteKey(db))
 	})
-	r.Handle("/metrics", metrics.Handler())
+	r.Mount("/metrics", promhttp.HandlerFor(
+		prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{EnableOpenMetrics: true},
+	))
 
 	return r
 }

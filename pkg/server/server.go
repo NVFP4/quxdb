@@ -3,13 +3,13 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/yashgorana/quxdb/pkg/db"
-	"github.com/yashgorana/quxdb/pkg/version"
 )
 
 type QuxServer struct {
@@ -17,26 +17,28 @@ type QuxServer struct {
 	db     *db.QuxDB
 }
 
-func NewServer(config QuxServerConfig) *QuxServer {
+func NewServer(config QuxServerConfig) (*QuxServer, error) {
+	db, err := db.New(config.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	return &QuxServer{
 		config: config,
-		db:     db.New(config.DataDir),
-	}
+		db:     db,
+	}, nil
 }
 
 func (s *QuxServer) StartWithContext(ctx context.Context) error {
-	fmt.Printf("quxdb %s\n", version.Detailed)
-
 	addr := s.config.Addr()
 
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: setupHttpRoutes(s.db),
 		// Configs
-		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1 MB
 		TLSConfig: &tls.Config{
 			// Force TLS 1.3 to ensure modern ciphers and better performance
@@ -49,11 +51,11 @@ func (s *QuxServer) StartWithContext(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("bind %q: %w", addr, err)
+		return fmt.Errorf("quxdb server: %w", err)
 	}
 
 	go func() {
-		fmt.Printf("starting quxserver on http://%s\n", addr)
+		fmt.Printf("quxdb server: http://%s\n", addr)
 		if srvErr := srv.Serve(ln); srvErr != nil && srvErr != http.ErrServerClosed {
 			errCh <- srvErr // http.Serve crashed
 		}
@@ -68,18 +70,26 @@ func (s *QuxServer) StartWithContext(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		fmt.Println("server context cancelled. stopping gracefully...")
-		defer fmt.Println("server stopped")
+		var errs []error
 
-		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		fmt.Println("server context cancelled")
+
+		// give 60s for server to stop and drain connections
+		stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
+		// first stop server
 		if err := srv.Shutdown(stopCtx); err != nil {
 			_ = srv.Close() // force close if graceful shutdown fails
-			return fmt.Errorf("failed to stop server: %w", err)
+			errs = append(errs, err)
+		}
+		fmt.Println("server stopped")
+
+		if err := s.db.Stop(stopCtx); err != nil {
+			errs = append(errs, err)
 		}
 
-		return nil
+		return errors.Join(errs...)
 	case err := <-errCh:
 		close(errCh)
 		return err

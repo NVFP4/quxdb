@@ -7,5 +7,6 @@ scrape_configs:
       - targets: ["localhost:9090"]
 
   - job_name: "quxdb"
+    scrape_native_histograms: true
     static_configs:
       - targets: ["host.containers.internal:7129"]
