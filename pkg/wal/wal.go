@@ -138,14 +138,14 @@ func (w *WAL) AppendBatch(batch [][]byte) (lsns []LSN, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-append:
+retry:
 	lsns, err = w.writer.appendBatch(w.activeSegment, batch, 0x00)
 	if err != nil {
 		if errors.Is(err, errSegmentInsufficientSpace) {
 			err = w.rolloverLocked()
 			if err == nil {
 				// rollover was a success, retry
-				goto append
+				goto retry
 			}
 		}
 		return
@@ -174,6 +174,9 @@ func (w *WAL) Replay(fn func(Record) error) (LSN, error) {
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					// this segment is over, continue to next one
+					if seg != w.activeSegment {
+						seg.close()
+					}
 					break
 				}
 				return lsn, err
@@ -216,6 +219,9 @@ func (w *WAL) rolloverLocked() error {
 	}
 
 	w.segments = append(w.segments, seg)
+	if w.activeSegment != nil {
+		w.activeSegment.close()
+	}
 	w.activeSegment = seg
 
 	return nil

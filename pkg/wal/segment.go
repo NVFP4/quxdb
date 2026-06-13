@@ -1,10 +1,12 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/yashgorana/quxdb/pkg/fs"
@@ -25,6 +27,8 @@ type walSegment struct {
 	ts       time.Time
 	flags    uint32
 	sid      segID
+
+	closed atomic.Bool
 }
 
 func segmentName(id segID) string {
@@ -64,12 +68,12 @@ func newSegment(dir string, id segID) (*walSegment, error) {
 		startLSN: newLSN(sid, offset),
 		ts:       time.Unix(int64(h.ts), 0).UTC(),
 	}
+	seg.closed.Store(false)
 
 	return seg, nil
 }
 
 func openSegment(segPath string) (*walSegment, error) {
-
 	file, err := os.OpenFile(segPath, os.O_CREATE|os.O_RDWR, 0o755)
 	if err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
@@ -107,15 +111,20 @@ func openSegment(segPath string) (*walSegment, error) {
 		startLSN: newLSN(sid, startOffset),
 		ts:       time.Unix(int64(h.ts), 0).UTC(),
 	}
+	seg.closed.Store(false)
 
 	return seg, nil
 }
 
 func (s *walSegment) close() error {
-	if s.file == nil {
+	if s.file == nil || s.closed.Load() {
 		return nil
 	}
-	return s.file.Close()
+	if err := s.file.Close(); err != nil {
+		return err
+	}
+	s.closed.Store(true)
+	return nil
 }
 
 func (s *walSegment) size() int64 {
@@ -135,10 +144,27 @@ func (s *walSegment) read(lsn LSN) (*walRecord, LSN, error) {
 	if offset >= s.cursor {
 		return nil, 0, io.EOF
 	}
+retry:
 	rec, n, err := readRecord(s.file, offset)
 	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			if err := s.reopen(); err != nil {
+				return nil, 0, err
+			}
+			goto retry
+		}
 		return nil, 0, err
 	}
 	nextOffset := offset + int64(n)
 	return rec, newLSN(s.sid, nextOffset), nil
+}
+
+func (s *walSegment) reopen() error {
+	file, err := os.OpenFile(s.path, os.O_CREATE|os.O_RDWR, 0o755)
+	if err != nil {
+		return err
+	}
+	s.file = file
+	s.closed.Store(false)
+	return nil
 }

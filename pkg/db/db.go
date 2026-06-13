@@ -1,11 +1,14 @@
 package db
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yashgorana/quxdb/pkg/bufpool"
@@ -16,19 +19,25 @@ import (
 )
 
 const (
-	memTableType = memtable.Map
+	memTableType = memtable.BTree
 	maxBatch     = 128
 )
 
 type QuxDB struct {
-	dataDir string
+	seq atomic.Uint64
+	_   [56]byte // cache line padding
 
-	mt  memtable.MemTable // active mem table
-	wal *wal.WAL
+	dataDir string
 
 	reqPool sync.Pool
 	reqChan chan *writeReq
-	walBuf  [][]byte
+
+	wal    *wal.WAL
+	walBuf [][]byte
+
+	amt   atomic.Pointer[quxMemtable] // active mem table
+	imt   []*quxMemtable
+	imtMu sync.RWMutex
 }
 
 func New(dataDir string) (*QuxDB, error) {
@@ -48,41 +57,48 @@ func New(dataDir string) (*QuxDB, error) {
 
 	db := &QuxDB{
 		dataDir: dataDir,
-		mt:      memtable.New(memTableType),
 		wal:     wal,
+		imt:     make([]*quxMemtable, 0, 4),
 		reqChan: make(chan *writeReq, 4096),
 		walBuf:  make([][]byte, 0, maxBatch),
 	}
 
+	db.amt.Store(newQuxMemtable())
+
 	db.reqPool.New = func() any {
-		return &writeReq{
-			done: make(chan struct{}, 1),
-		}
+		return newWriteReq()
 	}
 
 	return db, nil
 }
 
 func (db *QuxDB) Start(ctx context.Context) error {
-	fmt.Printf("db started with dir=%s memtable=%s\n", db.dataDir, memTableType)
-
 	if err := db.wal.Open(); err != nil {
 		return err
 	}
 
+	fmt.Printf("db replaying wal...\n")
+
+	var kv kvPair
+	var keys uint64
 	lsn, err := db.wal.Replay(func(r wal.Record) error {
-		var item kvItem
-		item.Decode(r.Data)
-		return db.doMemtableOp(item.op, item.key, item.val)
+		keys++
+		kv.Decode(r.Data)
+		return db.setMt(kv.qkey, kv.val, r.LSN)
 	})
 	if err != nil {
 		fmt.Printf("replay: %v\ntruncating to lsn=%d\n", err, lsn)
 		db.wal.TruncateFrom(lsn)
 	}
 
-	fmt.Printf("memtable: keys=%d\n", db.mt.Len())
+	// restore last known sequence number
+	if kv.qkey != nil {
+		db.seq.Store(seqFromQuxKey(kv.qkey))
+	}
 
 	go db.writeLoop()
+
+	fmt.Printf("db started with dir=%s memtable=%s keys=%d seq=%d\n", db.dataDir, memTableType, keys, db.seq.Load())
 
 	return nil
 }
@@ -99,7 +115,41 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 }
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool) {
-	return db.mt.Get(key)
+	readSeq := db.seq.Load()
+	lookupKey := newQuxKey(key, readSeq, opMax)
+
+	if value, found, ok := getFromMemtable(db.amt.Load(), key, lookupKey); found {
+		return value, ok
+	}
+
+	db.imtMu.RLock()
+	imt := db.imt
+	db.imtMu.RUnlock()
+
+	for i := len(imt) - 1; i >= 0; i-- {
+		if value, found, ok := getFromMemtable(imt[i], key, lookupKey); found {
+			return value, ok
+		}
+	}
+
+	return nil, false
+}
+
+func getFromMemtable(mt *quxMemtable, key, lookupKey []byte) (value []byte, found bool, ok bool) {
+	internalKey, value, ok := mt.SeekGE(lookupKey)
+	if !ok {
+		return nil, false, false
+	}
+
+	userKey, _, op := decodeQuxKey(internalKey)
+	if !bytes.Equal(userKey, key) {
+		return nil, false, false
+	}
+	if op == opDelete {
+		return nil, true, false
+	}
+
+	return value, true, true
 }
 
 func (db *QuxDB) Delete(key []byte) error {
@@ -109,18 +159,49 @@ func (db *QuxDB) Delete(key []byte) error {
 }
 
 func (db *QuxDB) All() iter.Seq2[[]byte, []byte] {
-	return db.mt.All()
+	return db.Range(nil, nil)
 }
 
 func (db *QuxDB) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
-	return db.mt.Range(start, end)
+	return func(yield func([]byte, []byte) bool) {
+		readSeq := db.seq.Load()
+		mt := db.amt.Load()
+
+		var iter memtable.Iterator
+		if start != nil {
+			iter = mt.IterFrom(newQuxKey(start, readSeq, opMax))
+		} else {
+			iter = mt.Iter()
+		}
+
+		var lastUserKey []byte
+		for internalKey, value := range iter {
+			userKey, seq, op := decodeQuxKey(internalKey)
+			if end != nil && bytes.Compare(userKey, end) > 0 {
+				return
+			}
+			if lastUserKey != nil && bytes.Equal(userKey, lastUserKey) {
+				continue
+			}
+			if seq > readSeq {
+				continue
+			}
+
+			lastUserKey = bytes.Clone(userKey)
+			if op == opDelete {
+				continue
+			}
+			if !yield(userKey, value) {
+				return
+			}
+		}
+	}
 }
 
-func (db *QuxDB) enqueueWrite(key, val []byte, op uint8) *writeReq {
+func (db *QuxDB) enqueueWrite(key, val []byte, op dbOP) *writeReq {
 	w := db.reqPool.Get().(*writeReq)
-	w.key = key
+	w.qkey = newQuxKey(key, db.seq.Add(1), op)
 	w.val = val
-	w.op = op
 	w.res = writeResult{}
 	w.enqueuedAt = time.Now()
 
@@ -132,9 +213,8 @@ func (db *QuxDB) awaitResult(req *writeReq) writeResult {
 	<-req.done
 	res := req.res
 
-	req.key = nil
+	req.qkey = nil
 	req.val = nil
-	req.op = 0
 	req.res = writeResult{}
 	db.reqPool.Put(req)
 
@@ -209,10 +289,9 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 
 	memStart := time.Now()
 	if err == nil {
-		for _, req := range batch {
-			if err = db.doMemtableOp(req.op, req.key, req.val); err != nil {
-				fmt.Println("FATAL: Memtable update failed after WAL sync")
-				panic(err)
+		for i, req := range batch {
+			if err = db.setMt(req.qkey, req.val, lsns[i]); err != nil {
+				panic(fmt.Sprintf("unknown error %v", err))
 			}
 		}
 	}
@@ -256,13 +335,41 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	db.walBuf = db.walBuf[:0]
 }
 
-func (db *QuxDB) doMemtableOp(op uint8, key, val []byte) error {
-	switch op {
-	case opSet:
-		return db.mt.Set(key, val)
-	case opDelete:
-		return db.mt.Delete(key)
-	default:
-		return fmt.Errorf("the fuck is this op")
+func (db *QuxDB) setMt(qkey quxKey, val []byte, lsn wal.LSN) error {
+retry:
+	err := db.amt.Load().Set(qkey, val)
+	if err != nil {
+		if errors.Is(err, memtable.ErrMemtableFull) {
+			db.rolloverMemtable(seqFromQuxKey(qkey), lsn)
+			goto retry
+		}
+		return err
+	}
+	return nil
+}
+
+func (db *QuxDB) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) {
+	amt := db.amt.Load()
+	// set seq/lsn info to active mem table
+	amt.lastLSN = lastLSN
+	amt.lastSeq = lastSeq
+	// append active to imt
+	db.imtMu.Lock()
+	db.imt = append(db.imt, amt)
+	db.imtMu.Unlock()
+
+	db.amt.Store(newQuxMemtable())
+	fmt.Printf("froze memtable keys=%d size=%.2fMB lastSeq=%d lastLSN=%d\n", amt.Len(), float64(amt.SizeBytes())/(1024*1024), amt.lastSeq, amt.lastLSN)
+}
+
+type quxMemtable struct {
+	memtable.Memtable
+	lastLSN wal.LSN
+	lastSeq uint64
+}
+
+func newQuxMemtable() *quxMemtable {
+	return &quxMemtable{
+		Memtable: memtable.New(memTableType, memtable.WithComparator(compareInternalKey)),
 	}
 }
