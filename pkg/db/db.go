@@ -79,12 +79,12 @@ func (db *QuxDB) Start(ctx context.Context) error {
 
 	fmt.Printf("db replaying wal...\n")
 
-	var kv kvPair
+	var kv quxKV
 	var keys uint64
 	lsn, err := db.wal.Replay(func(r wal.Record) error {
 		keys++
 		kv.Decode(r.Data)
-		return db.setMt(kv.qkey, kv.val, r.LSN)
+		return db.setMemtable(kv, r.LSN)
 	})
 	if err != nil {
 		fmt.Printf("replay: %v\ntruncating to lsn=%d\n", err, lsn)
@@ -93,7 +93,7 @@ func (db *QuxDB) Start(ctx context.Context) error {
 
 	// restore last known sequence number
 	if kv.qkey != nil {
-		db.seq.Store(seqFromQuxKey(kv.qkey))
+		db.seq.Store(kv.qkey.Seq())
 	}
 
 	go db.writeLoop()
@@ -109,14 +109,14 @@ func (db *QuxDB) Stop(ctx context.Context) error {
 }
 
 func (db *QuxDB) Set(key []byte, value []byte) error {
-	req := db.enqueueWrite(key, value, opSet)
+	req := db.enqueueWrite(key, value, quxOpSet)
 	res := db.awaitResult(req)
 	return res.err
 }
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 	readSeq := db.seq.Load()
-	lookupKey := newQuxKey(key, readSeq, opMax)
+	lookupKey := newQuxKey(key, readSeq, quxOpMax)
 
 	if value, found, ok := getFromMemtable(db.amt.Load(), key, lookupKey); found {
 		return value, ok
@@ -135,17 +135,17 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 	return nil, false
 }
 
-func getFromMemtable(mt *quxMemtable, key, lookupKey []byte) (value []byte, found bool, ok bool) {
+func getFromMemtable(mt *quxMemtable, key []byte, lookupKey quxKey) (value []byte, found bool, ok bool) {
 	internalKey, value, ok := mt.SeekGE(lookupKey)
 	if !ok {
 		return nil, false, false
 	}
 
-	userKey, _, op := decodeQuxKey(internalKey)
+	userKey, _, op := quxKey(internalKey).Decode()
 	if !bytes.Equal(userKey, key) {
 		return nil, false, false
 	}
-	if op == opDelete {
+	if op == quxOpDelete {
 		return nil, true, false
 	}
 
@@ -153,7 +153,7 @@ func getFromMemtable(mt *quxMemtable, key, lookupKey []byte) (value []byte, foun
 }
 
 func (db *QuxDB) Delete(key []byte) error {
-	req := db.enqueueWrite(key, nil, opDelete)
+	req := db.enqueueWrite(key, nil, quxOpDelete)
 	res := db.awaitResult(req)
 	return res.err
 }
@@ -169,14 +169,14 @@ func (db *QuxDB) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 
 		var iter memtable.Iterator
 		if start != nil {
-			iter = mt.IterFrom(newQuxKey(start, readSeq, opMax))
+			iter = mt.IterFrom(newQuxKey(start, readSeq, quxOpMax))
 		} else {
 			iter = mt.Iter()
 		}
 
 		var lastUserKey []byte
 		for internalKey, value := range iter {
-			userKey, seq, op := decodeQuxKey(internalKey)
+			userKey, seq, op := quxKey(internalKey).Decode()
 			if end != nil && bytes.Compare(userKey, end) > 0 {
 				return
 			}
@@ -188,7 +188,7 @@ func (db *QuxDB) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 			}
 
 			lastUserKey = bytes.Clone(userKey)
-			if op == opDelete {
+			if op == quxOpDelete {
 				continue
 			}
 			if !yield(userKey, value) {
@@ -198,10 +198,10 @@ func (db *QuxDB) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 	}
 }
 
-func (db *QuxDB) enqueueWrite(key, val []byte, op dbOP) *writeReq {
+func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) *writeReq {
 	w := db.reqPool.Get().(*writeReq)
-	w.qkey = newQuxKey(key, db.seq.Add(1), op)
-	w.val = val
+	w.kv.qkey = newQuxKey(key, db.seq.Add(1), op)
+	w.kv.val = val
 	w.res = writeResult{}
 	w.enqueuedAt = time.Now()
 
@@ -213,8 +213,7 @@ func (db *QuxDB) awaitResult(req *writeReq) writeResult {
 	<-req.done
 	res := req.res
 
-	req.qkey = nil
-	req.val = nil
+	req.kv = quxKV{}
 	req.res = writeResult{}
 	db.reqPool.Put(req)
 
@@ -259,7 +258,7 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 
 	totalBytes := 0
 	for _, req := range batch {
-		totalBytes += req.EncodedLen()
+		totalBytes += req.kv.EncodedLen()
 	}
 
 	// serialize all records one big buffer
@@ -269,9 +268,9 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	// create batch from slices of the big buff
 	bufOff := 0
 	for _, req := range batch {
-		n := req.EncodedLen()
+		n := req.kv.EncodedLen()
 		end := bufOff + n
-		req.Encode(batchBuff[bufOff:end])
+		req.kv.Encode(batchBuff[bufOff:end])
 
 		db.walBuf = append(db.walBuf, batchBuff[bufOff:end])
 		bufOff = end
@@ -290,7 +289,7 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	memStart := time.Now()
 	if err == nil {
 		for i, req := range batch {
-			if err = db.setMt(req.qkey, req.val, lsns[i]); err != nil {
+			if err = db.setMemtable(req.kv, lsns[i]); err != nil {
 				panic(fmt.Sprintf("unknown error %v", err))
 			}
 		}
@@ -335,12 +334,12 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	db.walBuf = db.walBuf[:0]
 }
 
-func (db *QuxDB) setMt(qkey quxKey, val []byte, lsn wal.LSN) error {
+func (db *QuxDB) setMemtable(kv quxKV, lsn wal.LSN) error {
 retry:
-	err := db.amt.Load().Set(qkey, val)
+	err := db.amt.Load().Set(kv.qkey, kv.val)
 	if err != nil {
 		if errors.Is(err, memtable.ErrMemtableFull) {
-			db.rolloverMemtable(seqFromQuxKey(qkey), lsn)
+			db.rolloverMemtable(kv.qkey.Seq(), lsn)
 			goto retry
 		}
 		return err
@@ -370,6 +369,6 @@ type quxMemtable struct {
 
 func newQuxMemtable() *quxMemtable {
 	return &quxMemtable{
-		Memtable: memtable.New(memTableType, memtable.WithComparator(compareInternalKey)),
+		Memtable: memtable.New(memTableType),
 	}
 }
