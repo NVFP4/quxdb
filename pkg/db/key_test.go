@@ -32,3 +32,14 @@ func TestQuxKey(t *testing.T) {
 	k2 = newQuxKey([]byte("a"), 31234, quxOpSet)
 	assert.True(t, bytes.Compare(k1, k2) > 0, fmt.Sprintf("'%s' should sort before '%s'", k1, k2))
 }
+
+func TestQuxKeySetSeq(t *testing.T) {
+	key := newQuxKey([]byte("key"), 0, quxOpDelete)
+
+	key.SetSeq(42)
+
+	userKey, seq, op := key.Decode()
+	assert.Equal(t, []byte("key"), userKey)
+	assert.Equal(t, quxSeq(42), seq)
+	assert.Equal(t, quxOpDelete, op)
+}

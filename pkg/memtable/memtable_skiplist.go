@@ -1,6 +1,7 @@
 package memtable
 
 import (
+	"iter"
 	"slices"
 	"sync"
 	_ "unsafe"
@@ -10,7 +11,7 @@ const (
 	// With p=1/2, height 24 covers roughly 16 million entries at the top
 	// level, well above what a 64 MiB key/value data arena should hold.
 	slMaxHeight    = 24
-	slMaxDataBytes = 1 << 26 // 64 MiB
+	slMaxDataBytes = 16 * 1024 * 1024
 )
 
 type slNode struct {
@@ -195,28 +196,28 @@ func (m *slMemtable) Set(key, val []byte) error {
 	return m.setLocked(key, val)
 }
 
-func (m *slMemtable) Delete(key []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var prev [slMaxHeight]uint32
-	x := m.findGreaterOrEqual(key, &prev)
-	if x == 0 || m.cmp(m.arena.key(x), key) != 0 {
-		return
-	}
-
-	h := int(m.arena.nodes[x].height)
-	for i := range h {
-		m.arena.setNext(prev[i], i, m.arena.next(x, i))
-		if m.tail[i] == x {
-			m.tail[i] = prev[i]
-		}
-	}
-	for m.height > 1 && m.arena.next(m.head, m.height-1) == 0 {
-		m.height--
-	}
-	m.len--
-}
+// func (m *slMemtable) Delete(key []byte) {
+// 	m.mu.Lock()
+// 	defer m.mu.Unlock()
+//
+// 	var prev [slMaxHeight]uint32
+// 	x := m.findGreaterOrEqual(key, &prev)
+// 	if x == 0 || m.cmp(m.arena.key(x), key) != 0 {
+// 		return
+// 	}
+//
+// 	h := int(m.arena.nodes[x].height)
+// 	for i := range h {
+// 		m.arena.setNext(prev[i], i, m.arena.next(x, i))
+// 		if m.tail[i] == x {
+// 			m.tail[i] = prev[i]
+// 		}
+// 	}
+// 	for m.height > 1 && m.arena.next(m.head, m.height-1) == 0 {
+// 		m.height--
+// 	}
+// 	m.len--
+// }
 
 func (m *slMemtable) SizeBytes() int {
 	m.mu.RLock()
@@ -363,3 +364,18 @@ func (m *slMemtable) findGreaterOrEqual(key []byte, prev *[slMaxHeight]uint32) u
 }
 
 var _ Memtable = (*slMemtable)(nil)
+
+type slCursor struct {
+	next func() ([]byte, []byte, bool)
+}
+
+func (c *slCursor) Next() (key, value []byte, ok bool) {
+	return c.next()
+}
+
+func (m *slMemtable) Cursor(start, end []byte) Cursor {
+	next, _ := iter.Pull2(m.IterRange(start, end))
+	return &slCursor{next: next}
+}
+
+var _ Cursor = (*slCursor)(nil)

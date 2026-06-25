@@ -27,12 +27,22 @@ func hGetKey(db *db.QuxDB) http.HandlerFunc {
 
 func hGetKeys(db *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+
+		var start, end []byte
+		if s := q.Get("start"); s != "" {
+			start = []byte(s)
+		}
+		if e := q.Get("end"); e != "" {
+			end = []byte(e)
+		}
+
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 
 		bw := bufio.NewWriter(w)
 		defer bw.Flush()
-		for key, value := range db.All() {
+		for key, value := range db.Iter(start, end) {
 			_, _ = bw.Write(key)
 			_ = bw.WriteByte('\t')
 			_, _ = bw.Write(value)

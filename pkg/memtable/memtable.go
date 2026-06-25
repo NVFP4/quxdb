@@ -8,6 +8,10 @@ import (
 
 type Iterator = iter.Seq2[[]byte, []byte]
 
+type Cursor interface {
+	Next() (key, value []byte, ok bool)
+}
+
 type Comparator func(a, b []byte) int
 
 var ErrMemtableFull = errors.New("memtable full")
@@ -36,7 +40,7 @@ type Memtable interface {
 	// Set the key-value pair in the memtable
 	Set(key, value []byte) error
 	// Delete the key-value pair from the memtable
-	Delete(key []byte)
+	// Delete(key []byte)
 	// Returns the size of the memtable in bytes
 	SizeBytes() int
 	// Returns the number of key-value pairs in the memtable
@@ -47,6 +51,9 @@ type Memtable interface {
 	IterRange(start, end []byte) Iterator
 	// Returns an iterator for all key-value pairs in the memtable
 	Iter() Iterator
+	// Returns a pull-style cursor over a range of key-value pairs between
+	// [start, end] in the memtable. A nil bound means unbounded on that side.
+	Cursor(start, end []byte) Cursor
 }
 
 // ----------------------------------------------------------------------------

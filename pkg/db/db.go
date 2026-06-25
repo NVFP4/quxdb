@@ -21,11 +21,15 @@ import (
 const (
 	memTableType = memtable.BTree
 	maxBatch     = 128
+	fullSync     = false
 )
 
 type QuxDB struct {
-	seq atomic.Uint64
-	_   [56]byte // cache line padding
+	committedSeq atomic.Uint64
+	_            [56]byte // cache line padding
+
+	// writeSeq is the last assigned sequence and is owned by writeLoop.
+	writeSeq quxSeq
 
 	dataDir string
 
@@ -91,14 +95,14 @@ func (db *QuxDB) Start(ctx context.Context) error {
 		db.wal.TruncateFrom(lsn)
 	}
 
-	// restore last known sequence number
 	if kv.qkey != nil {
-		db.seq.Store(kv.qkey.Seq())
+		db.committedSeq.Store(kv.qkey.Seq())
 	}
+	db.writeSeq = quxSeq(db.committedSeq.Load())
 
 	go db.writeLoop()
 
-	fmt.Printf("db started with dir=%s memtable=%s keys=%d seq=%d\n", db.dataDir, memTableType, keys, db.seq.Load())
+	fmt.Printf("db started with dir=%s memtable=%s keys=%d seq=%d\n", db.dataDir, memTableType, keys, db.committedSeq.Load())
 
 	return nil
 }
@@ -115,7 +119,7 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 }
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool) {
-	readSeq := db.seq.Load()
+	readSeq := db.committedSeq.Load()
 	lookupKey := newQuxKey(key, readSeq, quxOpMax)
 
 	if value, found, ok := getFromMemtable(db.amt.Load(), key, lookupKey); found {
@@ -158,40 +162,77 @@ func (db *QuxDB) Delete(key []byte) error {
 	return res.err
 }
 
-func (db *QuxDB) All() iter.Seq2[[]byte, []byte] {
-	return db.Range(nil, nil)
-}
-
-func (db *QuxDB) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
+// Iter iterates over key-value over bounds [start, end].
+// Slices are valid only for the current iteration. Caller must clone to retain/mutate.
+func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
-		readSeq := db.seq.Load()
-		mt := db.amt.Load()
-
-		var iter memtable.Iterator
-		if start != nil {
-			iter = mt.IterFrom(newQuxKey(start, readSeq, quxOpMax))
-		} else {
-			iter = mt.Iter()
+		if start != nil && end != nil && bytes.Compare(start, end) > 0 {
+			return
 		}
 
-		var lastUserKey []byte
-		for internalKey, value := range iter {
-			userKey, seq, op := quxKey(internalKey).Decode()
-			if end != nil && bytes.Compare(userKey, end) > 0 {
-				return
+		readSeq := db.committedSeq.Load()
+
+		var startKey, endKey []byte
+		if start != nil {
+			// (readSeq, quxOpMax) sorts just before the first visible version of start, so the cursor lands there.
+			startKey = newQuxKey(start, readSeq, quxOpMax)
+		}
+		if end != nil {
+			// seq=0 (→ ^0=0xFF…FF) sorts after every real version of end, making the bound inclusive.
+			endKey = newQuxKey(end, 0, quxOpSet)
+		}
+
+		db.imtMu.RLock()
+		memtables := make([]*quxMemtable, 0, len(db.imt)+1)
+		memtables = append(memtables, db.amt.Load())
+		memtables = append(memtables, db.imt...)
+		db.imtMu.RUnlock()
+
+		// Fast path: single memtable, no merge heap needed.
+		if len(memtables) == 1 {
+			cur := &mvccCursor{
+				cur:     memtables[0].Cursor(startKey, endKey),
+				readSeq: readSeq,
 			}
-			if lastUserKey != nil && bytes.Equal(userKey, lastUserKey) {
-				continue
+			for {
+				key, val, ok := cur.Next()
+				if !ok {
+					return
+				}
+				userKey, _, op := quxKey(key).Decode()
+				if op != quxOpDelete && !yield(userKey, val) {
+					return
+				}
 			}
-			if seq > readSeq {
-				continue
+		}
+
+		// General path: k-way merge across active + frozen memtables.
+		cursors := make([]*mvccCursor, len(memtables))
+		for i, mt := range memtables {
+			cursors[i] = &mvccCursor{
+				cur:     mt.Cursor(startKey, endKey),
+				readSeq: readSeq,
+			}
+		}
+
+		var currentUserKey []byte
+		resolved := false
+
+		for qkey, val := range mergeIter(cursors) {
+			userKey := qkey.UserKey()
+			op := qkey.Op()
+
+			if !bytes.Equal(userKey, currentUserKey) {
+				currentUserKey = userKey
+				resolved = false
 			}
 
-			lastUserKey = bytes.Clone(userKey)
-			if op == quxOpDelete {
+			if resolved {
 				continue
 			}
-			if !yield(userKey, value) {
+			resolved = true
+
+			if op != quxOpDelete && !yield(userKey, val) {
 				return
 			}
 		}
@@ -200,7 +241,9 @@ func (db *QuxDB) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 
 func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) *writeReq {
 	w := db.reqPool.Get().(*writeReq)
-	w.kv.qkey = newQuxKey(key, db.seq.Add(1), op)
+	// Sequence assignment belongs to the single writer. Building the key here
+	// still copies the caller's key before the request is queued.
+	w.kv.qkey = newQuxKey(key, 0, op)
 	w.kv.val = val
 	w.res = writeResult{}
 	w.enqueuedAt = time.Now()
@@ -255,6 +298,10 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	metrics.DbCommitBatchSize.Observe(float64(len(batch)))
 
 	commitStart := time.Now()
+	for _, req := range batch {
+		db.writeSeq++
+		req.kv.qkey.SetSeq(db.writeSeq)
+	}
 
 	totalBytes := 0
 	for _, req := range batch {
@@ -281,7 +328,9 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 
 	syncStart := time.Now()
 	if err == nil {
-		err = db.wal.Sync()
+		if fullSync {
+			err = db.wal.Sync()
+		}
 	} else {
 		fmt.Printf("batch got err: %v\n", err)
 	}
@@ -293,6 +342,7 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 				panic(fmt.Sprintf("unknown error %v", err))
 			}
 		}
+		db.committedSeq.Store(batch[len(batch)-1].kv.qkey.Seq())
 	}
 
 	commitEnd := time.Now()
@@ -348,17 +398,19 @@ retry:
 }
 
 func (db *QuxDB) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) {
+	next := newQuxMemtable()
+
+	db.imtMu.Lock()
 	amt := db.amt.Load()
 	// set seq/lsn info to active mem table
 	amt.lastLSN = lastLSN
 	amt.lastSeq = lastSeq
 	// append active to imt
-	db.imtMu.Lock()
 	db.imt = append(db.imt, amt)
+	db.amt.Store(next)
 	db.imtMu.Unlock()
 
-	db.amt.Store(newQuxMemtable())
-	fmt.Printf("froze memtable keys=%d size=%.2fMB lastSeq=%d lastLSN=%d\n", amt.Len(), float64(amt.SizeBytes())/(1024*1024), amt.lastSeq, amt.lastLSN)
+	fmt.Printf("froze memtable size=%.2fMB keys=%d lastSeq=%d lastLSN=%d\n", float64(amt.SizeBytes())/(1024*1024), amt.Len(), amt.lastSeq, amt.lastLSN)
 }
 
 type quxMemtable struct {

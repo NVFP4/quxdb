@@ -60,6 +60,11 @@ func (k quxKey) Seq() quxSeq {
 	return quxSeq(^binary.BigEndian.Uint64(k[seqOff : seqOff+quxKeySeqLen]))
 }
 
+func (k quxKey) SetSeq(seq quxSeq) {
+	seqOff := len(k) - quxKeySeqLen - quxKeyOpLen
+	binary.BigEndian.PutUint64(k[seqOff:seqOff+quxKeySeqLen], ^seq)
+}
+
 func (k quxKey) Op() quxOp {
 	return quxOp(^k[len(k)-1])
 }
