@@ -11,10 +11,7 @@ import (
 
 func Fdatasync(file *os.File) error {
 	_, err := unix.FcntlInt(file.Fd(), unix.F_FULLFSYNC, 0)
-	if err != nil {
-		return fmt.Errorf("F_FULLFSYNC failed: %w", err)
-	}
-	return nil
+	return err
 }
 
 func Fallocate(file *os.File, offset int64, n int64) error {

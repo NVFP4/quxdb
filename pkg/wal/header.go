@@ -2,6 +2,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -9,75 +10,92 @@ import (
 )
 
 /*
-WAL HEADER
-magic32 ver32 segId32 created64 lsn64 flags32 crc32 <padding>
+===============================================================
+WAL Header
+===============================================================
+magic32    QUXWAL
+ver16      WAL Version
+flags16    WAL Flags
+sid32      WAL Segment ID
+maxsize64  WAL Segment Max Size
+created64  Unix timestamp
+crc32      CRC32C(magic, ver, flags, sid, maxsize, created)
+===============================================================
+<padding>
+===============================================================
 */
 
 const (
-	walVersion       uint32 = 1
-	walHeaderMagic32 uint32 = 'Q'<<24 | 'U'<<16 | 'X'<<8 | 0xDB
+	walVersion       = 1
+	walHeaderMagic32 = 'Q'<<24 | 'W'<<16 | 'A'<<8 | 'L'
 
-	// magic32 + ver32 + segId32 + created64 + lsn64 + flags32 + crc32
-	walHeaderEncLen = 4*5 + 8*2
+	walHeaderEncLen = 8*2 + 4*3 + 2*2
 	walHeaderLen    = (walHeaderEncLen + 7) &^ 7
 )
 
 var walCRC32CTable = crc32.MakeTable(crc32.Castagnoli)
 
 var (
-	ErrHeaderWrite         = fmt.Errorf("header write")
-	ErrHeaderRead          = fmt.Errorf("header read")
-	ErrHeaderInvalidFormat = fmt.Errorf("%w: invalid format", ErrHeaderRead)
-	ErrHeaderInvalidVer    = fmt.Errorf("%w: invalid version", ErrHeaderRead)
-	ErrHeaderInvalidSize   = fmt.Errorf("%w: invalid size", ErrHeaderRead)
-	ErrHeaderCorrupt       = fmt.Errorf("%w: corrupted - crc32 mismatch", ErrHeaderRead)
+	ErrHeaderWrite         = errors.New("header write")
+	ErrHeaderRead          = errors.New("header read")
+	ErrHeaderInvalidFormat = errors.New("header read: invalid format")
+	ErrHeaderInvalidVer    = errors.New("header read: invalid version")
+	ErrHeaderInvalidSize   = errors.New("header read: invalid size")
+	ErrHeaderCorrupt       = errors.New("header read: corrupted - crc32 mismatch")
 )
 
 type walHeader struct {
-	ver    uint32
-	sid    uint32
-	flags  uint32
-	crc32c uint32
-	ts     uint64
-	size   uint64
+	sid     uint32
+	ver     uint16
+	flags   uint16
+	crc32c  uint32
+	created uint64
+	maxSize uint64
 }
 
-func writeHeader(file io.WriterAt, sid segID, maxSize uint64, flags uint32) (*walHeader, int64, error) {
+func writeHeader(w io.WriterAt, sid segID, maxSize uint64, flags uint16) (*walHeader, int64, error) {
 	bufOff := 0
 	buf := make([]byte, walHeaderLen) // allocated padded buf
 	h := &walHeader{
-		ver:   walVersion,
-		sid:   uint32(sid),
-		ts:    uint64(time.Now().UTC().Unix()),
-		size:  maxSize,
-		flags: flags,
+		ver:     walVersion,
+		sid:     uint32(sid),
+		created: uint64(time.Now().UTC().Unix()),
+		maxSize: maxSize,
+		flags:   flags,
 	}
 
+	// magic32
 	binary.BigEndian.PutUint32(buf[bufOff:], walHeaderMagic32)
 	bufOff += 4
 
-	binary.LittleEndian.PutUint32(buf[bufOff:], h.ver)
-	bufOff += 4
+	// ver16
+	binary.LittleEndian.PutUint16(buf[bufOff:], h.ver)
+	bufOff += 2
 
+	// flags16
+	binary.LittleEndian.PutUint16(buf[bufOff:], h.flags)
+	bufOff += 2
+
+	// sid32
 	binary.LittleEndian.PutUint32(buf[bufOff:], h.sid)
 	bufOff += 4
 
-	binary.LittleEndian.PutUint64(buf[bufOff:], h.ts)
+	// maxSize64
+	binary.LittleEndian.PutUint64(buf[bufOff:], h.maxSize)
 	bufOff += 8
 
-	binary.LittleEndian.PutUint64(buf[bufOff:], h.size)
+	// created64
+	binary.LittleEndian.PutUint64(buf[bufOff:], h.created)
 	bufOff += 8
-
-	binary.LittleEndian.PutUint32(buf[bufOff:], h.flags)
-	bufOff += 4
 
 	crc := crc32.Checksum(buf[:bufOff], walCRC32CTable)
 	h.crc32c = crc
 
+	// crc32
 	binary.LittleEndian.PutUint32(buf[bufOff:], crc)
 	bufOff += 4
 
-	n, err := file.WriteAt(buf, 0)
+	n, err := w.WriteAt(buf, 0)
 	if err != nil {
 		return nil, -1, fmt.Errorf("%w: %w", ErrHeaderWrite, err)
 	}
@@ -88,14 +106,14 @@ func writeHeader(file io.WriterAt, sid segID, maxSize uint64, flags uint32) (*wa
 	return h, walHeaderLen, nil
 }
 
-func readHeader(file io.ReaderAt) (*walHeader, int64, error) {
+func readHeader(r io.ReaderAt) (*walHeader, int64, error) {
 	h := &walHeader{}
 
 	bufOff := 0
 	crcOff := 0
 	buf := make([]byte, walHeaderLen)
 
-	_, err := file.ReadAt(buf, 0)
+	_, err := r.ReadAt(buf, 0)
 	if err != nil {
 		return nil, -1, fmt.Errorf("%w: %w", ErrHeaderRead, err)
 	}
@@ -106,23 +124,23 @@ func readHeader(file io.ReaderAt) (*walHeader, int64, error) {
 	}
 	bufOff += 4
 
-	h.ver = binary.LittleEndian.Uint32(buf[bufOff:])
+	h.ver = binary.LittleEndian.Uint16(buf[bufOff:])
 	if h.ver != walVersion {
 		return nil, -1, ErrHeaderInvalidVer
 	}
-	bufOff += 4
+	bufOff += 2
+
+	h.flags = binary.LittleEndian.Uint16(buf[bufOff:])
+	bufOff += 2
 
 	h.sid = binary.LittleEndian.Uint32(buf[bufOff:])
 	bufOff += 4
 
-	h.ts = binary.LittleEndian.Uint64(buf[bufOff:])
+	h.maxSize = binary.LittleEndian.Uint64(buf[bufOff:])
 	bufOff += 8
 
-	h.size = binary.LittleEndian.Uint64(buf[bufOff:])
+	h.created = binary.LittleEndian.Uint64(buf[bufOff:])
 	bufOff += 8
-
-	h.flags = binary.LittleEndian.Uint32(buf[bufOff:])
-	bufOff += 4
 
 	crcOff = bufOff
 	h.crc32c = binary.LittleEndian.Uint32(buf[bufOff:])

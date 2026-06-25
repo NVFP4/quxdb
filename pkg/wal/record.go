@@ -9,23 +9,28 @@ import (
 )
 
 /*
+=============================================
 WAL Record
-magic32 crc32 len64 recType16 flags16 lsn64 plen64 <data..> <padding>
-
-crc32       CRC32C(len64 | recType16 | flags16 | lsn64 | plen64 | data)
-recType16   record type (commit, ...)
-flags16     record flags (compression, ...)
-lsn64       LSN
-plen        data length
-data        data stream
+=============================================
+magic32		QREC
+crc32		record crc
+hcrc32		header crc
+rlen32		record len
+rtype16		record type (commit, ...)
+rflags16	record flags (compression, ...)
+lsn64		LSN
+dlen32		data length
+=============================================
+data		data bytes
+=============================================
+<padding>
+=============================================
 */
 
 const (
-	// magic32 crc32 len64 recType16 flags16 lsn64 plen64
-	walRecordHeaderLen = 2*2 + 4*2 + 8*3
+	walRecordHeaderLen = 2*2 + 4*5 + 8
 
-	// Record magic ends with 0xFF
-	walRecordMagic32 uint32 = 'Q'<<24 | 'U'<<16 | 'X'<<8 | 0xFF
+	walRecordMagic32 uint32 = 'Q'<<24 | 'R'<<16 | 'E'<<8 | 'C'
 )
 
 const (
@@ -33,20 +38,24 @@ const (
 )
 
 var (
-	ErrRecordWrite         = fmt.Errorf("record write")
-	ErrRecordRead          = fmt.Errorf("record read")
-	ErrRecordInvalidFormat = fmt.Errorf("%w: invalid format", ErrRecordRead)
-	ErrRecordTorn          = fmt.Errorf("%w: record torn", ErrRecordRead)
-	ErrRecordCorrupt       = fmt.Errorf("%w: corrupted - crc32 mismatch", ErrRecordRead)
-	ErrIncompleteRead      = fmt.Errorf("%w: incomplete record read", ErrRecordRead)
+	ErrRecordWrite         = errors.New("record write")
+	ErrRecordRead          = errors.New("record read")
+	ErrRecordInvalidFormat = errors.New("record read: invalid format")
+	ErrRecordInvalidSize   = errors.New("record read: invalid size")
+	ErrRecordInvalidLSN    = errors.New("record read: lsn mismatch")
+	ErrRecordTorn          = errors.New("record read: record torn")
+	ErrRecordCorrupt       = errors.New("record read: corrupted - crc32 mismatch")
+	ErrIncompleteRead      = errors.New("record read: incomplete record read")
 )
 
 type walRecordHeader struct {
-	lsn     uint64
-	dataLen uint64
-	crc32c  uint32
-	recType uint16
-	flags   uint16
+	lsn       uint64
+	recCRC    uint32
+	headerCRC uint32
+	recLen    uint32
+	recType   uint16
+	recFlags  uint16
+	dataLen   uint32
 }
 
 type walRecord struct {
@@ -54,132 +63,151 @@ type walRecord struct {
 	data []byte
 }
 
-func readRecordSize(file io.ReaderAt, off int64) (int64, error) {
-	// magic32 + crc32c + recordLen64
-	var hBuff [4 + 4 + 8]byte
-	hOff := 0
-
-	_, err := file.ReadAt(hBuff[:], off)
-	if err != nil {
-		return -1, fmt.Errorf("%w: %w", ErrRecordRead, err)
-	}
-
-	magic := binary.BigEndian.Uint32(hBuff[hOff:])
-	if magic != walRecordMagic32 {
-		return -1, ErrRecordInvalidFormat
-	}
-	hOff += 4
-
-	_ = binary.LittleEndian.Uint32(hBuff[hOff:])
-	hOff += 4
-
-	// record len
-	len := binary.LittleEndian.Uint64(hBuff[hOff:])
-	hOff += 8
-
-	return off + int64(len), nil
-}
-
-func readRecord(file io.ReaderAt, off int64) (*walRecord, int, error) {
+func readRecordHeader(r io.ReaderAt, off int64, limit int64) (*walRecord, error) {
 	rec := &walRecord{}
-
 	var hBuff [walRecordHeaderLen]byte
 	hOff := 0
 
-	_, err := file.ReadAt(hBuff[:], off)
+	_, err := r.ReadAt(hBuff[:], off)
 	if err != nil {
 		// this EOF is fine, no more headers to read.
-		return nil, -1, fmt.Errorf("%w: %w", ErrRecordRead, err)
+		return nil, fmt.Errorf("%w: %w", ErrRecordRead, err)
 	}
 
+	// magic32
 	magic := binary.BigEndian.Uint32(hBuff[hOff:])
 	if magic != walRecordMagic32 {
-		return nil, -1, ErrRecordInvalidFormat
+		return nil, ErrRecordInvalidFormat
 	}
 	hOff += 4
 
-	rec.crc32c = binary.LittleEndian.Uint32(hBuff[hOff:])
+	// crc32
+	rec.recCRC = binary.LittleEndian.Uint32(hBuff[hOff:])
+	hOff += 4
+
+	// hcrc32
+	rec.headerCRC = binary.LittleEndian.Uint32(hBuff[hOff:])
 	hOff += 4
 	crcOff := hOff
 
-	// record len
-	_ = binary.LittleEndian.Uint64(hBuff[hOff:])
-	hOff += 8
+	// rlen32
+	rec.recLen = binary.LittleEndian.Uint32(hBuff[hOff:])
+	hOff += 4
 
+	// rtype16
 	rec.recType = binary.LittleEndian.Uint16(hBuff[hOff:])
 	hOff += 2
 
-	rec.flags = binary.LittleEndian.Uint16(hBuff[hOff:])
+	// rflags16
+	rec.recFlags = binary.LittleEndian.Uint16(hBuff[hOff:])
 	hOff += 2
 
+	// lsn64
 	rec.lsn = binary.LittleEndian.Uint64(hBuff[hOff:])
 	hOff += 8
 
-	rec.dataLen = binary.LittleEndian.Uint64(hBuff[hOff:])
-	hOff += 8
+	// dlen32
+	rec.dataLen = binary.LittleEndian.Uint32(hBuff[hOff:])
+	hOff += 4
 
-	// partialCRC = CRC32C(recType16 | flags16 | lsn64 | plen64)
+	// validate bounds
+	if rec.recLen < walRecordHeaderLen || rec.recLen%8 != 0 {
+		return nil, ErrRecordTorn
+	}
+	if off < 0 || off+int64(rec.recLen) > limit {
+		return nil, ErrRecordInvalidSize
+	}
+	if alignUp8(walRecordHeaderLen+int(rec.dataLen)) != int(rec.recLen) {
+		return nil, ErrRecordInvalidSize
+	}
+
+	// CRC32C(rlen, rtype, rflags, lsn, dlen)
 	expectedCRC := crc32.Checksum(hBuff[crcOff:hOff], walCRC32CTable)
+	if rec.headerCRC != expectedCRC {
+		return nil, ErrRecordCorrupt
+	}
+	return rec, nil
+}
+
+func readRecord(r io.ReaderAt, off int64, limit int64) (*walRecord, error) {
+	rec, err := readRecordHeader(r, off, limit)
+	if err != nil {
+		return nil, err
+	}
 
 	// now we read the data
 	rec.data = make([]byte, uint(rec.dataLen))
-	_, err = file.ReadAt(rec.data, int64(off)+int64(hOff))
+	_, err = r.ReadAt(rec.data, int64(off)+walRecordHeaderLen)
 	if err != nil {
 		// eof here is bad. because we had data.
 		if errors.Is(err, io.EOF) {
-			return nil, -1, ErrRecordTorn
+			return nil, ErrRecordTorn
 		}
-		return nil, -1, fmt.Errorf("%w: %w at offset %d", ErrRecordRead, err, off)
+		return nil, fmt.Errorf("%w: %w at offset %d", ErrRecordRead, err, off)
 	}
 
-	// expectedCRC = CRC32C(partialCRC | plen64)
-	expectedCRC = crc32.Update(expectedCRC, walCRC32CTable, rec.data)
-	if rec.crc32c != expectedCRC {
-		return nil, -1, ErrRecordCorrupt
+	// CRC32C(... | data)
+	if rec.recCRC != crc32.Update(rec.headerCRC, walCRC32CTable, rec.data) {
+		return nil, ErrRecordCorrupt
 	}
 
-	return rec, alignUp8(walRecordHeaderLen + int(rec.dataLen)), nil
+	return rec, nil
 }
 
-func encodeRecord(dest []byte, lsn LSN, flags uint16, data []byte) (int, error) {
+func encodeRecord(dest []byte, lsn LSN, flags uint16, data []byte) int {
 	bufOff := 0
 	dataLen := len(data)
-	totalBytes := alignUp8(walRecordHeaderLen + dataLen)
+	recLen := alignUp8(walRecordHeaderLen + dataLen)
 
+	// magic32
 	binary.BigEndian.PutUint32(dest[bufOff:], walRecordMagic32)
 	bufOff += 4
 
+	// crc32
 	crcOff := bufOff
 	bufOff += 4 // reserve crc32 slot
+
+	// hcrc32
+	hcrcOff := bufOff
+	bufOff += 4 // reserve hcrc32 slot
 	crcStart := bufOff
 
-	binary.LittleEndian.PutUint64(dest[bufOff:], uint64(totalBytes))
-	bufOff += 8
+	// rlen32
+	binary.LittleEndian.PutUint32(dest[bufOff:], uint32(recLen))
+	bufOff += 4
 
+	// rtype16
 	binary.LittleEndian.PutUint16(dest[bufOff:], walRecTypeFull)
 	bufOff += 2
 
+	// rflags16
 	binary.LittleEndian.PutUint16(dest[bufOff:], flags)
 	bufOff += 2
 
+	// lsn64
 	binary.LittleEndian.PutUint64(dest[bufOff:], uint64(lsn))
 	bufOff += 8
 
-	binary.LittleEndian.PutUint64(dest[bufOff:], uint64(dataLen))
-	bufOff += 8
+	// dlen32
+	binary.LittleEndian.PutUint32(dest[bufOff:], uint32(dataLen))
+	bufOff += 4
 
-	// inline-write data
+	// hcrc32
+	hcrc := crc32.Checksum(dest[crcStart:bufOff], walCRC32CTable)
+	binary.LittleEndian.PutUint32(dest[hcrcOff:], hcrc)
+
+	// data
 	copy(dest[bufOff:bufOff+dataLen], data)
 	bufOff += dataLen
 
-	// CRC32C(recType16 | flags16 | lsn64 | plen64 | data)
+	// crc32
 	crc := crc32.Checksum(dest[crcStart:bufOff], walCRC32CTable)
 	binary.LittleEndian.PutUint32(dest[crcOff:], crc)
 
 	// clear pad the rest
-	clear(dest[bufOff:totalBytes])
+	clear(dest[bufOff:recLen])
 
-	return totalBytes, nil
+	return recLen
 }
 
 func encodedBatchLen(batch [][]byte) int {
