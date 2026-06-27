@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/yashgorana/quxdb/pkg/db"
@@ -14,7 +15,11 @@ const maxBodyBytes = 1024 * 1024 // 1MB
 
 func hPutKey(db *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := chi.URLParam(r, "key")
+		key, err := url.PathUnescape(chi.URLParam(r, "key"))
+		if err != nil {
+			http.Error(w, "invalid key", http.StatusBadRequest)
+			return
+		}
 		if key == "" {
 			http.Error(w, "no key provided", http.StatusBadRequest)
 			return
