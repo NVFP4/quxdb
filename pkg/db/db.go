@@ -288,6 +288,7 @@ func (db *QuxDB) writeLoop() {
 		}
 
 		db.commitBatch(batch)
+
 		clear(batch)
 		batch = batch[:0]
 	}
@@ -297,6 +298,8 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	metrics.DbCommitBacklogSize.Observe(float64(len(db.reqChan)))
 	metrics.DbCommitBatchSize.Observe(float64(len(batch)))
 
+	lens := make([]int, len(batch))
+
 	commitStart := time.Now()
 	for _, req := range batch {
 		db.writeSeq++
@@ -304,8 +307,10 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	}
 
 	totalBytes := 0
-	for _, req := range batch {
-		totalBytes += req.kv.EncodedLen()
+	for i, req := range batch {
+		n := req.kv.EncodedLen()
+		lens[i] = n
+		totalBytes += n
 	}
 
 	// serialize all records one big buffer
@@ -314,8 +319,8 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 
 	// create batch from slices of the big buff
 	bufOff := 0
-	for _, req := range batch {
-		n := req.kv.EncodedLen()
+	for i, req := range batch {
+		n := lens[i]
 		end := bufOff + n
 		req.kv.Encode(batchBuff[bufOff:end])
 

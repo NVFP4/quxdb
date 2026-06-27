@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/binary"
+	"math/bits"
 )
 
 type quxKV struct {
@@ -10,8 +11,9 @@ type quxKV struct {
 }
 
 func (r *quxKV) EncodedLen() int {
-	// 4 for lenKey, 4 for lenVal
-	return 8 + len(r.qkey) + len(r.val)
+	lenKey := len(r.qkey)
+	lenVal := len(r.val)
+	return sizeUvarint(lenKey) + sizeUvarint(lenVal) + lenKey + lenVal
 }
 
 func (r *quxKV) Encode(buf []byte) int {
@@ -19,14 +21,14 @@ func (r *quxKV) Encode(buf []byte) int {
 	lenKey := len(r.qkey)
 	lenVal := len(r.val)
 
-	binary.LittleEndian.PutUint32(buf[bufOff:], uint32(lenKey))
-	bufOff += 4
+	n := binary.PutUvarint(buf[bufOff:], uint64(lenKey))
+	bufOff += n
 
 	copy(buf[bufOff:], r.qkey)
 	bufOff += lenKey
 
-	binary.LittleEndian.PutUint32(buf[bufOff:], uint32(lenVal))
-	bufOff += 4
+	n = binary.PutUvarint(buf[bufOff:], uint64(lenVal))
+	bufOff += n
 
 	copy(buf[bufOff:], r.val)
 	bufOff += lenVal
@@ -37,17 +39,21 @@ func (r *quxKV) Encode(buf []byte) int {
 func (r *quxKV) Decode(buf []byte) int {
 	bufOff := 0
 
-	lenKey := binary.LittleEndian.Uint32(buf[bufOff:])
-	bufOff += 4
+	lenKey, n := binary.Uvarint(buf[bufOff:])
+	bufOff += n
 
 	r.qkey = buf[bufOff : bufOff+int(lenKey)]
 	bufOff += int(lenKey)
 
-	lenVal := binary.LittleEndian.Uint32(buf[bufOff:])
-	bufOff += 4
+	lenVal, n := binary.Uvarint(buf[bufOff:])
+	bufOff += n
 
 	r.val = buf[bufOff : bufOff+int(lenVal)]
 	bufOff += int(lenVal)
 
 	return bufOff
+}
+
+func sizeUvarint(x int) int {
+	return (bits.Len64(uint64(x)|1) + 6) / 7
 }
