@@ -120,7 +120,7 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 	readSeq := db.committedSeq.Load()
-	lookupKey := newQuxKey(key, readSeq, quxOpMax)
+	lookupKey := newSeekStart(key, readSeq)
 
 	if value, found, ok := getFromMemtable(db.amt.Load(), key, lookupKey); found {
 		return value, ok
@@ -162,8 +162,6 @@ func (db *QuxDB) Delete(key []byte) error {
 	return res.err
 }
 
-// Iter iterates over key-value over bounds [start, end].
-// Slices are valid only for the current iteration. Caller must clone to retain/mutate.
 func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		if start != nil && end != nil && bytes.Compare(start, end) > 0 {
@@ -174,12 +172,10 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 
 		var startKey, endKey []byte
 		if start != nil {
-			// (readSeq, quxOpMax) sorts just before the first visible version of start, so the cursor lands there.
-			startKey = newQuxKey(start, readSeq, quxOpMax)
+			startKey = newSeekStart(start, readSeq)
 		}
 		if end != nil {
-			// seq=0 (→ ^0=0xFF…FF) sorts after every real version of end, making the bound inclusive.
-			endKey = newQuxKey(end, 0, quxOpSet)
+			endKey = newSeekEnd(end)
 		}
 
 		db.imtMu.RLock()
@@ -241,8 +237,6 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 
 func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) *writeReq {
 	w := db.reqPool.Get().(*writeReq)
-	// Sequence assignment belongs to the single writer. Building the key here
-	// still copies the caller's key before the request is queued.
 	w.kv.qkey = newQuxKey(key, 0, op)
 	w.kv.val = val
 	w.res = writeResult{}

@@ -13,19 +13,17 @@ type (
 const (
 	quxOpSet quxOp = 1 << iota
 	quxOpDelete
-
-	quxOpMax quxOp = 0xFF
 )
 
 const (
-	quxKeyAlign = 8
-
+	quxKeyAlign      = 8
 	quxKeyMarker     = 1
 	quxKeySeqLen     = 8
 	quxKeyOpLen      = 1
 	quxKeyTrailerLen = quxKeyMarker + quxKeySeqLen + quxKeyOpLen
 )
 
+// byte sortable internal key - userKey ASC, seq DESC, op DESC
 func newQuxKey(userKey []byte, seq quxSeq, op quxOp) quxKey {
 	n := len(userKey)
 
@@ -71,4 +69,16 @@ func (k quxKey) Op() quxOp {
 
 func (k quxKey) Decode() ([]byte, quxSeq, quxOp) {
 	return k.UserKey(), k.Seq(), k.Op()
+}
+
+// seek start (inclusive)
+// returns the newest version of `userKey` that is `<=seq`
+func newSeekStart(userKey []byte, seq quxSeq) quxKey {
+	return newQuxKey(userKey, seq, quxOp(0xFF))
+}
+
+// seek end (inclusive)
+// returns last possible `quxKey` for this `userKey`
+func newSeekEnd(userKey []byte) quxKey {
+	return newQuxKey(userKey, 0, quxOp(0x00))
 }

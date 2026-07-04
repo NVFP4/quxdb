@@ -7,8 +7,8 @@ import (
 
 const (
 	nBuckets      = 13
-	minBucketSize = 1 << 10 // 1kb
-	maxBucketSize = minBucketSize << (nBuckets - 1)
+	minBucketSize = 1024                            // min 1 KiB
+	maxBucketSize = minBucketSize << (nBuckets - 1) // max 4 MiB
 )
 
 var (
