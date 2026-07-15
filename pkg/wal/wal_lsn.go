@@ -3,18 +3,18 @@ package wal
 type LSN uint64
 type segID uint32
 
-func newLSN(sid segID, offset int64) LSN {
-	if offset < 0 || offset >= walSegmentMaxSize {
+func newLSN(sid segID, offset uint64, segSize uint64) LSN {
+	if offset >= segSize {
 		panic("wal: offset exceeds segment size")
 	}
 
-	return LSN(uint64(sid)*walSegmentMaxSize + uint64(offset))
+	return LSN(uint64(sid)*segSize + offset)
 }
 
-func lsnOffset(lsn LSN) int64 {
-	return int64(uint64(lsn) % walSegmentMaxSize)
+func lsnOffset(lsn LSN, segSize uint64) uint64 {
+	return uint64(lsn) % segSize
 }
 
-func lsnSegID(lsn LSN) segID {
-	return segID(uint64(lsn) / walSegmentMaxSize)
+func lsnSegID(lsn LSN, segSize uint64) segID {
+	return segID(uint64(lsn) / segSize)
 }

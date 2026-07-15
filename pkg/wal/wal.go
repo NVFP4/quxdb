@@ -11,7 +11,8 @@ const (
 )
 
 type Record struct {
-	LSN  LSN
+	LSN LSN
+	// valid only until WAL operation. callers must clone.
 	Data []byte
 }
 
@@ -22,8 +23,12 @@ type WAL struct {
 	mu       sync.RWMutex
 }
 
-func New(walDir string) (*WAL, error) {
-	segments := newSegmentSet(walDir)
+func New(walDir string, opts ...Option) (*WAL, error) {
+	options, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	segments := newSegmentSet(walDir, options.segmentSize)
 	return &WAL{
 		segments: segments,
 		writer:   newWalWriter(segments),
@@ -40,13 +45,13 @@ func (w *WAL) Open() error {
 	}
 
 	for _, seg := range w.segments.segments {
-		fmt.Printf("wal segment id=%d size=%dMB cursor=0x%x startOffset=%d flags=%d createdAt='%s'\n",
-			seg.sid,
-			seg.maxSize/(1024*1024),
+		fmt.Printf("wal segment id=%d mode=%d size=%dMiB startLSN=%d cursor=0x%x createdAt='%s'\n",
+			seg.segId,
+			seg.mode,
+			seg.segMaxSize>>20,
+			seg.startLSN,
 			seg.cursor,
-			lsnOffset(seg.startLSN),
-			seg.flags,
-			seg.created.Format(time.RFC3339),
+			seg.createdAt.Format(time.RFC3339),
 		)
 	}
 
@@ -78,6 +83,7 @@ func (w *WAL) Sync() error {
 	return w.writer.sync()
 }
 
+// Append expects that WAL has been opened, replayed and corruptions trucated.
 func (w *WAL) Append(data []byte) (lsn LSN, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -85,7 +91,8 @@ func (w *WAL) Append(data []byte) (lsn LSN, err error) {
 	return w.writer.append(data, walRecordFlags)
 }
 
-func (w *WAL) AppendBatch(batch [][]byte) (lsns []LSN, err error) {
+// AppendBatch has the same recovery precondition as Append.
+func (w *WAL) AppendBatch(batch [][]byte) ([]AppendResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -98,9 +105,9 @@ func (w *WAL) TruncateFrom(lsn LSN) error {
 	return w.writer.truncate(lsn)
 }
 
-func (w *WAL) Replay(fn func(Record) error) (LSN, error) {
+func (w *WAL) Replay(callback func(Record) error) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	return w.reader.replay(fn)
+	return w.reader.replay(callback)
 }

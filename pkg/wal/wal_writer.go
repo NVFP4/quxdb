@@ -6,7 +6,6 @@ import (
 
 var (
 	errSegmentInsufficientSpace = errors.New("wal: segment insufficient space")
-	ErrNoRecords                = errors.New("wal: no records to append")
 	ErrRecordTooLarge           = errors.New("wal: record too large for segment")
 )
 
@@ -30,20 +29,20 @@ retry:
 	return lsn, err
 }
 
-func (w *walWriter) appendBatch(batch [][]byte, flags uint16) (lsns []LSN, err error) {
+func (w *walWriter) appendBatch(batch [][]byte, flags uint16) ([]AppendResult, error) {
 	if len(batch) == 0 {
-		return nil, ErrNoRecords
+		return nil, nil
 	}
 
 retry:
-	lsns, err = w.segments.active.appendBatch(batch, flags)
+	results, err := w.segments.active.appendBatch(batch, flags)
 	if err == errSegmentInsufficientSpace {
 		if err = w.segments.rollover(); err != nil {
 			return nil, err
 		}
 		goto retry
 	}
-	return lsns, err
+	return results, err
 }
 
 func (w *walWriter) sync() error {

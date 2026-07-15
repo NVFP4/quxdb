@@ -21,7 +21,7 @@ func (r *walReader) read(lsn LSN) (*walRecord, LSN, error) {
 	return seg.read(lsn)
 }
 
-func (r *walReader) replay(fn func(Record) error) (LSN, error) {
+func (r *walReader) replay(callback func(Record) error) (LSN, error) {
 	var lsn LSN
 
 	for _, seg := range r.segments.segments {
@@ -37,7 +37,7 @@ func (r *walReader) replay(fn func(Record) error) (LSN, error) {
 				segErr = err
 				break
 			}
-			if err := fn(Record{Data: rec.data, LSN: LSN(rec.lsn)}); err != nil {
+			if err := callback(Record{Data: rec.data, LSN: LSN(rec.lsn)}); err != nil {
 				segErr = err
 				break
 			}

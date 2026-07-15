@@ -323,25 +323,24 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	}
 
 	appendStart := time.Now()
-	lsns, err := db.wal.AppendBatch(db.walBuf)
+	results, err := db.wal.AppendBatch(db.walBuf)
 
 	syncStart := time.Now()
-	if err == nil {
-		if fullSync {
-			err = db.wal.Sync()
-		}
-	} else {
-		fmt.Printf("batch got err: %v\n", err)
+	if err == nil && fullSync {
+		err = db.wal.Sync()
 	}
 
 	memStart := time.Now()
 	if err == nil {
 		for i, req := range batch {
-			if err = db.setMemtable(req.kv, lsns[i]); err != nil {
+			if results[i].Err != nil {
+				continue
+			}
+			if err := db.setMemtable(req.kv, results[i].LSN); err != nil {
 				panic(fmt.Sprintf("unknown error %v", err))
 			}
+			db.committedSeq.Store(req.kv.qkey.Seq())
 		}
-		db.committedSeq.Store(batch[len(batch)-1].kv.qkey.Seq())
 	}
 
 	commitEnd := time.Now()
@@ -349,14 +348,18 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 
 	for i, req := range batch {
 		lsn := uint64(0)
-		if err == nil {
-			lsn = uint64(lsns[i])
+		reqErr := err
+		if reqErr == nil {
+			reqErr = results[i].Err
+		}
+		if reqErr == nil {
+			lsn = uint64(results[i].LSN)
 		}
 
 		// unblock waiters
 		req.res = writeResult{
 			lsn:       lsn,
-			err:       err,
+			err:       reqErr,
 			queueWait: commitStart.Sub(req.enqueuedAt),
 			commitDur: commitDur,
 			totalDur:  commitEnd.Sub(req.enqueuedAt),

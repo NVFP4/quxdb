@@ -1,9 +1,11 @@
 package wal
 
 import (
-	"bytes"
+	"encoding/base32"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,33 +18,51 @@ import (
 )
 
 const (
-	walSegmentMaxSize = 64 * 1024 * 1024
-	walSegmentFlags   = 0
+	walSegmentMinSize     = 4 << 10  // 4KiB
+	walSegmentDefaultSize = 64 << 20 // 64MiB
+	walSegmentFlags       = 0
 )
 
 var (
-	ErrSegmentLSNMismatch  = errors.New("wal: lsn does not belong to this segment")
-	ErrSegmentLSNBefore    = errors.New("wal: lsn is before segment start")
+	ErrSegmentLSNInvalid   = errors.New("wal: lsn does not belong to this segment")
 	ErrTruncateOutOfBounds = errors.New("wal: truncate lsn outside segment bounds")
+	ErrSegmentReadOnly     = errors.New("wal: segment is read-only")
+)
+
+var (
+	crc32Table = crc32.MakeTable(crc32.Castagnoli)
+	base32Hex  = base32.HexEncoding.WithPadding(base32.NoPadding)
+)
+
+type segmentMode uint8
+
+const (
+	segmentModeReadOnly segmentMode = iota
+	segmentModeReadWrite
 )
 
 type walSegment struct {
 	path string
 	file *os.File
+	mode segmentMode
 
 	mmapMu sync.Mutex
 	mmap   []byte
 
-	cursor   int64
-	maxSize  int64
+	cursor   uint64
 	startLSN LSN
-	created  time.Time
-	sid      segID
-	flags    uint16
+
+	walHeader
 }
 
-func newSegment(dir string, id segID) (*walSegment, error) {
-	segPath := filepath.Join(dir, segmentName(id))
+func newSegment(dir string, id segID, segSize uint64) (*walSegment, error) {
+	createdAt := time.Now().UTC()
+	segPath := filepath.Join(dir, walDir, segmentName(createdAt, id))
+
+	if err := pathlib.EnsureParent(segPath); err != nil {
+		return nil, err
+	}
+
 	if !pathlib.FileEmpty(segPath) {
 		return nil, fmt.Errorf("wal: segment already exists for id=%d", id)
 	}
@@ -52,59 +72,78 @@ func newSegment(dir string, id segID) (*walSegment, error) {
 		return nil, fmt.Errorf("wal: %w", err)
 	}
 
-	if err := fs.Fallocate(file, 0, walSegmentMaxSize); err != nil {
-		return nil, err
+	if err := fs.Fallocate(file, 0, int64(segSize)); err != nil {
+		return nil, errors.Join(fmt.Errorf("wal: %w", err), file.Close())
 	}
 
-	h, offset, err := writeHeader(file, id, walSegmentMaxSize, walSegmentFlags)
+	h := walHeader{
+		segVer:     walVersion,
+		segId:      id,
+		createdAt:  createdAt,
+		segMaxSize: segSize,
+		segFlags:   walSegmentFlags,
+	}
+	n, err := writeHeader(file, &h)
 	if err != nil {
-		return nil, fmt.Errorf("wal: %w", err)
+		return nil, errors.Join(fmt.Errorf("wal: %w", err), file.Close())
 	}
-
-	sid := segID(h.sid)
-	maxSize := int64(h.maxSize)
+	offset := uint64(n)
 
 	seg := &walSegment{
-		cursor:   offset,
-		file:     file,
-		flags:    h.flags,
-		maxSize:  maxSize,
-		path:     segPath,
-		sid:      sid,
-		startLSN: newLSN(sid, offset),
-		created:  time.Unix(int64(h.created), 0).UTC(),
+		walHeader: h,
+		cursor:    offset,
+		file:      file,
+		path:      segPath,
+		startLSN:  newLSN(h.segId, offset, h.segMaxSize),
+		mode:      segmentModeReadWrite,
 	}
 
 	return seg, nil
 }
 
-func openSegment(segPath string) (*walSegment, error) {
-	file, err := os.OpenFile(segPath, os.O_CREATE|os.O_RDWR, 0o755)
+func openSegment(segPath string, segmentSize uint64, mode segmentMode) (*walSegment, error) {
+	var (
+		file  *os.File
+		err   error
+		flags int
+	)
+
+	switch mode {
+	case segmentModeReadOnly:
+		flags = os.O_RDONLY
+	case segmentModeReadWrite:
+		flags = os.O_RDWR
+	default:
+		return nil, fmt.Errorf("wal: segment id path=%q has invalid mode=%d", segPath, mode)
+	}
+	file, err = os.OpenFile(segPath, flags, 0)
 	if err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
 	}
 
-	h, startOffset, err := readHeader(file)
+	h, n, err := readHeader(file)
 	if err != nil {
-		return nil, fmt.Errorf("wal: %w", err)
+		return nil, errors.Join(fmt.Errorf("wal: %w", err), file.Close())
+	}
+	if h.segMaxSize != segmentSize {
+		return nil, errors.Join(fmt.Errorf("wal: segment id=%d size=%d does not match configured size=%d", h.segId, h.segMaxSize, segmentSize), file.Close())
 	}
 
-	maxSize := int64(h.maxSize)
-	endOffset := getLastOffset(file, startOffset, maxSize)
-	if endOffset > maxSize {
-		fmt.Printf("wal: segment id=%d is likely corrupt\n", h.sid)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("wal: stat segment id=%d: %w", h.segId, err), file.Close())
+	}
+	if info.Size() < int64(n) || uint64(info.Size()) > h.segMaxSize {
+		return nil, errors.Join(fmt.Errorf("wal: segment id=%d has invalid logical size=%d", h.segId, info.Size()), file.Close())
 	}
 
-	sid := segID(h.sid)
 	seg := &walSegment{
-		cursor:   endOffset,
-		file:     file,
-		flags:    h.flags,
-		maxSize:  maxSize,
-		path:     segPath,
-		sid:      sid,
-		startLSN: newLSN(sid, startOffset),
-		created:  time.Unix(int64(h.created), 0).UTC(),
+		walHeader: *h,
+		cursor:    uint64(info.Size()),
+		file:      file,
+		path:      segPath,
+		startLSN:  newLSN(h.segId, uint64(n), h.segMaxSize),
+		mode:      mode,
 	}
 
 	return seg, nil
@@ -118,52 +157,71 @@ func (s *walSegment) closeFile() error {
 	if s.file == nil {
 		return nil
 	}
-	if err := s.file.Close(); err != nil {
-		return err
-	}
-	s.file = nil
-	return nil
+
+	err := s.file.Close()
+	s.file = nil // we cleanup the ref, regardless of the error
+	return err
 }
 
 func (s *walSegment) openReadWrite() error {
-	if s.file != nil {
+	if s.mode == segmentModeReadWrite && s.file != nil {
 		return nil
+	}
+	if err := s.closeFile(); err != nil {
+		return err
 	}
 	file, err := os.OpenFile(s.path, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
 	s.file = file
+	s.mode = segmentModeReadWrite
 	return nil
 }
 
-func (s *walSegment) mmapReadOnly() ([]byte, error) {
+func (s *walSegment) openReadOnlyMmapLocked() ([]byte, error) {
+	if s.mmap != nil {
+		return s.mmap, nil
+	}
+	if s.mode != segmentModeReadOnly {
+		return nil, fmt.Errorf("wal: segment id=%d is not read-only", s.segId)
+	}
+
+	if s.file == nil {
+		file, err := os.OpenFile(s.path, os.O_RDONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		s.file = file
+	}
+
+	mmap, err := fs.Mmap(s.file, 0, int64(s.cursor))
+	if err != nil {
+		return nil, err
+	}
+
+	err = fs.Madvice(mmap, fs.MADV_SEQUENTIAL)
+	if err != nil {
+		fmt.Printf("madvice err %s\n", err)
+	}
+
+	if err := s.closeFile(); err != nil {
+		_ = fs.Munmap(mmap)
+		return nil, err
+	}
+	s.mmap = mmap
+	return mmap, nil
+}
+
+func (s *walSegment) getMmap() ([]byte, error) {
 	s.mmapMu.Lock()
 	defer s.mmapMu.Unlock()
 
 	if s.mmap != nil {
 		return s.mmap, nil
 	}
-	if s.cursor == 0 {
-		return nil, nil
-	}
 
-	file, err := os.OpenFile(s.path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-	mmap, err := fs.Mmap(file, 0, s.cursor)
-	closeErr := file.Close()
-	if err != nil {
-		return nil, errors.Join(err, closeErr)
-	}
-	if closeErr != nil {
-		_ = fs.Munmap(mmap)
-		return nil, closeErr
-	}
-
-	s.mmap = mmap
-	return s.mmap, nil
+	return s.openReadOnlyMmapLocked()
 }
 
 func (s *walSegment) munmap() error {
@@ -173,128 +231,217 @@ func (s *walSegment) munmap() error {
 	if s.mmap == nil {
 		return nil
 	}
-	if err := fs.Munmap(s.mmap); err != nil {
-		return err
-	}
+	err := fs.Munmap(s.mmap)
 	s.mmap = nil
-	return nil
+	return err
 }
 
-func (s *walSegment) read(lsn LSN) (*walRecord, LSN, error) {
-	if s.file != nil {
-		return s.readFrom(s.file, lsn)
+func (s *walSegment) read(lsn LSN) (rec *walRecord, next LSN, err error) {
+	switch s.mode {
+	case segmentModeReadWrite:
+		if s.file == nil {
+			return nil, 0, fmt.Errorf("wal: active segment id=%d has no file descriptor", s.segId)
+		}
+		return s.readFromReader(s.file, lsn)
+	case segmentModeReadOnly:
+		mmap, err := s.getMmap()
+		if err != nil {
+			return nil, 0, err
+		}
+		return s.readFromBytes(mmap, lsn)
+	default:
+		return nil, 0, fmt.Errorf("wal: segment id=%d has invalid mode=%d", s.segId, s.mode)
 	}
+}
 
-	mmap, err := s.mmapReadOnly()
+func (s *walSegment) readFromReader(r io.ReaderAt, lsn LSN) (*walRecord, LSN, error) {
+	offset, err := s.offsetFromLSN(lsn)
 	if err != nil {
 		return nil, 0, err
 	}
-	return s.readFrom(bytes.NewReader(mmap), lsn)
+
+	rec, _, err := readRecord(r, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	return s.finishRead(&rec, lsn, offset)
 }
 
-func (s *walSegment) readFrom(r io.ReaderAt, lsn LSN) (*walRecord, LSN, error) {
-	if s.sid != lsnSegID(lsn) {
-		return nil, 0, ErrSegmentLSNMismatch
+func (s *walSegment) readFromBytes(src []byte, lsn LSN) (*walRecord, LSN, error) {
+	offset, err := s.offsetFromLSN(lsn)
+	if err != nil {
+		return nil, 0, err
 	}
-	offset := lsnOffset(lsn)
-	if offset < lsnOffset(s.startLSN) {
-		return nil, 0, ErrSegmentLSNBefore
+
+	rec, err := readRecordBytes(src, offset)
+	if err != nil {
+		return nil, 0, err
 	}
-	// Fallocate leaves zeroes after the logical WAL cursor.
+	return s.finishRead(&rec, lsn, offset)
+}
+
+func (s *walSegment) offsetFromLSN(lsn LSN) (uint64, error) {
+	if s.segId != lsnSegID(lsn, s.segMaxSize) {
+		return 0, ErrSegmentLSNInvalid
+	}
+	offset := lsnOffset(lsn, s.segMaxSize)
+	if offset < lsnOffset(s.startLSN, s.segMaxSize) {
+		return 0, ErrSegmentLSNInvalid
+	}
+	// cursor is the logical WAL EOF, whether it came from fstat or appends.
 	if offset >= s.cursor {
-		return nil, 0, io.EOF
+		return 0, io.EOF
 	}
+	return offset, nil
+}
 
-	rec, err := readRecord(r, offset, s.cursor)
-	if err != nil {
-		return nil, 0, err
-	}
+func (s *walSegment) finishRead(rec *walRecord, lsn LSN, offset uint64) (*walRecord, LSN, error) {
 	if LSN(rec.lsn) != lsn {
-		return nil, 0, ErrRecordInvalidLSN
+		return nil, 0, fmt.Errorf("%w: expected=%d got=%d", ErrRecordInvalidLSN, lsn, rec.lsn)
 	}
 
-	nextOffset := offset + int64(rec.recLen)
-	return rec, newLSN(s.sid, nextOffset), nil
+	nextOffset := offset + uint64(rec.recLen)
+	if nextOffset > s.cursor || nextOffset > s.segMaxSize {
+		return nil, 0, ErrRecordTorn
+	}
+	return rec, newLSN(s.segId, nextOffset, s.segMaxSize), nil
 }
 
 func (s *walSegment) append(data []byte, flags uint16) (LSN, error) {
-	totalBytes := encodedRecordLen(data)
+	if s.mode != segmentModeReadWrite || s.file == nil {
+		return 0, ErrSegmentReadOnly
+	}
+	if err := validateDataLen(data); err != nil {
+		return 0, err
+	}
+
+	lsn := newLSN(s.segId, s.cursor, s.segMaxSize)
+	rec := newRecord(lsn, flags, data)
+	totalBytes := int(rec.recLen)
 	if err := s.checkRoom(totalBytes); err != nil {
 		return 0, err
 	}
 
-	lsn := newLSN(s.sid, s.cursor)
 	buf := bufpool.Get(uint(totalBytes))
 	defer bufpool.Put(buf)
 
-	encodeRecord(buf, lsn, flags, data)
-
-	n, err := s.file.WriteAt(buf, s.cursor)
+	_, err := encodeRecord(buf, &rec)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrRecordWrite, err)
-	}
-	if n != totalBytes {
-		return 0, fmt.Errorf("%w: %w", ErrRecordWrite, io.ErrShortWrite)
+		return 0, err
 	}
 
-	s.cursor += int64(totalBytes)
+	if err := s.writeAtCursor(buf); err != nil {
+		return 0, err
+	}
+
+	s.cursor += uint64(totalBytes)
 	return lsn, nil
 }
 
-func (s *walSegment) appendBatch(batch [][]byte, flags uint16) ([]LSN, error) {
-	totalBytes := encodedBatchLen(batch)
+func (s *walSegment) appendBatch(batch [][]byte, flags uint16) ([]AppendResult, error) {
+	if s.mode != segmentModeReadWrite || s.file == nil {
+		return nil, ErrSegmentReadOnly
+	}
+	results := make([]AppendResult, len(batch))
+	totalBytes := 0
+	for i, data := range batch {
+		if err := validateDataLen(data); err != nil {
+			results[i].Err = err
+			continue
+		}
+		totalBytes += encodedRecordLen(data)
+	}
+
+	if totalBytes == 0 {
+		return results, nil
+	}
 	if err := s.checkRoom(totalBytes); err != nil {
 		return nil, err
 	}
 
 	recOffset := s.cursor
 	bufOffset := 0
-
-	lsns := make([]LSN, len(batch))
 	buf := bufpool.Get(uint(totalBytes)) // allocate a big buffer pool for the whole batch
 	defer bufpool.Put(buf)
 
 	for i, data := range batch {
-		lsn := newLSN(s.sid, recOffset)
-		lsns[i] = lsn
-		n := encodeRecord(buf[bufOffset:], lsn, flags, data)
+		if results[i].Err != nil {
+			continue
+		}
+
+		lsn := newLSN(s.segId, recOffset, s.segMaxSize)
+		results[i].LSN = lsn
+
+		rec := newRecord(lsn, flags, data)
+		n, err := encodeRecord(buf[bufOffset:], &rec)
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
 		bufOffset += n
-		recOffset += int64(n)
+		recOffset += uint64(n)
 	}
 
-	n, err := s.file.WriteAt(buf, s.cursor)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrRecordWrite, err)
-	}
-	if n != totalBytes {
-		return nil, fmt.Errorf("%w: %w", ErrRecordWrite, io.ErrUnexpectedEOF)
+	if err := s.writeAtCursor(buf); err != nil {
+		return nil, err
 	}
 
 	s.cursor = recOffset
 
-	return lsns, nil
+	return results, nil
 }
 
 func (s *walSegment) checkRoom(n int) error {
-	if s.cursor+int64(n) < s.maxSize {
+	if s.cursor+uint64(n) < s.segMaxSize {
 		return nil
 	}
-	if lsnOffset(s.startLSN)+int64(n) >= s.maxSize {
+	if lsnOffset(s.startLSN, s.segMaxSize)+uint64(n) >= s.segMaxSize {
 		return ErrRecordTooLarge
 	}
 	return errSegmentInsufficientSpace
 }
 
 func (s *walSegment) sync() error {
+	if s.mode != segmentModeReadWrite || s.file == nil {
+		return ErrSegmentReadOnly
+	}
 	return fs.Fdatasync(s.file)
 }
 
-func (s *walSegment) truncate(lsn LSN) error {
-	if s.sid != lsnSegID(lsn) {
-		return ErrSegmentLSNMismatch
+func (s *walSegment) writeAtCursor(buf []byte) error {
+	n, err := s.file.WriteAt(buf, int64(s.cursor))
+	if err == nil && n == len(buf) {
+		return nil
 	}
-	offset := lsnOffset(lsn)
-	if offset < lsnOffset(s.startLSN) || offset > s.cursor {
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	if truncateErr := s.file.Truncate(int64(s.cursor)); truncateErr != nil {
+		return errors.Join(err, truncateErr)
+	}
+	return err
+}
+
+func (s *walSegment) seal() error {
+	if s.mode != segmentModeReadWrite || s.file == nil {
+		return ErrSegmentReadOnly
+	}
+	if err := fs.Fdatasync(s.file); err != nil {
+		return err
+	}
+	if err := s.closeFile(); err != nil {
+		return err
+	}
+	s.mode = segmentModeReadOnly
+	return nil
+}
+
+func (s *walSegment) truncate(lsn LSN) error {
+	if s.segId != lsnSegID(lsn, s.segMaxSize) {
+		return ErrSegmentLSNInvalid
+	}
+	offset := lsnOffset(lsn, s.segMaxSize)
+	if offset < lsnOffset(s.startLSN, s.segMaxSize) || offset > s.cursor {
 		return ErrTruncateOutOfBounds
 	}
 	if err := s.munmap(); err != nil {
@@ -303,7 +450,7 @@ func (s *walSegment) truncate(lsn LSN) error {
 	if err := s.openReadWrite(); err != nil {
 		return err
 	}
-	if err := s.file.Truncate(offset); err != nil {
+	if err := s.file.Truncate(int64(offset)); err != nil {
 		return err
 	}
 	if err := fs.Fdatasync(s.file); err != nil {
@@ -313,21 +460,26 @@ func (s *walSegment) truncate(lsn LSN) error {
 	return nil
 }
 
-func segmentName(id segID) string {
-	return fmt.Sprintf("%010d.quxwal", id)
+// Base32Hex(48-bit milliseconds | 32-bit ID)
+// timestamps > 48-bits will return undefined behavior
+// so worry after 10889-08-02 05:31:50.655 UTC
+func segmentName(ts time.Time, id segID) string {
+	var buf [10]byte
+	u := uint64(ts.UnixMilli())
+
+	// lower 48 bits of ts in big endian
+	buf[0] = byte(u >> 40)
+	buf[1] = byte(u >> 32)
+	buf[2] = byte(u >> 24)
+	buf[3] = byte(u >> 16)
+	buf[4] = byte(u >> 8)
+	buf[5] = byte(u)
+
+	binary.BigEndian.PutUint32(buf[6:], uint32(id))
+	return base32Hex.EncodeToString(buf[:]) + ".quxwal"
 }
 
-func getLastOffset(file io.ReaderAt, startOffset int64, maxSize int64) int64 {
-	next := startOffset
-	endOffset := startOffset
-
-	for {
-		rec, err := readRecordHeader(file, next, maxSize)
-		if err != nil {
-			break
-		}
-		next += int64(rec.recLen)
-		endOffset = next
-	}
-	return endOffset
+type AppendResult struct {
+	LSN LSN
+	Err error
 }
