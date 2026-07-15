@@ -1,7 +1,6 @@
 package memtable
 
 import (
-	"iter"
 	"slices"
 	"sync"
 	_ "unsafe"
@@ -9,9 +8,9 @@ import (
 
 const (
 	// With p=1/2, height 24 covers roughly 16 million entries at the top
-	// level, well above what a 64 MiB key/value data arena should hold.
+	// level, well above what a 16 MiB key/value data arena should hold.
 	slMaxHeight    = 24
-	slMaxDataBytes = 16 * 1024 * 1024
+	slMaxDataBytes = 16 << 20 // 16 MiB
 )
 
 type slNode struct {
@@ -84,14 +83,14 @@ func (a *slArena) key(i uint32) []byte {
 	n := &a.nodes[i]
 	start := int(n.keyOff)
 	end := start + int(n.keyLen)
-	return a.data[start:end]
+	return a.data[start:end:end]
 }
 
 func (a *slArena) value(i uint32) []byte {
 	n := &a.nodes[i]
 	start := int(n.valOff)
 	end := start + int(n.valLen)
-	return a.data[start:end]
+	return a.data[start:end:end]
 }
 
 func (a *slArena) setValue(i uint32, val []byte) error {
@@ -133,40 +132,48 @@ func (a *slArena) setNext(i uint32, level int, next uint32) {
 }
 
 type slMemtable struct {
-	mu     sync.RWMutex
-	arena  *slArena
-	cmp    Comparator
-	head   uint32
-	tail   [slMaxHeight]uint32
-	height int
-	len    int
+	mu        sync.RWMutex
+	arena     *slArena
+	cmp       Comparator
+	head      uint32
+	tail      [slMaxHeight]uint32
+	height    int
+	len       int
+	sizeBytes int
 }
 
 //go:linkname fastrand runtime.fastrand
 func fastrand() uint32
 
 func newSkiplistMemtable(opts ...Option) *slMemtable {
-	cfg := defaultOptions()
-	for _, opt := range opts {
-		opt(&cfg)
+	cfg := makeOptions(opts...)
+	m := &slMemtable{cmp: cfg.Comparator}
+	m.initLocked()
+	return m
+}
+
+func (m *slMemtable) initLocked() {
+	if m.arena != nil {
+		return
 	}
 
 	a := newArena(slMaxDataBytes)
-	m := &slMemtable{
-		arena:  a,
-		cmp:    cfg.Comparator,
-		head:   a.newHead(),
-		height: 1,
-	}
+	m.arena = a
+	m.head = a.newHead()
+	m.height = 1
+	m.len = 0
+	m.sizeBytes = 0
 	for i := range slMaxHeight {
 		m.tail[i] = m.head
 	}
-	return m
 }
 
 func (m *slMemtable) Get(key []byte) ([]byte, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.arena == nil {
+		return nil, false
+	}
 
 	x := m.findGreaterOrEqual(key, nil)
 	if x == 0 || m.cmp(m.arena.key(x), key) != 0 {
@@ -177,9 +184,12 @@ func (m *slMemtable) Get(key []byte) ([]byte, bool) {
 	return m.arena.value(x), true
 }
 
-func (m *slMemtable) SeekGE(key []byte) ([]byte, []byte, bool) {
+func (m *slMemtable) Seek(key []byte) ([]byte, []byte, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.arena == nil {
+		return nil, nil, false
+	}
 
 	x := m.findGreaterOrEqual(key, nil)
 	if x == 0 {
@@ -192,38 +202,19 @@ func (m *slMemtable) SeekGE(key []byte) ([]byte, []byte, bool) {
 func (m *slMemtable) Set(key, val []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.arena == nil && (len(key) > slMaxDataBytes || len(val) > slMaxDataBytes-len(key)) {
+		return ErrMemtableFull
+	}
+	m.initLocked()
 
 	return m.setLocked(key, val)
 }
-
-// func (m *slMemtable) Delete(key []byte) {
-// 	m.mu.Lock()
-// 	defer m.mu.Unlock()
-//
-// 	var prev [slMaxHeight]uint32
-// 	x := m.findGreaterOrEqual(key, &prev)
-// 	if x == 0 || m.cmp(m.arena.key(x), key) != 0 {
-// 		return
-// 	}
-//
-// 	h := int(m.arena.nodes[x].height)
-// 	for i := range h {
-// 		m.arena.setNext(prev[i], i, m.arena.next(x, i))
-// 		if m.tail[i] == x {
-// 			m.tail[i] = prev[i]
-// 		}
-// 	}
-// 	for m.height > 1 && m.arena.next(m.head, m.height-1) == 0 {
-// 		m.height--
-// 	}
-// 	m.len--
-// }
 
 func (m *slMemtable) SizeBytes() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	return len(m.arena.data)
+	return m.sizeBytes
 }
 
 func (m *slMemtable) Len() int {
@@ -233,33 +224,16 @@ func (m *slMemtable) Len() int {
 	return m.len
 }
 
-func (m *slMemtable) Iter() Iterator {
-	return m.IterRange(nil, nil)
-}
+func (m *slMemtable) Clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-func (m *slMemtable) IterFrom(key []byte) Iterator {
-	return m.IterRange(key, nil)
-}
-
-func (m *slMemtable) IterRange(start, end []byte) Iterator {
-	return func(yield func([]byte, []byte) bool) {
-		m.mu.RLock()
-		defer m.mu.RUnlock()
-
-		x := m.arena.next(m.head, 0)
-		if start != nil {
-			x = m.findGreaterOrEqual(start, nil)
-		}
-
-		for ; x != 0; x = m.arena.next(x, 0) {
-			if end != nil && m.cmp(m.arena.key(x), end) > 0 {
-				return
-			}
-			if !yield(m.arena.key(x), m.arena.value(x)) {
-				return
-			}
-		}
-	}
+	m.arena = nil
+	m.head = 0
+	m.tail = [slMaxHeight]uint32{}
+	m.height = 0
+	m.len = 0
+	m.sizeBytes = 0
 }
 
 func (m *slMemtable) setLocked(key, val []byte) error {
@@ -274,7 +248,12 @@ func (m *slMemtable) setLocked(key, val []byte) error {
 	var prev [slMaxHeight]uint32
 	x := m.findGreaterOrEqual(key, &prev)
 	if x != 0 && m.cmp(m.arena.key(x), key) == 0 {
-		return m.arena.setValue(x, val)
+		oldLen := int(m.arena.nodes[x].valLen)
+		if err := m.arena.setValue(x, val); err != nil {
+			return err
+		}
+		m.sizeBytes += len(val) - oldLen
+		return nil
 	}
 
 	if len(m.arena.data)+len(key)+len(val) > cap(m.arena.data) {
@@ -299,6 +278,7 @@ func (m *slMemtable) append(key, val []byte) {
 	}
 
 	m.len++
+	m.sizeBytes += len(key) + len(val)
 }
 
 func (m *slMemtable) insertAfter(key, val []byte, prev *[slMaxHeight]uint32) {
@@ -323,6 +303,7 @@ func (m *slMemtable) insertAfter(key, val []byte, prev *[slMaxHeight]uint32) {
 	}
 
 	m.len++
+	m.sizeBytes += len(key) + len(val)
 }
 
 func (m *slMemtable) randomHeight() int {
@@ -366,16 +347,53 @@ func (m *slMemtable) findGreaterOrEqual(key []byte, prev *[slMaxHeight]uint32) u
 var _ Memtable = (*slMemtable)(nil)
 
 type slCursor struct {
-	next func() ([]byte, []byte, bool)
+	m         *slMemtable
+	start     []byte
+	end       []byte
+	next      uint32
+	started   bool
+	exhausted bool
 }
 
 func (c *slCursor) Next() (key, value []byte, ok bool) {
-	return c.next()
+	c.m.mu.RLock()
+	defer c.m.mu.RUnlock()
+
+	if c.exhausted || c.m.arena == nil {
+		c.exhausted = true
+		return nil, nil, false
+	}
+
+	if !c.started {
+		c.next = c.m.arena.next(c.m.head, 0)
+		if c.start != nil {
+			c.next = c.m.findGreaterOrEqual(c.start, nil)
+		}
+		c.started = true
+	}
+
+	if c.next == 0 {
+		c.exhausted = true
+		return nil, nil, false
+	}
+
+	key = c.m.arena.key(c.next)
+	if c.end != nil && c.m.cmp(key, c.end) > 0 {
+		c.exhausted = true
+		return nil, nil, false
+	}
+
+	value = c.m.arena.value(c.next)
+	c.next = c.m.arena.next(c.next, 0)
+	return key, value, true
 }
 
 func (m *slMemtable) Cursor(start, end []byte) Cursor {
-	next, _ := iter.Pull2(m.IterRange(start, end))
-	return &slCursor{next: next}
+	return &slCursor{
+		m:     m,
+		start: start[:len(start):len(start)],
+		end:   end[:len(end):len(end)],
+	}
 }
 
 var _ Cursor = (*slCursor)(nil)

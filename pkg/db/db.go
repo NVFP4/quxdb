@@ -140,7 +140,7 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 }
 
 func getFromMemtable(mt *quxMemtable, key []byte, lookupKey quxKey) (value []byte, found bool, ok bool) {
-	internalKey, value, ok := mt.SeekGE(lookupKey)
+	internalKey, value, ok := mt.Seek(lookupKey)
 	if !ok {
 		return nil, false, false
 	}

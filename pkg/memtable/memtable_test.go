@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMemtable(t *testing.T) {
@@ -58,20 +59,24 @@ func TestMemtable(t *testing.T) {
 			}
 			assert.Equal(t, 100, m2.Len(), "Len expected 100")
 
-			// 6. Iterators
-			t.Run("Iterators", func(t *testing.T) {
-				// All
+			// 6. Cursor
+			t.Run("Cursor", func(t *testing.T) {
 				allCount := 0
-				for range m2.Iter() {
+				c := m2.Cursor(nil, nil)
+				for {
+					_, _, ok := c.Next()
+					if !ok {
+						break
+					}
 					allCount++
 				}
-				assert.Equal(t, 100, allCount, "All iterator expected 100 items")
+				assert.Equal(t, 100, allCount, "All cursor expected 100 items")
 			})
 		})
 	}
 }
 
-func TestMemtableIter(t *testing.T) {
+func TestMemtableCursor(t *testing.T) {
 	impls := []struct {
 		name    string
 		Factory func(...Option) Memtable
@@ -91,7 +96,12 @@ func TestMemtableIter(t *testing.T) {
 			}
 
 			var iterated []string
-			for k := range m.Iter() {
+			c := m.Cursor(nil, nil)
+			for {
+				k, _, ok := c.Next()
+				if !ok {
+					break
+				}
 				iterated = append(iterated, string(k))
 			}
 
@@ -99,34 +109,54 @@ func TestMemtableIter(t *testing.T) {
 			slices.Sort(expected)
 			assert.Equal(t, expected, iterated, "Keys are not sorted")
 
-			seekKey, seekVal, ok := m.SeekGE([]byte("applep"))
-			assert.True(t, ok, "SeekGE should find first key >= seek key")
+			seekKey, seekVal, ok := m.Seek([]byte("applep"))
+			assert.True(t, ok, "Seek should find first key >= seek key")
 			assert.Equal(t, []byte("applepie"), seekKey)
 			assert.Equal(t, []byte("val"), seekVal)
 
 			var fromApple []string
-			for k := range m.IterFrom([]byte("apple")) {
+			c = m.Cursor([]byte("apple"), nil)
+			for {
+				k, _, ok := c.Next()
+				if !ok {
+					break
+				}
 				fromApple = append(fromApple, string(k))
 			}
-			assert.Equal(t, []string{"apple", "applepie", "apricot", "b", "banana", "berry", "c", "cherry", "date"}, fromApple, "IterFrom should include first key >= start")
+			assert.Equal(t, []string{"apple", "applepie", "apricot", "b", "banana", "berry", "c", "cherry", "date"}, fromApple, "Cursor should include first key >= start")
 
 			var fromBetweenKeys []string
-			for k := range m.IterFrom([]byte("bb")) {
+			c = m.Cursor([]byte("bb"), nil)
+			for {
+				k, _, ok := c.Next()
+				if !ok {
+					break
+				}
 				fromBetweenKeys = append(fromBetweenKeys, string(k))
 			}
-			assert.Equal(t, []string{"berry", "c", "cherry", "date"}, fromBetweenKeys, "IterFrom should start at next key when start is absent")
+			assert.Equal(t, []string{"berry", "c", "cherry", "date"}, fromBetweenKeys, "Cursor should start at next key when start is absent")
 
 			var ranged []string
-			for k := range m.IterRange([]byte("apple"), []byte("c")) {
+			c = m.Cursor([]byte("apple"), []byte("c"))
+			for {
+				k, _, ok := c.Next()
+				if !ok {
+					break
+				}
 				ranged = append(ranged, string(k))
 			}
-			assert.Equal(t, []string{"apple", "applepie", "apricot", "b", "banana", "berry", "c"}, ranged, "IterRange should include both bounds")
+			assert.Equal(t, []string{"apple", "applepie", "apricot", "b", "banana", "berry", "c"}, ranged, "Cursor should include both bounds")
 
 			var emptyRange []string
-			for k := range m.IterRange([]byte("d"), []byte("a")) {
+			c = m.Cursor([]byte("d"), []byte("a"))
+			for {
+				k, _, ok := c.Next()
+				if !ok {
+					break
+				}
 				emptyRange = append(emptyRange, string(k))
 			}
-			assert.Empty(t, emptyRange, "IterRange should be empty when start is after end")
+			assert.Empty(t, emptyRange, "Cursor should be empty when start is after end")
 
 			// 2. Larger randomized test
 			m2 := impl.Factory()
@@ -143,15 +173,344 @@ func TestMemtableIter(t *testing.T) {
 
 			var lastKey []byte
 			iterCount := 0
-			for k := range m2.Iter() {
+			c = m2.Cursor(nil, nil)
+			for {
+				k, _, ok := c.Next()
+				if !ok {
+					break
+				}
 				if lastKey != nil {
-					assert.Greater(t, bytes.Compare(k, lastKey), 0, "Iterator out of order at position %d: %x -> %x", iterCount, lastKey, k)
+					assert.Greater(t, bytes.Compare(k, lastKey), 0, "Cursor out of order at position %d: %x -> %x", iterCount, lastKey, k)
 				}
 				lastKey = bytes.Clone(k)
 				iterCount++
 			}
 
-			assert.Equal(t, len(uniqueKeys), iterCount, "Iterator returned wrong number of unique keys")
+			assert.Equal(t, len(uniqueKeys), iterCount, "Cursor returned wrong number of unique keys")
+		})
+	}
+}
+
+func TestMemtableBorrowedViewsAreCapacityCapped(t *testing.T) {
+	impls := []struct {
+		name    string
+		Factory func(...Option) Memtable
+	}{
+		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
+		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
+	}
+
+	for _, impl := range impls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.Factory()
+			require.NoError(t, m.Set([]byte("a"), []byte("value-a")))
+			require.NoError(t, m.Set([]byte("b"), []byte("value-b")))
+
+			value, ok := m.Get([]byte("a"))
+			require.True(t, ok)
+			assert.Equal(t, len(value), cap(value))
+
+			key, value, ok := m.Seek([]byte("a"))
+			require.True(t, ok)
+			assert.Equal(t, len(key), cap(key))
+			assert.Equal(t, len(value), cap(value))
+
+			start := make([]byte, 1, 16)
+			end := make([]byte, 1, 16)
+			start[0], end[0] = 'a', 'b'
+			cursor := m.Cursor(start, end)
+			key, value, ok = cursor.Next()
+			require.True(t, ok)
+			assert.Equal(t, len(key), cap(key))
+			assert.Equal(t, len(value), cap(value))
+
+			switch cursor := cursor.(type) {
+			case *slCursor:
+				assert.Equal(t, len(cursor.start), cap(cursor.start))
+				assert.Equal(t, len(cursor.end), cap(cursor.end))
+			case *btreeCursor:
+				assert.Equal(t, len(cursor.start), cap(cursor.start))
+				assert.Equal(t, len(cursor.end), cap(cursor.end))
+			default:
+				t.Fatalf("unexpected cursor type %T", cursor)
+			}
+		})
+	}
+}
+
+func TestMemtableSizeBytesReportsLiveData(t *testing.T) {
+	impls := []struct {
+		name    string
+		Factory func(...Option) Memtable
+	}{
+		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
+		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
+	}
+
+	for _, impl := range impls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.Factory()
+			assert.Zero(t, m.SizeBytes())
+
+			require.NoError(t, m.Set([]byte("abc"), []byte("12")))
+			assert.Equal(t, 5, m.SizeBytes())
+
+			require.NoError(t, m.Set([]byte("abc"), []byte("12345")))
+			assert.Equal(t, 8, m.SizeBytes())
+
+			require.NoError(t, m.Set([]byte("abc"), []byte("x")))
+			assert.Equal(t, 4, m.SizeBytes())
+
+			require.NoError(t, m.Set([]byte("z"), []byte("vv")))
+			assert.Equal(t, 7, m.SizeBytes())
+			assert.Equal(t, 2, m.Len())
+		})
+	}
+}
+
+func TestMemtableClearReleasesStorageAndAllowsReuse(t *testing.T) {
+	impls := []struct {
+		name    string
+		Factory func(...Option) Memtable
+	}{
+		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
+		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
+	}
+
+	for _, impl := range impls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.Factory()
+			for i := range 200 {
+				require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("value")))
+			}
+			require.NotZero(t, m.Len())
+			require.NotZero(t, m.SizeBytes())
+
+			m.Clear()
+			assert.Zero(t, m.Len())
+			assert.Zero(t, m.SizeBytes())
+			_, ok := m.Get([]byte("key-000"))
+			assert.False(t, ok)
+			_, _, ok = m.Seek(nil)
+			assert.False(t, ok)
+			_, _, ok = m.Cursor(nil, nil).Next()
+			assert.False(t, ok)
+
+			switch m := m.(type) {
+			case *slMemtable:
+				assert.Nil(t, m.arena)
+				assert.Zero(t, m.head)
+				assert.Zero(t, m.height)
+				assert.Equal(t, [slMaxHeight]uint32{}, m.tail)
+			case *btreeMemtable:
+				assert.Nil(t, m.data)
+				assert.Nil(t, m.leafChunks)
+				assert.Nil(t, m.internalChunks)
+				assert.Zero(t, m.root)
+				assert.Zero(t, m.firstLeaf)
+				assert.Zero(t, m.lastLeaf)
+				assert.Zero(t, m.leafCount)
+				assert.Zero(t, m.internalCount)
+			default:
+				t.Fatalf("unexpected memtable type %T", m)
+			}
+
+			m.Clear() // idempotent
+			require.NoError(t, m.Set([]byte("new"), []byte("value")))
+			value, ok := m.Get([]byte("new"))
+			require.True(t, ok)
+			assert.Equal(t, []byte("value"), value)
+			assert.Equal(t, 1, m.Len())
+			assert.Equal(t, len("new")+len("value"), m.SizeBytes())
+			_, ok = m.Get([]byte("key-000"))
+			assert.False(t, ok)
+		})
+	}
+}
+
+func TestMemtableClearPreservesComparator(t *testing.T) {
+	reverse := func(a, b []byte) int { return bytes.Compare(b, a) }
+	for _, typ := range []MemTableType{Skiplist, BTree} {
+		t.Run(typ.String(), func(t *testing.T) {
+			m := New(typ, WithComparator(reverse))
+			require.NoError(t, m.Set([]byte("a"), nil))
+			m.Clear()
+			require.NoError(t, m.Set([]byte("a"), nil))
+			require.NoError(t, m.Set([]byte("b"), nil))
+
+			key, _, ok := m.Cursor(nil, nil).Next()
+			require.True(t, ok)
+			assert.Equal(t, []byte("b"), key)
+		})
+	}
+}
+
+func TestBTreeUpdateDoesNotSplitFullNodes(t *testing.T) {
+	t.Run("Root", func(t *testing.T) {
+		m := newBTreeMemtable().(*btreeMemtable)
+		for i := range btreeLeafMaxItems {
+			require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
+		}
+
+		root := m.root
+		leafCount := m.leafCount
+		internalCount := m.internalCount
+		require.NoError(t, m.Set([]byte("key-010"), []byte("updated")))
+
+		assert.Equal(t, root, m.root)
+		assert.Equal(t, leafCount, m.leafCount)
+		assert.Equal(t, internalCount, m.internalCount)
+		assert.Empty(t, m.internalChunks)
+		value, ok := m.Get([]byte("key-010"))
+		require.True(t, ok)
+		assert.Equal(t, []byte("updated"), value)
+	})
+
+	t.Run("Child", func(t *testing.T) {
+		m := newBTreeMemtable().(*btreeMemtable)
+		for i := range btreeLeafMaxItems + 1 {
+			require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
+		}
+
+		leafCount := m.leafCount
+		internalCount := m.internalCount
+		require.NoError(t, m.Set([]byte("key-010"), []byte("updated")))
+
+		assert.Equal(t, leafCount, m.leafCount)
+		assert.Equal(t, internalCount, m.internalCount)
+		value, ok := m.Get([]byte("key-010"))
+		require.True(t, ok)
+		assert.Equal(t, []byte("updated"), value)
+	})
+}
+
+func TestBTreeRootSplitCapacityFailureIsAtomic(t *testing.T) {
+	m := newBTreeMemtable().(*btreeMemtable)
+	for i := range btreeLeafMaxItems {
+		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
+	}
+
+	m.internalCount = btreeLeafBit
+	root := m.root
+	leafCount := m.leafCount
+	dataLen := m.dataLen
+	sizeBytes := m.sizeBytes
+	count := m.count
+
+	err := m.Set([]byte("key-999"), []byte("v"))
+	require.ErrorIs(t, err, ErrMemtableFull)
+	assert.Equal(t, root, m.root)
+	assert.Equal(t, leafCount, m.leafCount)
+	assert.Equal(t, uint32(btreeLeafBit), m.internalCount)
+	assert.Equal(t, dataLen, m.dataLen)
+	assert.Equal(t, sizeBytes, m.sizeBytes)
+	assert.Equal(t, count, m.count)
+	assert.Equal(t, uint16(btreeLeafMaxItems), m.leaf(root.index()).n)
+}
+
+func TestBTreeChunksAreSmallLazyAndDenseForAscendingInserts(t *testing.T) {
+	m := newBTreeMemtable().(*btreeMemtable)
+	assert.Equal(t, 128, btreeLeafChunkSize)
+	assert.Equal(t, 32, btreeInternalChunkSize)
+	assert.Len(t, m.leafChunks, 1)
+	assert.Empty(t, m.internalChunks)
+
+	for i := range btreeLeafMaxItems + 1 {
+		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
+	}
+
+	leftIdx := m.firstLeaf
+	left := m.leaf(leftIdx)
+	rightIdx := left.nextLeaf
+	right := m.leaf(rightIdx)
+	assert.Equal(t, uint16(btreeLeafMaxItems), left.n)
+	assert.Equal(t, uint16(1), right.n)
+	assert.Equal(t, rightIdx, m.lastLeaf)
+	assert.Equal(t, uint32(3), m.leafCount) // nil + two leaves
+	assert.Len(t, m.internalChunks, 1)
+}
+
+func TestBTreeAscendingInsertsAcrossInternalSplits(t *testing.T) {
+	const count = 10_000
+	m := newBTreeMemtable().(*btreeMemtable)
+	for i := range count {
+		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%05d", i), []byte("v")))
+	}
+
+	expectedLeaves := (count + btreeLeafMaxItems - 1) / btreeLeafMaxItems
+	assert.Equal(t, uint32(expectedLeaves+1), m.leafCount) // include nil leaf
+
+	leafCount := 0
+	for leafIdx := m.firstLeaf; leafIdx != 0; leafIdx = m.leaf(leafIdx).nextLeaf {
+		leafCount++
+		if leafIdx != m.lastLeaf {
+			assert.Equal(t, uint16(btreeLeafMaxItems), m.leaf(leafIdx).n)
+		}
+	}
+	assert.Equal(t, expectedLeaves, leafCount)
+
+	cursor := m.Cursor(nil, nil)
+	for i := range count {
+		key, value, ok := cursor.Next()
+		require.True(t, ok, "cursor ended at item %d", i)
+		assert.Equal(t, fmt.Sprintf("key-%05d", i), string(key))
+		assert.Equal(t, []byte("v"), value)
+	}
+	_, _, ok := cursor.Next()
+	assert.False(t, ok)
+}
+
+func TestBTreeCanRevisitFullLeafFromBiasedSplit(t *testing.T) {
+	m := newBTreeMemtable().(*btreeMemtable)
+	for i := range btreeLeafMaxItems + 1 {
+		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
+	}
+	require.NoError(t, m.Set([]byte("key-010a"), []byte("middle")))
+
+	value, ok := m.Get([]byte("key-010a"))
+	require.True(t, ok)
+	assert.Equal(t, []byte("middle"), value)
+	assert.Equal(t, btreeLeafMaxItems+2, m.Len())
+
+	var previous []byte
+	seen := 0
+	cursor := m.Cursor(nil, nil)
+	for {
+		key, _, ok := cursor.Next()
+		if !ok {
+			break
+		}
+		if previous != nil {
+			assert.Less(t, bytes.Compare(previous, key), 0)
+		}
+		previous = bytes.Clone(key)
+		seen++
+	}
+	assert.Equal(t, m.Len(), seen)
+}
+
+func TestBTreeCursorSkipsEmptyNonFinalLeaf(t *testing.T) {
+	m := newBTreeMemtable().(*btreeMemtable)
+	for i := range btreeLeafMaxItems + 1 {
+		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
+	}
+
+	m.leaf(m.firstLeaf).n = 0
+	cursor := m.Cursor(nil, nil)
+	key, value, ok := cursor.Next()
+	require.True(t, ok)
+	assert.Equal(t, []byte("key-063"), key)
+	assert.Equal(t, []byte("v"), value)
+	_, _, ok = cursor.Next()
+	assert.False(t, ok)
+}
+
+func TestMemtableRejectsNilComparator(t *testing.T) {
+	for _, typ := range []MemTableType{Skiplist, BTree} {
+		t.Run(typ.String(), func(t *testing.T) {
+			assert.PanicsWithValue(t, "memtable: nil comparator", func() {
+				New(typ, WithComparator(nil))
+			})
 		})
 	}
 }
@@ -180,7 +539,12 @@ func TestMemtableComparator(t *testing.T) {
 			m.Set([]byte{'b', 1}, []byte("b1"))
 
 			var iterated [][]byte
-			for k := range m.Iter() {
+			c := m.Cursor(nil, nil)
+			for {
+				k, _, ok := c.Next()
+				if !ok {
+					break
+				}
 				iterated = append(iterated, bytes.Clone(k))
 			}
 			assert.Equal(t, [][]byte{
@@ -190,17 +554,17 @@ func TestMemtableComparator(t *testing.T) {
 				{'b', 1},
 			}, iterated)
 
-			key, val, ok := m.SeekGE([]byte{'a', 2})
+			key, val, ok := m.Seek([]byte{'a', 2})
 			assert.True(t, ok)
 			assert.Equal(t, []byte{'a', 1}, key)
 			assert.Equal(t, []byte("a1"), val)
 
-			key, val, ok = m.SeekGE([]byte{'b', 3})
+			key, val, ok = m.Seek([]byte{'b', 3})
 			assert.True(t, ok)
 			assert.Equal(t, []byte{'b', 2}, key)
 			assert.Equal(t, []byte("b2"), val)
 
-			key, _, ok = m.SeekGE([]byte{'a', 0})
+			key, _, ok = m.Seek([]byte{'a', 0})
 			assert.True(t, ok)
 			assert.Equal(t, []byte{'b', 2}, key)
 		})
@@ -251,7 +615,7 @@ func TestMemtableConcurrency(t *testing.T) {
 	}
 }
 
-func TestBTreeIterReleasesReadLockBeforeYield(t *testing.T) {
+func TestBTreeCursorReleasesReadLockBetweenNextCalls(t *testing.T) {
 	m := newBTreeMemtable()
 	expected := make([]string, 0, btreeLeafMaxItems)
 
@@ -261,32 +625,38 @@ func TestBTreeIterReleasesReadLockBeforeYield(t *testing.T) {
 		assert.NoError(t, m.Set([]byte(key), []byte("value")))
 	}
 
-	reachedYield := make(chan struct{})
-	releaseYield := make(chan struct{})
-	iterDone := make(chan []string, 1)
+	reachedNext := make(chan struct{})
+	releaseNext := make(chan struct{})
+	cursorDone := make(chan []string, 1)
 
 	go func() {
 		got := make([]string, 0, btreeLeafMaxItems)
-		first := true
+		c := m.Cursor(nil, nil)
 
-		for key := range m.Iter() {
+		key, _, ok := c.Next()
+		if ok {
 			got = append(got, string(key))
-			if first {
-				close(reachedYield)
-				<-releaseYield
-				first = false
+		}
+		close(reachedNext)
+		<-releaseNext
+
+		for {
+			key, _, ok = c.Next()
+			if !ok {
+				break
 			}
+			got = append(got, string(key))
 		}
 
-		iterDone <- got
+		cursorDone <- got
 	}()
 
-	<-reachedYield
+	<-reachedNext
 
 	writeDone := make(chan error, 1)
 	go func() {
 		// The root leaf is full, so this write also forces a split while the
-		// iterator is paused in its consumer.
+		// cursor is paused between calls to Next.
 		writeDone <- m.Set([]byte("key-999"), []byte("value"))
 	}()
 
@@ -294,12 +664,12 @@ func TestBTreeIterReleasesReadLockBeforeYield(t *testing.T) {
 	case err := <-writeDone:
 		assert.NoError(t, err)
 	case <-time.After(time.Second):
-		close(releaseYield)
-		t.Fatal("write blocked while iterator was paused in yield")
+		close(releaseNext)
+		t.Fatal("write blocked while cursor was paused between Next calls")
 	}
 
-	close(releaseYield)
-	assert.Equal(t, expected, <-iterDone)
+	close(releaseNext)
+	assert.Equal(t, expected, <-cursorDone)
 }
 
 const (
@@ -307,7 +677,7 @@ const (
 	benchInternalKeyTrailerLen       = 8 + 1
 	benchOpSet                 uint8 = 1
 	benchOpSeekMax             uint8 = 0xff
-	benchIterKeys                    = 10_000
+	benchCursorKeys                  = 10_000
 )
 
 func makeInternalBenchKey(userKey []byte, seq uint64, op uint8) []byte {
@@ -430,7 +800,7 @@ func BenchmarkMemtable(b *testing.B) {
 				}
 			})
 
-			b.Run("SeekGE/Seq", func(b *testing.B) {
+			b.Run("Seek/Seq", func(b *testing.B) {
 				keys := make([][]byte, b.N)
 				for i := range b.N {
 					keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
@@ -444,11 +814,11 @@ func BenchmarkMemtable(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					m.SeekGE(keys[i])
+					m.Seek(keys[i])
 				}
 			})
 
-			b.Run("SeekGE/Rand", func(b *testing.B) {
+			b.Run("Seek/Rand", func(b *testing.B) {
 				rngLocal := rand.New(rand.NewSource(42))
 				keys := make([][]byte, b.N)
 				for i := range b.N {
@@ -468,32 +838,13 @@ func BenchmarkMemtable(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					m.SeekGE(keys[indices[i]])
-				}
-			})
-
-			b.Run("Iter/All", func(b *testing.B) {
-				m := impl.Factory()
-				for i := range benchIterKeys {
-					m.Set(fmt.Appendf(nil, "unique-seq:%016d", i), val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					count := 0
-					for range m.Iter() {
-						count++
-					}
-					if count != benchIterKeys {
-						b.Fatalf("expected %d, got %d", benchIterKeys, count)
-					}
+					m.Seek(keys[indices[i]])
 				}
 			})
 
 			b.Run("Cursor/All", func(b *testing.B) {
 				m := impl.Factory()
-				for i := range benchIterKeys {
+				for i := range benchCursorKeys {
 					m.Set(fmt.Appendf(nil, "unique-seq:%016d", i), val)
 				}
 
@@ -509,8 +860,8 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 						count++
 					}
-					if count != benchIterKeys {
-						b.Fatalf("expected %d, got %d", benchIterKeys, count)
+					if count != benchCursorKeys {
+						b.Fatalf("expected %d, got %d", benchCursorKeys, count)
 					}
 				}
 			})
@@ -594,7 +945,7 @@ func BenchmarkMemtable(b *testing.B) {
 					}
 				})
 
-				b.Run("SeekGE/Seq", func(b *testing.B) {
+				b.Run("Seek/Seq", func(b *testing.B) {
 					m := impl.Factory(WithComparator(compareInternalBenchKey))
 					keys := make([][]byte, b.N)
 					seekKeys := make([][]byte, b.N)
@@ -611,11 +962,11 @@ func BenchmarkMemtable(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						m.SeekGE(seekKeys[i])
+						m.Seek(seekKeys[i])
 					}
 				})
 
-				b.Run("SeekGE/Rand", func(b *testing.B) {
+				b.Run("Seek/Rand", func(b *testing.B) {
 					m := impl.Factory(WithComparator(compareInternalBenchKey))
 					rngLocal := rand.New(rand.NewSource(42))
 					keys := make([][]byte, b.N)
@@ -639,54 +990,34 @@ func BenchmarkMemtable(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						m.SeekGE(seekKeys[indices[i]])
+						m.Seek(seekKeys[indices[i]])
 					}
 				})
 
-			b.Run("Iter/All", func(b *testing.B) {
-				m := impl.Factory(WithComparator(compareInternalBenchKey))
-				for i := range benchIterKeys {
-					userKey := fmt.Appendf(nil, "unique-seq:%016d", i)
-					m.Set(makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet), val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					count := 0
-					for range m.Iter() {
-						count++
+				b.Run("Cursor/All", func(b *testing.B) {
+					m := impl.Factory(WithComparator(compareInternalBenchKey))
+					for i := range benchCursorKeys {
+						userKey := fmt.Appendf(nil, "unique-seq:%016d", i)
+						m.Set(makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet), val)
 					}
-					if count != benchIterKeys {
-						b.Fatalf("expected %d, got %d", benchIterKeys, count)
-					}
-				}
-			})
 
-			b.Run("Cursor/All", func(b *testing.B) {
-				m := impl.Factory(WithComparator(compareInternalBenchKey))
-				for i := range benchIterKeys {
-					userKey := fmt.Appendf(nil, "unique-seq:%016d", i)
-					m.Set(makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet), val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					count := 0
-					c := m.Cursor(nil, nil)
-					for {
-						_, _, ok := c.Next()
-						if !ok {
-							break
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						count := 0
+						c := m.Cursor(nil, nil)
+						for {
+							_, _, ok := c.Next()
+							if !ok {
+								break
+							}
+							count++
 						}
-						count++
+						if count != benchCursorKeys {
+							b.Fatalf("expected %d, got %d", benchCursorKeys, count)
+						}
 					}
-					if count != benchIterKeys {
-						b.Fatalf("expected %d, got %d", benchIterKeys, count)
-					}
-				}
-			})
+				})
 			})
 		})
 	}
