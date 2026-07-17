@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"encoding/binary"
 )
 
@@ -71,6 +72,20 @@ func (k quxKey) Decode() ([]byte, quxSeq, quxOp) {
 	return k.UserKey(), k.Seq(), k.Op()
 }
 
+func (k quxKey) Compare(userKey []byte) int {
+	return bytes.Compare(k.UserKey(), userKey)
+}
+
+func resolvePointLookup(key quxKey, value, userKey []byte) (bool, []byte, bool) {
+	if key.Compare(userKey) != 0 {
+		return false, nil, false
+	}
+	if key.Op() == quxOpDelete {
+		return true, nil, false
+	}
+	return true, value, true
+}
+
 // seek start (inclusive)
 // returns the newest version of `userKey` that is `<=seq`
 func newSeekStart(userKey []byte, seq quxSeq) quxKey {
@@ -79,6 +94,6 @@ func newSeekStart(userKey []byte, seq quxSeq) quxKey {
 
 // seek end (inclusive)
 // returns last possible `quxKey` for this `userKey`
-func newSeekEnd(userKey []byte) quxKey {
-	return newQuxKey(userKey, 0, quxOp(0x00))
+func newSeekEndInclusive(userKey []byte) quxKey {
+	return newQuxKey(userKey, quxSeq(0), quxOp(0))
 }

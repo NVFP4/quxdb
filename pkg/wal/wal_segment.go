@@ -202,7 +202,7 @@ func (s *walSegment) openReadOnlyMmapLocked() ([]byte, error) {
 
 	err = fs.Madvice(mmap, fs.MADV_SEQUENTIAL)
 	if err != nil {
-		fmt.Printf("madvice err %s\n", err)
+		fmt.Printf("wal: madvice err %s\n", err)
 	}
 
 	if err := s.closeFile(); err != nil {

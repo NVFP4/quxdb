@@ -2,7 +2,9 @@ package wal
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"slices"
 )
 
 type walReader struct {
@@ -22,10 +24,47 @@ func (r *walReader) read(lsn LSN) (*walRecord, LSN, error) {
 }
 
 func (r *walReader) replay(callback func(Record) error) (LSN, error) {
-	var lsn LSN
+	return r.replayAfter(0, callback)
+}
 
-	for _, seg := range r.segments.segments {
-		lsn = seg.startLSN
+func (r *walReader) replayAfter(last LSN, callback func(Record) error) (LSN, error) {
+	segments := r.segments.segments
+	if len(segments) == 0 {
+		if last == 0 {
+			return 0, nil
+		}
+		_, _, err := r.read(last)
+		return last, err
+	}
+
+	start := segments[0].startLSN
+	if last != 0 {
+		_, next, err := r.read(last)
+		if err != nil {
+			return last, err
+		}
+		start = next
+	}
+
+	startSegment, err := r.segments.segmentForLSN(start)
+	if err != nil {
+		return start, err
+	}
+	startOffset := lsnOffset(start, startSegment.segMaxSize)
+	if startOffset < lsnOffset(startSegment.startLSN, startSegment.segMaxSize) || startOffset > startSegment.cursor {
+		return start, fmt.Errorf("%w: lsn=%d", ErrSegmentLSNInvalid, start)
+	}
+
+	startIndex := slices.Index(segments, startSegment)
+	if err := closeSegments(segments[:startIndex]); err != nil {
+		return start, err
+	}
+
+	lsn := start
+	for i, seg := range segments[startIndex:] {
+		if i > 0 {
+			lsn = seg.startLSN
+		}
 		var segErr error
 
 		for {

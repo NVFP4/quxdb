@@ -4,6 +4,8 @@ import (
 	"slices"
 	"sync"
 	_ "unsafe"
+
+	"github.com/yashgorana/quxdb/pkg/core"
 )
 
 const (
@@ -388,7 +390,11 @@ func (c *slCursor) Next() (key, value []byte, ok bool) {
 	return key, value, true
 }
 
-func (m *slMemtable) Cursor(start, end []byte) Cursor {
+func (c *slCursor) Err() error {
+	return nil
+}
+
+func (m *slMemtable) Cursor(start, end []byte) core.Cursor {
 	return &slCursor{
 		m:     m,
 		start: start[:len(start):len(start)],
@@ -396,4 +402,4 @@ func (m *slMemtable) Cursor(start, end []byte) Cursor {
 	}
 }
 
-var _ Cursor = (*slCursor)(nil)
+var _ core.Cursor = (*slCursor)(nil)

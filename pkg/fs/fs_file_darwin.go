@@ -3,7 +3,6 @@
 package fs
 
 import (
-	"fmt"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -17,21 +16,19 @@ func Fdatasync(file *os.File) error {
 func Fallocate(file *os.File, offset int64, n int64) error {
 	fd := file.Fd()
 
+	// try a strict contiguous allocation
 	fstore := unix.Fstore_t{
-		Flags:   unix.F_ALLOCATECONTIG,
+		Flags:   unix.F_ALLOCATECONTIG | unix.F_ALLOCATEALL,
 		Posmode: unix.F_PEOFPOSMODE,
 		Offset:  offset,
 		Length:  n,
 	}
 
-	err := unix.FcntlFstore(fd, unix.F_PREALLOCATE, &fstore)
-	if err != nil {
-		return err
+	if err := unix.FcntlFstore(fd, unix.F_PREALLOCATE, &fstore); err == nil {
+		return nil
 	}
 
-	if err := unix.Ftruncate(int(fd), n); err != nil {
-		return fmt.Errorf("ftruncate logic pointer update failed: %w", err)
-	}
-
-	return nil
+	// on error, retry without F_ALLOCATECONTIG
+	fstore.Flags = unix.F_ALLOCATEALL
+	return unix.FcntlFstore(fd, unix.F_PREALLOCATE, &fstore)
 }

@@ -27,6 +27,8 @@ import (
 	"hash/crc32"
 	"io"
 	"time"
+
+	"github.com/yashgorana/quxdb/pkg/codec"
 )
 
 const (
@@ -84,43 +86,32 @@ func encodeHeader(dst []byte, h *walHeader) (int, error) {
 
 func decodeHeader(src []byte) (walHeader, int, error) {
 	var h walHeader
+	decoder := codec.NewDecoder(src)
 
-	off := 0
-	magic := binary.BigEndian.Uint32(src[off:])
+	magic := decoder.Uint32BE("header.magic")
+	h.segVer = decoder.Uint16("header.version")
+	h.segFlags = decoder.Uint16("header.flags")
+	h.segId = segID(decoder.Uint32("header.segmentID"))
+	h.segMaxSize = decoder.Uint64("header.segmentMaxSize")
+	created := decoder.Uint64("header.createdAt")
+	crcOff := decoder.Offset()
+	h.crc = decoder.Uint32("header.crc")
+
+	if err := decoder.Err(); err != nil {
+		return h, 0, err
+	}
 	if magic != walHeaderMagic32 {
 		return h, 0, ErrHeaderInvalidFormat
 	}
-	off += 4
-
-	h.segVer = binary.LittleEndian.Uint16(src[off:])
 	if h.segVer != walVersion {
 		return h, 0, ErrHeaderInvalidVer
 	}
-	off += 2
-
-	h.segFlags = binary.LittleEndian.Uint16(src[off:])
-	off += 2
-
-	h.segId = segID(binary.LittleEndian.Uint32(src[off:]))
-	off += 4
-
-	h.segMaxSize = binary.LittleEndian.Uint64(src[off:])
-	off += 8
-
-	created := binary.LittleEndian.Uint64(src[off:])
-	h.createdAt = time.Unix(0, int64(created)).UTC()
-	off += 8
-
-	crcOff := off
-	h.crc = binary.LittleEndian.Uint32(src[off:])
-	off += 4
-
-	expectedCRC := crc32.Checksum(src[:crcOff], crc32Table)
-	if h.crc != expectedCRC {
+	if h.crc != crc32.Checksum(src[:crcOff], crc32Table) {
 		return h, 0, ErrHeaderChecksumMismatch
 	}
 
-	return h, off, nil
+	h.createdAt = time.Unix(0, int64(created)).UTC()
+	return h, decoder.Offset(), nil
 }
 
 func writeHeader(w io.WriterAt, h *walHeader) (int, error) {

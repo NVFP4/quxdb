@@ -1,6 +1,7 @@
 package vset
 
 import (
+	"bytes"
 	"fmt"
 	"slices"
 	"sync"
@@ -8,10 +9,20 @@ import (
 	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
-const maxLevels = 8
+const MaxLevels = 5
 
-type TableMeta = sst.Metadata
-type Changes catalogRecord
+type Table = sst.Metadata
+
+type Checkpoint struct {
+	LastSeq uint64 `json:"seq"`
+	LastLSN uint64 `json:"lsn"`
+}
+
+type Change struct {
+	Op         Op
+	Table      Table
+	Checkpoint Checkpoint
+}
 
 type VersionSet struct {
 	catalog *catalog
@@ -26,11 +37,11 @@ func New(dir string) (*VersionSet, error) {
 	}
 
 	ver := &Version{
-		levels: newLevelMap(maxLevels),
+		levels: newLevelMap(MaxLevels),
 	}
 
 	err = catalog.replay(func(rec catalogRecord) error {
-		return applyRecord(ver, rec)
+		return applyRecordLocked(ver, rec)
 	})
 	if err != nil {
 		catalog.close()
@@ -49,7 +60,7 @@ func (vs *VersionSet) CurrentVersion() *Version {
 	return vs.latest
 }
 
-func (vs *VersionSet) Apply(changes []Changes) error {
+func (vs *VersionSet) Apply(changes []Change) error {
 	if len(changes) == 0 {
 		return nil
 	}
@@ -62,10 +73,23 @@ func (vs *VersionSet) Apply(changes []Changes) error {
 	}
 
 	newRecords := make([]catalogRecord, 0, len(changes))
-	for _, ch := range changes {
+	for i, ch := range changes {
 		switch ch.Op {
 		case OpAdd, OpDelete:
-			newRecords = append(newRecords, catalogRecord(ch))
+			table := ch.Table
+			newRecords = append(newRecords, catalogRecord{
+				Op:    ch.Op,
+				Table: &table,
+			})
+		case OpCheckpoint:
+			if i != len(changes)-1 {
+				return ErrRecordCorrupt
+			}
+			checkpoint := ch.Checkpoint
+			newRecords = append(newRecords, catalogRecord{
+				Op:         ch.Op,
+				Checkpoint: &checkpoint,
+			})
 		default:
 			return ErrRecordCorrupt
 		}
@@ -87,34 +111,69 @@ func (vs *VersionSet) Apply(changes []Changes) error {
 func buildNextVersion(current *Version, newRecords []catalogRecord) (*Version, error) {
 	next := current.Clone()
 	for _, rec := range newRecords {
-		if err := applyRecord(next, rec); err != nil {
+		if err := applyRecordLocked(next, rec); err != nil {
 			return nil, err
 		}
 	}
 	return next, nil
 }
 
-func applyRecord(ver *Version, rec catalogRecord) error {
+func applyRecordLocked(ver *Version, rec catalogRecord) error {
 	switch rec.Op {
 	case OpAdd:
-		deleteTable(ver.levels, rec.Meta.ID)
-		if rec.Meta.Level >= maxLevels {
-			return fmt.Errorf("level out of bounds '%d'", rec.Meta.Level)
+		if rec.Table == nil || rec.Checkpoint != nil {
+			return ErrRecordCorrupt
 		}
-		lvl := int(rec.Meta.Level)
-		ver.levels[lvl] = append(ver.levels[lvl], rec.Meta)
+		deleteTableLocked(ver.levels, rec.Table.ID)
+		if rec.Table.Level >= MaxLevels {
+			return fmt.Errorf("level out of bounds '%d'", rec.Table.Level)
+		}
+		if err := addTableLocked(ver.levels, *rec.Table); err != nil {
+			return err
+		}
 	case OpDelete:
-		deleteTable(ver.levels, rec.Meta.ID)
+		if rec.Table == nil || rec.Checkpoint != nil {
+			return ErrRecordCorrupt
+		}
+		deleteTableLocked(ver.levels, rec.Table.ID)
+	case OpCheckpoint:
+		if rec.Table != nil || rec.Checkpoint == nil {
+			return ErrRecordCorrupt
+		}
+		checkpoint := *rec.Checkpoint
+		if (checkpoint.LastSeq == 0) != (checkpoint.LastLSN == 0) ||
+			checkpoint.LastSeq < ver.checkpoint.LastSeq ||
+			(checkpoint.LastSeq == ver.checkpoint.LastSeq && checkpoint.LastLSN != ver.checkpoint.LastLSN) {
+			return ErrRecordCorrupt
+		}
+		ver.checkpoint = checkpoint
 	default:
 		return ErrRecordCorrupt
 	}
 	return nil
 }
 
-func deleteTable(levels LevelMap, id uint64) {
+func addTableLocked(levels LevelMap, t Table) error {
+	lvl := int(t.Level)
+
+	if lvl == 0 {
+		levels[lvl] = append(levels[lvl], t)
+		return nil
+	}
+
+	tables := levels[lvl]
+	idx, _ := slices.BinarySearchFunc(tables, t.MinKey, func(t Table, key []byte) int {
+		return bytes.Compare(t.MinKey, key)
+	})
+
+	levels[lvl] = slices.Insert(tables, idx, t)
+	return nil
+}
+
+func deleteTableLocked(levels LevelMap, id uint64) {
 	for lvl, metas := range levels {
-		metas = slices.DeleteFunc(metas, func(meta TableMeta) bool {
-			return meta.ID == id
+		metas = slices.DeleteFunc(metas, func(t Table) bool {
+			return t.ID == id
 		})
 		if len(metas) == 0 {
 			delete(levels, lvl)

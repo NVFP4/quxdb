@@ -11,7 +11,7 @@ import (
 	"github.com/yashgorana/quxdb/pkg/db"
 )
 
-const maxBodyBytes = 1024 * 1024 // 1MB
+const maxBodyBytes = 1 << 20 // 1MiB
 
 func hPutKey(db *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

@@ -13,6 +13,6 @@ func Fdatasync(file *os.File) error {
 }
 
 func Fallocate(file *os.File, offset int64, n int64) error {
-	// Mode 0 ensures the space is allocated and the file size is updated.
-	return unix.Fallocate(int(file.Fd()), 0, offset, n)
+	// reserve blocks, without increasing the file size
+	return unix.Fallocate(int(file.Fd()), unix.FALLOC_FL_KEEP_SIZE, offset, n)
 }

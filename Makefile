@@ -28,10 +28,14 @@ dev: ## Run the server with hot reloading
 run: ## Run the server without hot reloading
 	$(BUILD_ENV) go run ./cmd/server/
 
+.PHONY: runb
+runb: ## Run the server binary
+	.out/quxdb-server
+
 .PHONY: build
 build: ## Build the server
 	@mkdir -p .out && rm -f .out/*
-	$(BUILD_ENV) go build -o .out/quxdb-server ./cmd/server/
+	$(BUILD_ENV) go build -trimpath -ldflags="$(BUILD_LDFLAGS)" -o .out/quxdb-server ./cmd/server/
 
 .PHONY: test
 test: ## Run tests

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+
+	"github.com/yashgorana/quxdb/pkg/codec"
 )
 
 /*
@@ -57,6 +59,15 @@ var (
 	ErrRecordChecksumMismatch = errors.New("record checksum mismatch")
 )
 
+// IsCorruption reports whether err indicates damaged WAL record data.
+func IsCorruption(err error) bool {
+	return errors.Is(err, ErrRecordInvalidFormat) ||
+		errors.Is(err, ErrRecordInvalidSize) ||
+		errors.Is(err, ErrRecordInvalidLSN) ||
+		errors.Is(err, ErrRecordTorn) ||
+		errors.Is(err, ErrRecordChecksumMismatch)
+}
+
 type walRecordHeader struct {
 	lsn       uint64
 	headerCRC uint32
@@ -105,45 +116,34 @@ func decodeRecordHeader(src []byte) (walRecordHeader, int, error) {
 	if len(src) < walRecordHeaderLen {
 		return h, 0, ErrRecordTorn
 	}
-	off := 0
 
-	magic := binary.BigEndian.Uint32(src[off:])
+	decoder := codec.NewDecoder(src)
+	magic := decoder.Uint32BE("record.magic")
+	h.recLen = decoder.Uint32("record.length")
+	h.recType = decoder.Uint16("record.type")
+	h.recFlags = decoder.Uint16("record.flags")
+	h.lsn = decoder.Uint64("record.lsn")
+	h.dataLen = decoder.Uint32("record.dataLength")
+	crcOff := decoder.Offset()
+	h.headerCRC = decoder.Uint32("record.headerCRC")
+
+	if err := decoder.Err(); err != nil {
+		return h, 0, err
+	}
 	if magic != walRecordMagic32 {
 		return h, 0, ErrRecordInvalidFormat
 	}
-	off += 4
-
-	h.recLen = binary.LittleEndian.Uint32(src[off:])
-	off += 4
 	if h.recLen < walRecordHeaderLen+walRecordMetaLen || h.recLen%8 != 0 {
 		return h, 0, ErrRecordTorn
 	}
-
-	h.recType = binary.LittleEndian.Uint16(src[off:])
-	off += 2
-
-	h.recFlags = binary.LittleEndian.Uint16(src[off:])
-	off += 2
-
-	h.lsn = binary.LittleEndian.Uint64(src[off:])
-	off += 8
-
-	h.dataLen = binary.LittleEndian.Uint32(src[off:])
-	off += 4
-	crcOff := off
 	if err := validateDataWithinRecordBounds(int(h.dataLen), h.recLen); err != nil {
 		return h, 0, err
 	}
-
-	h.headerCRC = binary.LittleEndian.Uint32(src[off:])
-	off += 4
-
-	expectedCRC := crc32.Checksum(src[:crcOff], crc32Table)
-	if h.headerCRC != expectedCRC {
+	if h.headerCRC != crc32.Checksum(src[:crcOff], crc32Table) {
 		return h, 0, ErrRecordChecksumMismatch
 	}
 
-	return h, off, nil
+	return h, decoder.Offset(), nil
 }
 
 func newRecord(lsn LSN, flags uint16, data []byte) walRecord {
@@ -192,20 +192,18 @@ func decodeRecord(src []byte) (walRecord, int, error) {
 		return walRecord{}, 0, ErrRecordTorn
 	}
 
-	rec := walRecord{
-		walRecordHeader: h,
-	}
-	dataEnd := off + int(rec.dataLen)
-	crcOff := dataEnd
+	rec := walRecord{walRecordHeader: h}
+	decoder := codec.NewDecoder(src[off:h.recLen])
 
 	// caller must clone this slice as the underlying buffer will be short-lived
-	rec.data = src[off:dataEnd]
-	off = dataEnd
+	rec.data = decoder.Bytes("record.data", int(rec.dataLen))
+	crcOff := off + decoder.Offset()
+	rec.crc = decoder.Uint32("record.crc")
 
-	rec.crc = binary.LittleEndian.Uint32(src[off:])
-	off += 4
-	expectedCRC := crc32.Checksum(src[:crcOff], crc32Table)
-	if rec.crc != expectedCRC {
+	if err := decoder.Err(); err != nil {
+		return walRecord{}, 0, err
+	}
+	if rec.crc != crc32.Checksum(src[:crcOff], crc32Table) {
 		return walRecord{}, 0, ErrRecordChecksumMismatch
 	}
 

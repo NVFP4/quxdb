@@ -7,7 +7,7 @@ import (
 
 const (
 	nBuckets      = 13
-	minBucketSize = 1024                            // min 1 KiB
+	minBucketSize = 1 << 10                         // min 1 KiB
 	maxBucketSize = minBucketSize << (nBuckets - 1) // max 4 MiB
 )
 
@@ -29,7 +29,7 @@ func init() {
 func Get(size uint) []byte {
 	pIdx := poolIndex(size)
 	if pIdx < 0 {
-		return make([]byte, size) // too large m8, heap it
+		return make([]byte, 0, size) // too large m8, heap it
 	}
 
 	bufPtr := bufferPools[pIdx].Get().(*[]byte)

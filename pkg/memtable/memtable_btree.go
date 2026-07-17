@@ -2,6 +2,8 @@ package memtable
 
 import (
 	"sync"
+
+	"github.com/yashgorana/quxdb/pkg/core"
 )
 
 const (
@@ -666,12 +668,16 @@ type btreeCursor struct {
 	exhausted bool
 }
 
-func (m *btreeMemtable) Cursor(start, end []byte) Cursor {
+func (m *btreeMemtable) Cursor(start, end []byte) core.Cursor {
 	return &btreeCursor{
 		m:     m,
 		start: start[:len(start):len(start)],
 		end:   end[:len(end):len(end)],
 	}
+}
+
+func (c *btreeCursor) Err() error {
+	return nil
 }
 
 func (c *btreeCursor) Next() (key, value []byte, ok bool) {
@@ -710,4 +716,4 @@ func (c *btreeCursor) Next() (key, value []byte, ok bool) {
 	}
 }
 
-var _ Cursor = (*btreeCursor)(nil)
+var _ core.Cursor = (*btreeCursor)(nil)

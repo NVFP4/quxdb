@@ -3,12 +3,15 @@ package db
 import (
 	"bytes"
 	"iter"
+
+	"github.com/yashgorana/quxdb/pkg/core"
 )
 
 type mergeCursor struct {
-	cur   *mvccCursor
+	cur   core.Cursor
 	qkey  quxKey
 	value []byte
+	order int
 }
 
 func (c *mergeCursor) advance() bool {
@@ -26,12 +29,27 @@ func (c *mergeCursor) advance() bool {
 
 type mergeHeap []*mergeCursor
 
+func newMergeHeap[T core.Cursor](cursors []T) (mergeHeap, error) {
+	h := make(mergeHeap, 0, len(cursors))
+	for i, cur := range cursors {
+		mc := &mergeCursor{cur: cur, order: i}
+		if mc.advance() {
+			h.push(mc)
+			continue
+		}
+		if err := cur.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return h, nil
+}
+
 func (h *mergeHeap) push(cursor *mergeCursor) {
 	*h = append(*h, cursor)
 
 	for child := len(*h) - 1; child > 0; {
 		parent := (child - 1) / 2
-		if bytes.Compare((*h)[parent].qkey, (*h)[child].qkey) <= 0 {
+		if !mergeLess((*h)[child], (*h)[parent]) {
 			return
 		}
 		(*h)[parent], (*h)[child] = (*h)[child], (*h)[parent]
@@ -39,11 +57,11 @@ func (h *mergeHeap) push(cursor *mergeCursor) {
 	}
 }
 
-func (h *mergeHeap) advanceRoot() {
+func (h *mergeHeap) advanceRoot() error {
 	root := (*h)[0]
 	if root.advance() {
 		h.siftDown()
-		return
+		return nil
 	}
 
 	last := len(*h) - 1
@@ -54,6 +72,7 @@ func (h *mergeHeap) advanceRoot() {
 	if len(*h) > 0 {
 		h.siftDown()
 	}
+	return root.cur.Err()
 }
 
 func (h *mergeHeap) siftDown() {
@@ -65,10 +84,10 @@ func (h *mergeHeap) siftDown() {
 
 		child := left
 		right := left + 1
-		if right < len(*h) && bytes.Compare((*h)[right].qkey, (*h)[left].qkey) < 0 {
+		if right < len(*h) && mergeLess((*h)[right], (*h)[left]) {
 			child = right
 		}
-		if bytes.Compare((*h)[parent].qkey, (*h)[child].qkey) <= 0 {
+		if !mergeLess((*h)[child], (*h)[parent]) {
 			break
 		}
 
@@ -77,27 +96,27 @@ func (h *mergeHeap) siftDown() {
 	}
 }
 
+func mergeLess(a, b *mergeCursor) bool {
+	cmp := bytes.Compare(a.qkey, b.qkey)
+	return cmp < 0 || cmp == 0 && a.order < b.order
+}
+
 // mergeIter performs k-way merge of cursors by qkey.
-func mergeIter(cursors []*mvccCursor) iter.Seq2[quxKey, []byte] {
+func mergeIter[T core.Cursor](cursors []T) iter.Seq2[quxKey, []byte] {
 	return func(yield func(quxKey, []byte) bool) {
-		h := make(mergeHeap, 0, len(cursors))
-		for _, cur := range cursors {
-			mc := &mergeCursor{cur: cur}
-			if mc.advance() {
-				h.push(mc)
-			}
+		h, err := newMergeHeap(cursors)
+		if err != nil {
+			return
 		}
 
 		for len(h) > 0 {
 			cursor := h[0]
-			qkey := cursor.qkey
-			val := cursor.value
-
-			if !yield(qkey, val) {
+			if !yield(cursor.qkey, cursor.value) {
 				return
 			}
-
-			h.advanceRoot()
+			if err := h.advanceRoot(); err != nil {
+				return
+			}
 		}
 	}
 }

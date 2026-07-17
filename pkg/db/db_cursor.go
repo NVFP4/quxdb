@@ -3,12 +3,12 @@ package db
 import (
 	"bytes"
 
-	"github.com/yashgorana/quxdb/pkg/memtable"
+	"github.com/yashgorana/quxdb/pkg/core"
 )
 
-// mvccCursor emits at most one visible version per user key from a single memtable.
+// mvccCursor emits the newest visible version per user key from one sorted source.
 type mvccCursor struct {
-	cur     memtable.Cursor
+	cur     core.Cursor
 	readSeq quxSeq
 
 	skipUserKey []byte
@@ -36,4 +36,8 @@ func (c *mvccCursor) Next() (key, value []byte, ok bool) {
 			return key, value, true
 		}
 	}
+}
+
+func (c *mvccCursor) Err() error {
+	return c.cur.Err()
 }

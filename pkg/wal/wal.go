@@ -12,7 +12,7 @@ const (
 
 type Record struct {
 	LSN LSN
-	// valid only until WAL operation. callers must clone.
+	// Data is valid until the next WAL operation; clone it to retain it.
 	Data []byte
 }
 
@@ -45,7 +45,7 @@ func (w *WAL) Open() error {
 	}
 
 	for _, seg := range w.segments.segments {
-		fmt.Printf("wal segment id=%d mode=%d size=%dMiB startLSN=%d cursor=0x%x createdAt='%s'\n",
+		fmt.Printf("wal: segment id=%d mode=%d size=%dMiB startLSN=%d cursor=0x%x createdAt='%s'\n",
 			seg.segId,
 			seg.mode,
 			seg.segMaxSize>>20,
@@ -83,7 +83,7 @@ func (w *WAL) Sync() error {
 	return w.writer.sync()
 }
 
-// Append expects that WAL has been opened, replayed and corruptions trucated.
+// Append requires Open and recovery to complete first.
 func (w *WAL) Append(data []byte) (lsn LSN, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -105,9 +105,26 @@ func (w *WAL) TruncateFrom(lsn LSN) error {
 	return w.writer.truncate(lsn)
 }
 
+// PruneBefore deletes sealed segments preceding lsn's segment; zero is a no-op.
+func (w *WAL) PruneBefore(lsn LSN) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.segments.pruneBefore(lsn)
+}
+
+// Replay replays all records in WAL order.
 func (w *WAL) Replay(callback func(Record) error) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	return w.reader.replay(callback)
+}
+
+// ReplayAfter replays records following lsn; zero starts at the oldest record.
+func (w *WAL) ReplayAfter(lsn LSN, callback func(Record) error) (LSN, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.reader.replayAfter(lsn, callback)
 }

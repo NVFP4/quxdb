@@ -114,6 +114,42 @@ func (s *segmentSet) rollover() error {
 	return nil
 }
 
+func (s *segmentSet) pruneBefore(lsn LSN) error {
+	if lsn == 0 {
+		return nil
+	}
+
+	target, err := s.segmentForLSN(lsn)
+	if err != nil {
+		return err
+	}
+	offset := lsnOffset(lsn, target.segMaxSize)
+	if offset < lsnOffset(target.startLSN, target.segMaxSize) || offset > target.cursor {
+		return fmt.Errorf("%w: lsn=%d", ErrSegmentLSNInvalid, lsn)
+	}
+
+	targetIdx := slices.Index(s.segments, target)
+	if targetIdx == -1 {
+		return fmt.Errorf("wal: segment id=%d not found", target.segId)
+	}
+
+	for range targetIdx {
+		seg := s.segments[0]
+		if err := seg.close(); err != nil {
+			return fmt.Errorf("wal: close segment id=%d before prune: %w", seg.segId, err)
+		}
+		if err := os.Remove(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("wal: prune segment id=%d: %w", seg.segId, err)
+		}
+
+		delete(s.byID, seg.segId)
+		s.segments[0] = nil
+		s.segments = s.segments[1:]
+	}
+
+	return nil
+}
+
 func (s *segmentSet) truncateTail(lsn LSN) error {
 	targetSID := lsnSegID(lsn, s.segSize)
 	target := s.byID[targetSID]
@@ -121,7 +157,6 @@ func (s *segmentSet) truncateTail(lsn LSN) error {
 		return fmt.Errorf("wal: unknown segment id=%d", targetSID)
 	}
 
-	// validate the truncation
 	if err := target.truncate(lsn); err != nil {
 		return err
 	}
@@ -134,18 +169,13 @@ func (s *segmentSet) truncateTail(lsn LSN) error {
 	cut := targetIdx + 1
 	var errs []error
 	for _, seg := range s.segments[cut:] {
-		// try closing it
 		errs = append(errs, seg.close())
-		// delete it - if its ENOENT, ignore it
 		if err := os.Remove(seg.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
-		// remove from map
 		delete(s.byID, seg.segId)
 	}
-	// prune the segment list, regardless of errors
-	// we're already at a point of no return in the truncation
-	// just return the errors for logging/debugging
+	// Truncation is irreversible; retain state changes even when cleanup fails.
 	clear(s.segments[cut:])
 	s.segments = s.segments[:cut]
 

@@ -28,11 +28,13 @@ type Op int
 const (
 	OpAdd Op = iota + 1
 	OpDelete
+	OpCheckpoint
 )
 
 type catalogRecord struct {
-	Op   Op        `json:"op"`
-	Meta TableMeta `json:"meta"`
+	Op         Op          `json:"op"`
+	Table      *Table      `json:"table,omitempty"`
+	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`
 }
 
 type catalog struct {

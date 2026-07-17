@@ -34,4 +34,5 @@ Thumbs.db
 
 # project files
 quxdata
-
+*.log
+*.txt

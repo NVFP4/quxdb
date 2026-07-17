@@ -3,6 +3,8 @@ package memtable
 import (
 	"bytes"
 	"errors"
+
+	"github.com/yashgorana/quxdb/pkg/core"
 )
 
 type MemTableType int
@@ -48,16 +50,7 @@ type Memtable interface {
 	// Cursor returns a weakly consistent cursor over the inclusive [start, end]
 	// range. A nil bound is unbounded. Bounds are borrowed and must remain
 	// immutable until the cursor is exhausted.
-	Cursor(start, end []byte) Cursor
-}
-
-// ----------------------------------------------------------------------------
-
-type Cursor interface {
-	// Next returns borrowed, immutable views with capacity equal to their
-	// length. Clone them before mutation or retaining them across writes. A
-	// Cursor is not a snapshot and is not safe for concurrent calls to Next.
-	Next() (key, value []byte, ok bool)
+	Cursor(start, end []byte) core.Cursor
 }
 
 // ----------------------------------------------------------------------------

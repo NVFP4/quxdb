@@ -6,15 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	"github.com/yashgorana/quxdb/pkg/bufpool"
 	"github.com/yashgorana/quxdb/pkg/memtable"
 	"github.com/yashgorana/quxdb/pkg/metrics"
 	"github.com/yashgorana/quxdb/pkg/pathlib"
+	"github.com/yashgorana/quxdb/pkg/sst"
 	"github.com/yashgorana/quxdb/pkg/wal"
 )
 
@@ -22,26 +26,33 @@ const (
 	memTableType = memtable.BTree
 	maxBatch     = 128
 	fullSync     = false
+
+	imtFlushThreshold = 1 // holds this many `imt` in memory before flushing
+	maxImt            = 4 // `imt` beyond this value stalls write
 )
 
 type QuxDB struct {
 	committedSeq atomic.Uint64
 	_            [56]byte // cache line padding
 
-	// writeSeq is the last assigned sequence and is owned by writeLoop.
-	writeSeq quxSeq
+	// writeSeq and lastCommittedLSN are owned by writeLoop after recovery.
+	writeSeq         quxSeq
+	lastCommittedLSN wal.LSN
 
 	dataDir string
+	flock   *flock.Flock
 
 	reqPool sync.Pool
 	reqChan chan *writeReq
+	workers sync.WaitGroup
 
 	wal    *wal.WAL
 	walBuf [][]byte
 
-	amt   atomic.Pointer[quxMemtable] // active mem table
-	imt   []*quxMemtable
-	imtMu sync.RWMutex
+	imtNotify chan struct{}
+
+	lsm       *lsmState
+	compactor *lsmCompactor
 }
 
 func New(dataDir string) (*QuxDB, error) {
@@ -59,15 +70,21 @@ func New(dataDir string) (*QuxDB, error) {
 		return nil, err
 	}
 
+	lsm, err := newLsmState(dataDir, maxImt)
+	if err != nil {
+		return nil, err
+	}
 	db := &QuxDB{
-		dataDir: dataDir,
-		wal:     wal,
-		imt:     make([]*quxMemtable, 0, 4),
-		reqChan: make(chan *writeReq, 4096),
-		walBuf:  make([][]byte, 0, maxBatch),
+		dataDir:   dataDir,
+		wal:       wal,
+		flock:     flock.New(filepath.Join(dataDir, "quxdb.lock")),
+		imtNotify: make(chan struct{}, 1),
+		reqChan:   make(chan *writeReq, maxBatch*4), // particular reason why this is 4x
+		walBuf:    make([][]byte, 0, maxBatch),
+		lsm:       lsm,
 	}
 
-	db.amt.Store(newQuxMemtable())
+	db.compactor = newLsmCompactor(dataDir, lsm)
 
 	db.reqPool.New = func() any {
 		return newWriteReq()
@@ -77,39 +94,76 @@ func New(dataDir string) (*QuxDB, error) {
 }
 
 func (db *QuxDB) Start(ctx context.Context) error {
+	_, err := db.flock.TryLock()
+	if err != nil {
+		return err
+	}
+
+	checkpoint := db.lsm.currentVersion().Checkpoint()
+	lastSeq := checkpoint.LastSeq
+	lastLSN := wal.LSN(checkpoint.LastLSN)
+	db.committedSeq.Store(lastSeq)
+
+	fmt.Println("db: open wal")
 	if err := db.wal.Open(); err != nil {
 		return err
 	}
 
-	fmt.Printf("db replaying wal...\n")
-
+	fmt.Printf("db: wal replay from %d\n", lastLSN)
 	var kv quxKV
-	var keys uint64
-	lsn, err := db.wal.Replay(func(r wal.Record) error {
-		keys++
+	lsn, err := db.wal.ReplayAfter(lastLSN, func(r wal.Record) error {
 		kv.Decode(r.Data)
-		return db.setMemtable(kv, r.LSN)
+		if err := db.setMemtable(kv, lastSeq, lastLSN); err != nil {
+			return err
+		}
+		lastSeq = kv.qkey.Seq()
+		lastLSN = r.LSN
+		db.committedSeq.Store(lastSeq)
+		return nil
 	})
 	if err != nil {
-		fmt.Printf("replay: %v\ntruncating to lsn=%d\n", err, lsn)
-		db.wal.TruncateFrom(lsn)
+		if !wal.IsCorruption(err) {
+			return err
+		}
+		fmt.Printf("db: error %v - truncating to lsn=%d\n", err, lsn)
+		if truncateErr := db.wal.TruncateFrom(lsn); truncateErr != nil {
+			return errors.Join(err, truncateErr)
+		}
+	}
+	fmt.Println("db: wal replay completed")
+
+	db.writeSeq = quxSeq(lastSeq)
+	db.lastCommittedLSN = lastLSN
+
+	if err := db.wal.PruneBefore(wal.LSN(checkpoint.LastLSN)); err != nil {
+		return err
 	}
 
-	if kv.qkey != nil {
-		db.committedSeq.Store(kv.qkey.Seq())
-	}
-	db.writeSeq = quxSeq(db.committedSeq.Load())
+	db.compactor.Start()
+	db.compactor.Notify()
 
+	db.workers.Add(2)
+	go db.flushMemtables()
 	go db.writeLoop()
 
-	fmt.Printf("db started with dir=%s memtable=%s keys=%d seq=%d\n", db.dataDir, memTableType, keys, db.committedSeq.Load())
-
+	fmt.Printf("db: started with dir=%s memtableType=%s lastSeq=%d\n", db.dataDir, memTableType, db.committedSeq.Load())
 	return nil
 }
 
 func (db *QuxDB) Stop(ctx context.Context) error {
-	defer fmt.Println("db stopped")
-	return db.wal.Close()
+	defer fmt.Println("db: stopped")
+
+	close(db.reqChan)
+	db.workers.Wait()
+	db.compactor.Stop()
+	clear(db.walBuf)
+
+	return errors.Join(
+		db.wal.Close(),
+		db.lsm.close(),
+		db.flock.Unlock(),
+		os.Remove(filepath.Join(db.dataDir, "quxdb.lock")),
+	)
 }
 
 func (db *QuxDB) Set(key []byte, value []byte) error {
@@ -120,40 +174,47 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 	readSeq := db.committedSeq.Load()
+	snapshot := db.lsm.acquireReadSnapshot()
+	defer func() {
+		db.lsm.reportTableCleanupError(snapshot.release())
+	}()
+
 	lookupKey := newSeekStart(key, readSeq)
 
-	if value, found, ok := getFromMemtable(db.amt.Load(), key, lookupKey); found {
-		return value, ok
+	ikey, val, found := snapshot.memtables[0].Seek(lookupKey)
+	if found {
+		if resolved, value, exists := resolvePointLookup(ikey, val, key); resolved {
+			return value, exists
+		}
 	}
 
-	db.imtMu.RLock()
-	imt := db.imt
-	db.imtMu.RUnlock()
+	for i := len(snapshot.memtables) - 1; i >= 1; i-- {
+		ikey, val, found := snapshot.memtables[i].Seek(lookupKey)
+		if found {
+			if resolved, value, exists := resolvePointLookup(ikey, val, key); resolved {
+				return bytes.Clone(value), exists
+			}
+		}
+	}
 
-	for i := len(imt) - 1; i >= 0; i-- {
-		if value, found, ok := getFromMemtable(imt[i], key, lookupKey); found {
-			return value, ok
+	tables := snapshot.tableVersion.version.PointLookupCandidates(key)
+	for _, t := range tables {
+		reader, err := snapshot.openTable(sst.Metadata(t))
+		if err != nil {
+			fmt.Printf("db: store error %v\n", err)
+			return nil, false
+		}
+
+		ikey, value, found := reader.Lookup(key, lookupKey)
+		reader.Close()
+		if found {
+			if resolved, value, exists := resolvePointLookup(ikey, value, key); resolved {
+				return bytes.Clone(value), exists
+			}
 		}
 	}
 
 	return nil, false
-}
-
-func getFromMemtable(mt *quxMemtable, key []byte, lookupKey quxKey) (value []byte, found bool, ok bool) {
-	internalKey, value, ok := mt.Seek(lookupKey)
-	if !ok {
-		return nil, false, false
-	}
-
-	userKey, _, op := quxKey(internalKey).Decode()
-	if !bytes.Equal(userKey, key) {
-		return nil, false, false
-	}
-	if op == quxOpDelete {
-		return nil, true, false
-	}
-
-	return value, true, true
 }
 
 func (db *QuxDB) Delete(key []byte) error {
@@ -169,23 +230,23 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 		}
 
 		readSeq := db.committedSeq.Load()
+		snapshot := db.lsm.acquireReadSnapshot()
+		defer func() {
+			db.lsm.reportTableCleanupError(snapshot.release())
+		}()
 
 		var startKey, endKey []byte
 		if start != nil {
 			startKey = newSeekStart(start, readSeq)
 		}
 		if end != nil {
-			endKey = newSeekEnd(end)
+			endKey = newSeekEndInclusive(end)
 		}
 
-		db.imtMu.RLock()
-		memtables := make([]*quxMemtable, 0, len(db.imt)+1)
-		memtables = append(memtables, db.amt.Load())
-		memtables = append(memtables, db.imt...)
-		db.imtMu.RUnlock()
+		memtables := snapshot.memtables
+		tables := snapshot.tableVersion.version.RangeLookupCandidates(start, end)
 
-		// Fast path: single memtable, no merge heap needed.
-		if len(memtables) == 1 {
+		if len(memtables) == 1 && len(tables) == 0 {
 			cur := &mvccCursor{
 				cur:     memtables[0].Cursor(startKey, endKey),
 				readSeq: readSeq,
@@ -202,13 +263,31 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 			}
 		}
 
-		// General path: k-way merge across active + frozen memtables.
-		cursors := make([]*mvccCursor, len(memtables))
-		for i, mt := range memtables {
-			cursors[i] = &mvccCursor{
+		cursors := make([]*mvccCursor, 0, len(memtables)+len(tables))
+		for _, mt := range memtables {
+			cursors = append(cursors, &mvccCursor{
 				cur:     mt.Cursor(startKey, endKey),
 				readSeq: readSeq,
+			})
+		}
+
+		readers := make([]sst.Reader, 0, len(tables))
+		defer func() {
+			for i := range readers {
+				db.lsm.reportTableCleanupError(readers[i].Close())
 			}
+		}()
+		for _, table := range tables {
+			reader, err := snapshot.openTable(sst.Metadata(table))
+			if err != nil {
+				fmt.Printf("db: store error %v\n", err)
+				return
+			}
+			readers = append(readers, reader)
+			cursors = append(cursors, &mvccCursor{
+				cur:     reader.Cursor(startKey, endKey),
+				readSeq: readSeq,
+			})
 		}
 
 		var currentUserKey []byte
@@ -258,13 +337,16 @@ func (db *QuxDB) awaitResult(req *writeReq) writeResult {
 }
 
 func (db *QuxDB) writeLoop() {
+	defer db.workers.Done()
+	defer close(db.imtNotify)
 	batch := make([]*writeReq, 0, maxBatch)
+	fmt.Println("db: write loop started")
 
 	for {
 		// block for first req
 		req, ok := <-db.reqChan
 		if !ok {
-			return
+			break
 		}
 		batch = append(batch, req)
 
@@ -286,6 +368,7 @@ func (db *QuxDB) writeLoop() {
 		clear(batch)
 		batch = batch[:0]
 	}
+	fmt.Println("db: write loop exited")
 }
 
 func (db *QuxDB) commitBatch(batch []*writeReq) {
@@ -332,15 +415,20 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 
 	memStart := time.Now()
 	if err == nil {
+		lastSeq := db.committedSeq.Load()
+		lastLSN := db.lastCommittedLSN
 		for i, req := range batch {
 			if results[i].Err != nil {
 				continue
 			}
-			if err := db.setMemtable(req.kv, results[i].LSN); err != nil {
+			if err := db.setMemtable(req.kv, lastSeq, lastLSN); err != nil {
 				panic(fmt.Sprintf("unknown error %v", err))
 			}
-			db.committedSeq.Store(req.kv.qkey.Seq())
+			lastSeq = req.kv.qkey.Seq()
+			lastLSN = results[i].LSN
+			db.committedSeq.Store(lastSeq)
 		}
+		db.lastCommittedLSN = lastLSN
 	}
 
 	commitEnd := time.Now()
@@ -386,12 +474,11 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	db.walBuf = db.walBuf[:0]
 }
 
-func (db *QuxDB) setMemtable(kv quxKV, lsn wal.LSN) error {
+func (db *QuxDB) setMemtable(kv quxKV, lastSeq uint64, lastLSN wal.LSN) error {
 retry:
-	err := db.amt.Load().Set(kv.qkey, kv.val)
-	if err != nil {
+	if err := db.lsm.activeMemtable().Set(kv.qkey, kv.val); err != nil {
 		if errors.Is(err, memtable.ErrMemtableFull) {
-			db.rolloverMemtable(kv.qkey.Seq(), lsn)
+			db.rolloverMemtable(lastSeq, lastLSN)
 			goto retry
 		}
 		return err
@@ -400,29 +487,76 @@ retry:
 }
 
 func (db *QuxDB) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) {
-	next := newQuxMemtable()
+	mt := db.lsm.rolloverMemtable(lastSeq, lastLSN)
 
-	db.imtMu.Lock()
-	amt := db.amt.Load()
-	// set seq/lsn info to active mem table
-	amt.lastLSN = lastLSN
-	amt.lastSeq = lastSeq
-	// append active to imt
-	db.imt = append(db.imt, amt)
-	db.amt.Store(next)
-	db.imtMu.Unlock()
+	fmt.Printf("db: rollover memtable size=%.2fMB keys=%d lastSeq=%d lastLSN=%d\n",
+		float64(mt.SizeBytes())/(1024*1024), mt.Len(), mt.lastSeq, mt.lastLSN)
 
-	fmt.Printf("froze memtable size=%.2fMB keys=%d lastSeq=%d lastLSN=%d\n", float64(amt.SizeBytes())/(1024*1024), amt.Len(), amt.lastSeq, amt.lastLSN)
-}
-
-type quxMemtable struct {
-	memtable.Memtable
-	lastLSN wal.LSN
-	lastSeq uint64
-}
-
-func newQuxMemtable() *quxMemtable {
-	return &quxMemtable{
-		Memtable: memtable.New(memTableType),
+	// Non-blocking notification; the flush worker determines whether enough
+	// immutable memtables are available.
+	select {
+	case db.imtNotify <- struct{}{}:
+	default:
 	}
+}
+
+func (db *QuxDB) flushMemtables() {
+	defer db.workers.Done()
+	fmt.Println("db: memtable flush started")
+	for {
+		_, ok := <-db.imtNotify
+		if !ok {
+			break
+		}
+
+		mtsToFlush := db.lsm.flushableMemtables(imtFlushThreshold)
+		if len(mtsToFlush) == 0 {
+			continue
+		}
+
+		newSSTs := make([]*sst.Metadata, 0, len(mtsToFlush))
+		for _, mt := range mtsToFlush {
+			b, err := sst.NewBuilder(sst.BuilderOpts{
+				Dir:       db.dataDir,
+				Level:     0,
+				Keys:      uint64(mt.Len()),
+				SizeBytes: uint64(mt.SizeBytes()),
+			})
+			if err != nil {
+				panic(err)
+			}
+			c := mt.Cursor(nil, nil)
+			for {
+				key, val, ok := c.Next()
+				if !ok {
+					break
+				}
+
+				qkey := quxKey(key)
+				err := b.Add(sst.Record{
+					OrderedKey: key,
+					FilterKey:  qkey.UserKey(),
+					Value:      val,
+				})
+				if err != nil {
+					panic(err)
+				}
+			}
+			sstMeta, err := b.Finalize()
+			if err != nil {
+				panic(err)
+			}
+			fmt.Printf("db: new sst level=%d path=%s\n", sstMeta.Level, sstMeta.Path)
+			newSSTs = append(newSSTs, sstMeta)
+		}
+
+		if err := db.lsm.replaceMemtablesWithSSTs(mtsToFlush, newSSTs); err != nil {
+			panic(err)
+		}
+		fmt.Printf("db: memtable flush flushed=%d queued=%d\n",
+			len(mtsToFlush), db.lsm.immutableMemtableCount())
+
+		db.compactor.Notify()
+	}
+	fmt.Println("db: memtable flush exited")
 }
