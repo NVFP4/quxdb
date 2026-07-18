@@ -76,7 +76,8 @@ type Option func(*Options)
 type Comparator func(a, b []byte) int
 
 type Options struct {
-	Comparator Comparator
+	Comparator    Comparator
+	CapacityBytes int
 }
 
 // WithComparator sets the memtable ordering. Passing nil causes construction
@@ -87,8 +88,19 @@ func WithComparator(cmp Comparator) Option {
 	}
 }
 
+// WithCapacityBytes sets the maximum number of key and value bytes retained
+// by the memtable. Passing a negative capacity causes construction to panic.
+func WithCapacityBytes(capacity int) Option {
+	return func(opts *Options) {
+		opts.CapacityBytes = capacity
+	}
+}
+
 func defaultOptions() Options {
-	return Options{Comparator: bytes.Compare}
+	return Options{
+		Comparator:    bytes.Compare,
+		CapacityBytes: 16 << 20,
+	}
 }
 
 func makeOptions(opts ...Option) Options {
@@ -98,6 +110,9 @@ func makeOptions(opts ...Option) Options {
 	}
 	if cfg.Comparator == nil {
 		panic("memtable: nil comparator")
+	}
+	if cfg.CapacityBytes < 0 {
+		panic("memtable: negative capacity")
 	}
 	return cfg
 }

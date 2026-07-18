@@ -5,204 +5,464 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
-	"slices"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestMemtable(t *testing.T) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
-	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
+type memtableTestImpl struct {
+	name string
+	new  func(...Option) Memtable
+}
+
+var memtableTestImpls = []memtableTestImpl{
+	{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
+	{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
+}
+
+func testCursorValue(version int) []byte {
+	value := fmt.Appendf(nil, "version-%03d:", version)
+	return append(value, bytes.Repeat([]byte{'x'}, version)...)
+}
+
+func collectCursorKeys(t *testing.T, m Memtable, start, end []byte) []string {
+	t.Helper()
+
+	var keys []string
+	cursor := m.Cursor(start, end)
+	for {
+		key, _, ok := cursor.Next()
+		if !ok {
+			break
+		}
+		keys = append(keys, string(key))
 	}
+	require.NoError(t, cursor.Err())
+	return keys
+}
 
-	for _, impl := range impls {
+func TestGetSet(t *testing.T) {
+	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
-			m := impl.Factory()
+			m := impl.new()
 
-			// 1. Set / Get
-			key := []byte("foo")
-			val := []byte("bar")
-			m.Set(key, val)
+			value, ok := m.Get([]byte("missing"))
+			assert.False(t, ok)
+			assert.Nil(t, value)
 
-			got, ok := m.Get(key)
-			assert.True(t, ok, "Get failed: key not found")
-			assert.Equal(t, val, got, "Get returned wrong value")
+			key := []byte("key")
+			input := []byte("value")
+			require.NoError(t, m.Set(key, input))
+			key[0] = 'x'
+			input[0] = 'x'
 
-			// 2. Overwrite
-			newVal := []byte("baz")
-			m.Set(key, newVal)
+			value, ok = m.Get([]byte("key"))
+			require.True(t, ok)
+			assert.Equal(t, []byte("value"), value)
+			assert.Equal(t, 1, m.Len())
 
-			got, ok = m.Get(key)
-			assert.True(t, ok, "Get failed after overwrite: key not found")
-			assert.Equal(t, newVal, got, "Get returned wrong value after overwrite")
+			require.NoError(t, m.Set([]byte("key"), []byte("updated")))
+			value, ok = m.Get([]byte("key"))
+			require.True(t, ok)
+			assert.Equal(t, []byte("updated"), value)
+			assert.Equal(t, 1, m.Len())
 
-			// 4. Delete
-			// m.Delete(key)
+			require.NoError(t, m.Set(nil, nil))
+			value, ok = m.Get([]byte{})
+			require.True(t, ok)
+			assert.Empty(t, value)
+			assert.Equal(t, 2, m.Len())
+		})
+	}
+}
 
-			// _, ok = m.Get(key)
-			// assert.False(t, ok, "Get returned ok=true after delete")
+func TestSeek(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new()
+			key, value, ok := m.Seek(nil)
+			assert.False(t, ok)
+			assert.Nil(t, key)
+			assert.Nil(t, value)
 
-			// 5. Len
-			m2 := impl.Factory()
-			assert.Equal(t, 0, m2.Len(), "Len not 0 for new table")
-
-			for i := range 100 {
-				m2.Set(fmt.Appendf(nil, "key-%03d", i), []byte("val"))
+			for _, key := range []string{"a", "c", "e"} {
+				require.NoError(t, m.Set([]byte(key), []byte("value-"+key)))
 			}
-			assert.Equal(t, 100, m2.Len(), "Len expected 100")
 
-			// 6. Cursor
-			t.Run("Cursor", func(t *testing.T) {
-				allCount := 0
-				c := m2.Cursor(nil, nil)
-				for {
-					_, _, ok := c.Next()
-					if !ok {
-						break
-					}
-					allCount++
-				}
-				assert.Equal(t, 100, allCount, "All cursor expected 100 items")
+			tests := []struct {
+				name      string
+				seek      []byte
+				wantKey   []byte
+				wantValue []byte
+				found     bool
+			}{
+				{"Nil", nil, []byte("a"), []byte("value-a"), true},
+				{"BeforeFirst", []byte("0"), []byte("a"), []byte("value-a"), true},
+				{"Exact", []byte("c"), []byte("c"), []byte("value-c"), true},
+				{"Between", []byte("b"), []byte("c"), []byte("value-c"), true},
+				{"AfterLast", []byte("z"), nil, nil, false},
+			}
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					key, value, ok := m.Seek(tt.seek)
+					assert.Equal(t, tt.found, ok)
+					assert.Equal(t, tt.wantKey, key)
+					assert.Equal(t, tt.wantValue, value)
+				})
+			}
+		})
+	}
+}
+
+func TestCapacity(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			t.Run("Negative", func(t *testing.T) {
+				assert.PanicsWithValue(t, "memtable: negative capacity", func() {
+					impl.new(WithCapacityBytes(-1))
+				})
+			})
+
+			t.Run("Zero", func(t *testing.T) {
+				m := impl.new(WithCapacityBytes(0))
+				require.NoError(t, m.Set(nil, nil))
+				require.ErrorIs(t, m.Set([]byte("a"), nil), ErrMemtableFull)
+				assert.Equal(t, 1, m.Len())
+				assert.Zero(t, m.SizeBytes())
+				_, ok := m.Get(nil)
+				assert.True(t, ok)
+			})
+
+			t.Run("Exact", func(t *testing.T) {
+				key := []byte("key")
+				value := []byte("value")
+				capacity := len(key) + len(value)
+				m := impl.new(WithCapacityBytes(capacity))
+
+				require.NoError(t, m.Set(key, value))
+				require.ErrorIs(t, m.Set([]byte("x"), nil), ErrMemtableFull)
+				assert.Equal(t, 1, m.Len())
+				assert.Equal(t, capacity, m.SizeBytes())
+				got, ok := m.Get(key)
+				require.True(t, ok)
+				assert.Equal(t, value, got)
+			})
+
+			t.Run("Overflow", func(t *testing.T) {
+				key := []byte("key")
+				value := []byte("value")
+				m := impl.new(WithCapacityBytes(len(key) + len(value) - 1))
+
+				require.ErrorIs(t, m.Set(key, value), ErrMemtableFull)
+				assert.Zero(t, m.Len())
+				assert.Zero(t, m.SizeBytes())
+				_, ok := m.Get(key)
+				assert.False(t, ok)
+			})
+
+			t.Run("UpdateOverflow", func(t *testing.T) {
+				key := []byte("key")
+				value := []byte("value")
+				m := impl.new(WithCapacityBytes(len(key) + len(value)))
+				require.NoError(t, m.Set(key, value))
+
+				require.ErrorIs(t, m.Set(key, []byte("larger-value")), ErrMemtableFull)
+				got, ok := m.Get(key)
+				require.True(t, ok)
+				assert.Equal(t, value, got)
+				assert.Equal(t, 1, m.Len())
+				assert.Equal(t, len(key)+len(value), m.SizeBytes())
+			})
+
+			t.Run("AfterClear", func(t *testing.T) {
+				key := []byte("key")
+				value := []byte("value")
+				m := impl.new(WithCapacityBytes(len(key) + len(value)))
+				require.NoError(t, m.Set(key, value))
+				m.Clear()
+				require.NoError(t, m.Set(key, value))
 			})
 		})
 	}
 }
 
-func TestMemtableCursor(t *testing.T) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
-	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
-	}
+func TestCursor(t *testing.T) {
+	const count = 256
 
-	for _, impl := range impls {
+	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
-			m := impl.Factory()
-
-			// 1. Manual keys in random order
-			keys := []string{"banana", "apple", "cherry", "date", "apricot", "berry", "applepie", "a", "b", "c"}
-			for _, k := range keys {
-				m.Set([]byte(k), []byte("val"))
+			m := impl.new()
+			keys := make([][]byte, count)
+			values := make([][]byte, count)
+			for i := range count {
+				keys[i] = fmt.Appendf(nil, "key-%03d", i)
+				values[i] = fmt.Appendf(nil, "value-%03d", i)
+			}
+			for _, i := range rand.New(rand.NewSource(42)).Perm(count) {
+				require.NoError(t, m.Set(keys[i], values[i]))
 			}
 
-			var iterated []string
-			c := m.Cursor(nil, nil)
-			for {
-				k, _, ok := c.Next()
-				if !ok {
-					break
-				}
-				iterated = append(iterated, string(k))
+			cursor := m.Cursor(nil, nil)
+			for i := range count {
+				key, value, ok := cursor.Next()
+				require.True(t, ok, "cursor ended at item %d", i)
+				assert.Equal(t, keys[i], key)
+				assert.Equal(t, values[i], value)
 			}
-
-			expected := slices.Clone(keys)
-			slices.Sort(expected)
-			assert.Equal(t, expected, iterated, "Keys are not sorted")
-
-			seekKey, seekVal, ok := m.Seek([]byte("applep"))
-			assert.True(t, ok, "Seek should find first key >= seek key")
-			assert.Equal(t, []byte("applepie"), seekKey)
-			assert.Equal(t, []byte("val"), seekVal)
-
-			var fromApple []string
-			c = m.Cursor([]byte("apple"), nil)
-			for {
-				k, _, ok := c.Next()
-				if !ok {
-					break
-				}
-				fromApple = append(fromApple, string(k))
-			}
-			assert.Equal(t, []string{"apple", "applepie", "apricot", "b", "banana", "berry", "c", "cherry", "date"}, fromApple, "Cursor should include first key >= start")
-
-			var fromBetweenKeys []string
-			c = m.Cursor([]byte("bb"), nil)
-			for {
-				k, _, ok := c.Next()
-				if !ok {
-					break
-				}
-				fromBetweenKeys = append(fromBetweenKeys, string(k))
-			}
-			assert.Equal(t, []string{"berry", "c", "cherry", "date"}, fromBetweenKeys, "Cursor should start at next key when start is absent")
-
-			var ranged []string
-			c = m.Cursor([]byte("apple"), []byte("c"))
-			for {
-				k, _, ok := c.Next()
-				if !ok {
-					break
-				}
-				ranged = append(ranged, string(k))
-			}
-			assert.Equal(t, []string{"apple", "applepie", "apricot", "b", "banana", "berry", "c"}, ranged, "Cursor should include both bounds")
-
-			var emptyRange []string
-			c = m.Cursor([]byte("d"), []byte("a"))
-			for {
-				k, _, ok := c.Next()
-				if !ok {
-					break
-				}
-				emptyRange = append(emptyRange, string(k))
-			}
-			assert.Empty(t, emptyRange, "Cursor should be empty when start is after end")
-
-			// 2. Larger randomized test
-			m2 := impl.Factory()
-			r := rand.New(rand.NewSource(42))
-			count := 2000
-			uniqueKeys := make(map[string]struct{})
-			for range count {
-				keyLen := r.Intn(32) + 1
-				key := make([]byte, keyLen)
-				r.Read(key)
-				m2.Set(key, []byte("val"))
-				uniqueKeys[string(key)] = struct{}{}
-			}
-
-			var lastKey []byte
-			iterCount := 0
-			c = m2.Cursor(nil, nil)
-			for {
-				k, _, ok := c.Next()
-				if !ok {
-					break
-				}
-				if lastKey != nil {
-					assert.Greater(t, bytes.Compare(k, lastKey), 0, "Cursor out of order at position %d: %x -> %x", iterCount, lastKey, k)
-				}
-				lastKey = bytes.Clone(k)
-				iterCount++
-			}
-
-			assert.Equal(t, len(uniqueKeys), iterCount, "Cursor returned wrong number of unique keys")
+			_, _, ok := cursor.Next()
+			assert.False(t, ok)
 		})
 	}
 }
 
-func TestMemtableBorrowedViewsAreCapacityCapped(t *testing.T) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
+func TestCursorRanges(t *testing.T) {
+	tests := []struct {
+		name       string
+		start, end []byte
+		want       []string
 	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
+		{"Unbounded", nil, nil, []string{"a", "b", "c", "d"}},
+		{"StartExact", []byte("b"), nil, []string{"b", "c", "d"}},
+		{"StartBetween", []byte("bb"), nil, []string{"c", "d"}},
+		{"EndExact", nil, []byte("c"), []string{"a", "b", "c"}},
+		{"EndBetween", nil, []byte("bb"), []string{"a", "b"}},
+		{"Closed", []byte("b"), []byte("c"), []string{"b", "c"}},
+		{"Inverted", []byte("d"), []byte("b"), nil},
+		{"AfterLast", []byte("z"), nil, nil},
 	}
 
-	for _, impl := range impls {
+	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
-			m := impl.Factory()
+			m := impl.new()
+			for _, key := range []string{"d", "b", "a", "c"} {
+				require.NoError(t, m.Set([]byte(key), []byte("value-"+key)))
+			}
+
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					assert.Equal(t, tt.want, collectCursorKeys(t, m, tt.start, tt.end))
+				})
+			}
+		})
+	}
+}
+
+func TestCursorIndependence(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new()
+			for _, key := range []string{"a", "b", "c"} {
+				require.NoError(t, m.Set([]byte(key), []byte("value-"+key)))
+			}
+
+			first := m.Cursor(nil, nil)
+			second := m.Cursor([]byte("b"), nil)
+
+			key, _, ok := first.Next()
+			require.True(t, ok)
+			assert.Equal(t, []byte("a"), key)
+			key, _, ok = second.Next()
+			require.True(t, ok)
+			assert.Equal(t, []byte("b"), key)
+			key, _, ok = first.Next()
+			require.True(t, ok)
+			assert.Equal(t, []byte("b"), key)
+			key, _, ok = second.Next()
+			require.True(t, ok)
+			assert.Equal(t, []byte("c"), key)
+			key, _, ok = first.Next()
+			require.True(t, ok)
+			assert.Equal(t, []byte("c"), key)
+		})
+	}
+}
+
+func TestCursorErrors(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new()
+			require.NoError(t, m.Set([]byte("a"), []byte("value")))
+			cursor := m.Cursor(nil, nil)
+
+			assert.NoError(t, cursor.Err())
+			_, _, ok := cursor.Next()
+			require.True(t, ok)
+			assert.NoError(t, cursor.Err())
+			_, _, ok = cursor.Next()
+			assert.False(t, ok)
+			assert.NoError(t, cursor.Err())
+		})
+	}
+}
+
+func TestCursorExhaustion(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			empty := impl.new().Cursor(nil, nil)
+			for range 3 {
+				key, value, ok := empty.Next()
+				assert.False(t, ok)
+				assert.Nil(t, key)
+				assert.Nil(t, value)
+			}
+
+			m := impl.new()
+			require.NoError(t, m.Set([]byte("a"), []byte("value")))
+			cursor := m.Cursor(nil, nil)
+			_, _, ok := cursor.Next()
+			require.True(t, ok)
+			for range 3 {
+				key, value, ok := cursor.Next()
+				assert.False(t, ok)
+				assert.Nil(t, key)
+				assert.Nil(t, value)
+			}
+		})
+	}
+}
+
+func TestCursorConcurrency(t *testing.T) {
+	const (
+		userCount      = 128
+		versionCount   = 32
+		writerCount    = 4
+		readerCount    = 4
+		scansPerReader = 8
+	)
+
+	allowedValues := make(map[string]struct{}, versionCount+1)
+	for version := 0; version <= versionCount; version++ {
+		allowedValues[string(testCursorValue(version))] = struct{}{}
+	}
+
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new(
+				WithCapacityBytes(32<<20),
+				WithComparator(compareMVCCKey),
+			)
+			keys := make([][][]byte, userCount)
+			planned := make(map[string]struct{}, userCount*(versionCount+1))
+			for user := range userCount {
+				userKey := fmt.Appendf(nil, "user-%03d", user)
+				keys[user] = make([][]byte, versionCount+1)
+				for version := 0; version <= versionCount; version++ {
+					key := makeMVCCKey(userKey, uint64(version), mvccOpSet)
+					keys[user][version] = key
+					planned[string(key)] = struct{}{}
+				}
+				require.NoError(t, m.Set(keys[user][0], testCursorValue(0)))
+			}
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(writerCount + readerCount)
+
+			for writerID := range writerCount {
+				go func() {
+					defer wg.Done()
+					<-start
+
+					// Growing updates preserve old borrowed values while new keys reshape the index.
+					for version := 1; version <= versionCount; version++ {
+						value := testCursorValue(version)
+						for user := writerID; user < userCount; user += writerCount {
+							if err := m.Set(keys[user][version], value); err != nil {
+								t.Errorf("Set(%q): %v", keys[user][version], err)
+								return
+							}
+							if err := m.Set(keys[user][0], value); err != nil {
+								t.Errorf("Set(%q): %v", keys[user][0], err)
+								return
+							}
+						}
+						runtime.Gosched()
+					}
+				}()
+			}
+
+			for range readerCount {
+				go func() {
+					defer wg.Done()
+					<-start
+
+					for range scansPerReader {
+						cursor := m.Cursor(nil, nil)
+						var previous []byte
+						count := 0
+						for {
+							key, value, ok := cursor.Next()
+							if !ok {
+								break
+							}
+							if previous != nil && compareMVCCKey(previous, key) >= 0 {
+								t.Errorf("cursor out of order: %x then %x", previous, key)
+								return
+							}
+							if _, ok := planned[string(key)]; !ok {
+								t.Errorf("cursor returned unknown key %x", key)
+								return
+							}
+
+							userLen := len(key) - mvccKeyTrailerLen
+							version := binary.LittleEndian.Uint64(key[userLen : userLen+8])
+							if version == 0 {
+								if _, ok := allowedValues[string(value)]; !ok {
+									t.Errorf("cursor key %x returned invalid value %q", key, value)
+									return
+								}
+							} else if !bytes.Equal(value, testCursorValue(int(version))) {
+								t.Errorf("cursor key %x returned invalid value %q", key, value)
+								return
+							}
+
+							previous = append(previous[:0], key...)
+							count++
+							if count > len(planned) {
+								t.Errorf("cursor returned more than %d items", len(planned))
+								return
+							}
+						}
+						if err := cursor.Err(); err != nil {
+							t.Errorf("cursor error: %v", err)
+							return
+						}
+					}
+				}()
+			}
+
+			close(start)
+			wg.Wait()
+
+			cursor := m.Cursor(nil, nil)
+			for user := range userCount {
+				for version := versionCount; version >= 0; version-- {
+					key, value, ok := cursor.Next()
+					require.True(t, ok)
+					assert.Equal(t, keys[user][version], key)
+					if version == 0 {
+						assert.Equal(t, testCursorValue(versionCount), value)
+					} else {
+						assert.Equal(t, testCursorValue(version), value)
+					}
+				}
+			}
+			_, _, ok := cursor.Next()
+			assert.False(t, ok)
+			assert.NoError(t, cursor.Err())
+			assert.Equal(t, len(planned), m.Len())
+		})
+	}
+}
+
+func TestBorrowedViews(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new()
 			require.NoError(t, m.Set([]byte("a"), []byte("value-a")))
 			require.NoError(t, m.Set([]byte("b"), []byte("value-b")))
 
@@ -215,52 +475,26 @@ func TestMemtableBorrowedViewsAreCapacityCapped(t *testing.T) {
 			assert.Equal(t, len(key), cap(key))
 			assert.Equal(t, len(value), cap(value))
 
-			start := make([]byte, 1, 16)
-			end := make([]byte, 1, 16)
-			start[0], end[0] = 'a', 'b'
-			cursor := m.Cursor(start, end)
-			key, value, ok = cursor.Next()
+			key, value, ok = m.Cursor([]byte("a"), []byte("b")).Next()
 			require.True(t, ok)
 			assert.Equal(t, len(key), cap(key))
 			assert.Equal(t, len(value), cap(value))
-
-			switch cursor := cursor.(type) {
-			case *slCursor:
-				assert.Equal(t, len(cursor.start), cap(cursor.start))
-				assert.Equal(t, len(cursor.end), cap(cursor.end))
-			case *btreeCursor:
-				assert.Equal(t, len(cursor.start), cap(cursor.start))
-				assert.Equal(t, len(cursor.end), cap(cursor.end))
-			default:
-				t.Fatalf("unexpected cursor type %T", cursor)
-			}
 		})
 	}
 }
 
-func TestMemtableSizeBytesReportsLiveData(t *testing.T) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
-	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
-	}
-
-	for _, impl := range impls {
+func TestSize(t *testing.T) {
+	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
-			m := impl.Factory()
+			m := impl.new()
 			assert.Zero(t, m.SizeBytes())
 
 			require.NoError(t, m.Set([]byte("abc"), []byte("12")))
 			assert.Equal(t, 5, m.SizeBytes())
-
 			require.NoError(t, m.Set([]byte("abc"), []byte("12345")))
 			assert.Equal(t, 8, m.SizeBytes())
-
 			require.NoError(t, m.Set([]byte("abc"), []byte("x")))
 			assert.Equal(t, 4, m.SizeBytes())
-
 			require.NoError(t, m.Set([]byte("z"), []byte("vv")))
 			assert.Equal(t, 7, m.SizeBytes())
 			assert.Equal(t, 2, m.Len())
@@ -268,23 +502,13 @@ func TestMemtableSizeBytesReportsLiveData(t *testing.T) {
 	}
 }
 
-func TestMemtableClearReleasesStorageAndAllowsReuse(t *testing.T) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
-	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
-	}
-
-	for _, impl := range impls {
+func TestClear(t *testing.T) {
+	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
-			m := impl.Factory()
+			m := impl.new()
 			for i := range 200 {
 				require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("value")))
 			}
-			require.NotZero(t, m.Len())
-			require.NotZero(t, m.SizeBytes())
 
 			m.Clear()
 			assert.Zero(t, m.Len())
@@ -296,402 +520,296 @@ func TestMemtableClearReleasesStorageAndAllowsReuse(t *testing.T) {
 			_, _, ok = m.Cursor(nil, nil).Next()
 			assert.False(t, ok)
 
-			switch m := m.(type) {
-			case *slMemtable:
-				assert.Nil(t, m.arena)
-				assert.Zero(t, m.head)
-				assert.Zero(t, m.height)
-				assert.Equal(t, [slMaxHeight]uint32{}, m.tail)
-			case *btreeMemtable:
-				assert.Nil(t, m.data)
-				assert.Nil(t, m.leafChunks)
-				assert.Nil(t, m.internalChunks)
-				assert.Zero(t, m.root)
-				assert.Zero(t, m.firstLeaf)
-				assert.Zero(t, m.lastLeaf)
-				assert.Zero(t, m.leafCount)
-				assert.Zero(t, m.internalCount)
-			default:
-				t.Fatalf("unexpected memtable type %T", m)
-			}
-
-			m.Clear() // idempotent
+			m.Clear()
 			require.NoError(t, m.Set([]byte("new"), []byte("value")))
 			value, ok := m.Get([]byte("new"))
 			require.True(t, ok)
 			assert.Equal(t, []byte("value"), value)
 			assert.Equal(t, 1, m.Len())
-			assert.Equal(t, len("new")+len("value"), m.SizeBytes())
-			_, ok = m.Get([]byte("key-000"))
-			assert.False(t, ok)
 		})
 	}
 }
 
-func TestMemtableClearPreservesComparator(t *testing.T) {
-	reverse := func(a, b []byte) int { return bytes.Compare(b, a) }
-	for _, typ := range []MemTableType{Skiplist, BTree} {
-		t.Run(typ.String(), func(t *testing.T) {
-			m := New(typ, WithComparator(reverse))
-			require.NoError(t, m.Set([]byte("a"), nil))
+func TestClearComparator(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new(WithComparator(compareMVCCKey))
+			require.NoError(t, m.Set(makeMVCCKey([]byte("key"), 1, 1), nil))
 			m.Clear()
-			require.NoError(t, m.Set([]byte("a"), nil))
-			require.NoError(t, m.Set([]byte("b"), nil))
 
+			newer := makeMVCCKey([]byte("key"), 2, 1)
+			older := makeMVCCKey([]byte("key"), 1, 1)
+			require.NoError(t, m.Set(older, nil))
+			require.NoError(t, m.Set(newer, nil))
 			key, _, ok := m.Cursor(nil, nil).Next()
 			require.True(t, ok)
-			assert.Equal(t, []byte("b"), key)
+			assert.Equal(t, newer, key)
 		})
 	}
 }
 
-func TestBTreeUpdateDoesNotSplitFullNodes(t *testing.T) {
-	t.Run("Root", func(t *testing.T) {
-		m := newBTreeMemtable().(*btreeMemtable)
-		for i := range btreeLeafMaxItems {
-			require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
-		}
+func TestComparator(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new(WithComparator(compareMVCCKey))
+			keys := [][]byte{
+				makeMVCCKey([]byte("a"), 3, 1),
+				makeMVCCKey([]byte("a"), 2, 2),
+				makeMVCCKey([]byte("a"), 2, 1),
+				makeMVCCKey([]byte("a"), 1, 1),
+				makeMVCCKey([]byte("b"), 4, 1),
+			}
+			for i, key := range keys {
+				require.NoError(t, m.Set(key, fmt.Appendf(nil, "value-%d", i)))
+			}
 
-		root := m.root
-		leafCount := m.leafCount
-		internalCount := m.internalCount
-		require.NoError(t, m.Set([]byte("key-010"), []byte("updated")))
+			assert.Equal(t, 5, m.Len())
+			assert.Equal(t, []string{
+				string(keys[0]),
+				string(keys[1]),
+				string(keys[2]),
+				string(keys[3]),
+				string(keys[4]),
+			}, collectCursorKeys(t, m, nil, nil))
 
-		assert.Equal(t, root, m.root)
-		assert.Equal(t, leafCount, m.leafCount)
-		assert.Equal(t, internalCount, m.internalCount)
-		assert.Empty(t, m.internalChunks)
-		value, ok := m.Get([]byte("key-010"))
-		require.True(t, ok)
-		assert.Equal(t, []byte("updated"), value)
-	})
+			seek := makeMVCCKey([]byte("a"), ^uint64(0), 0xff)
+			key, value, ok := m.Seek(seek)
+			require.True(t, ok)
+			assert.Equal(t, keys[0], key)
+			assert.Equal(t, []byte("value-0"), value)
 
-	t.Run("Child", func(t *testing.T) {
-		m := newBTreeMemtable().(*btreeMemtable)
-		for i := range btreeLeafMaxItems + 1 {
-			require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
-		}
-
-		leafCount := m.leafCount
-		internalCount := m.internalCount
-		require.NoError(t, m.Set([]byte("key-010"), []byte("updated")))
-
-		assert.Equal(t, leafCount, m.leafCount)
-		assert.Equal(t, internalCount, m.internalCount)
-		value, ok := m.Get([]byte("key-010"))
-		require.True(t, ok)
-		assert.Equal(t, []byte("updated"), value)
-	})
+			require.NoError(t, m.Set(keys[1], []byte("updated")))
+			value, ok = m.Get(keys[1])
+			require.True(t, ok)
+			assert.Equal(t, []byte("updated"), value)
+			assert.Equal(t, 5, m.Len())
+		})
+	}
 }
 
-func TestBTreeRootSplitCapacityFailureIsAtomic(t *testing.T) {
-	m := newBTreeMemtable().(*btreeMemtable)
-	for i := range btreeLeafMaxItems {
-		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
-	}
-
-	m.internalCount = btreeLeafBit
-	root := m.root
-	leafCount := m.leafCount
-	dataLen := m.dataLen
-	sizeBytes := m.sizeBytes
-	count := m.count
-
-	err := m.Set([]byte("key-999"), []byte("v"))
-	require.ErrorIs(t, err, ErrMemtableFull)
-	assert.Equal(t, root, m.root)
-	assert.Equal(t, leafCount, m.leafCount)
-	assert.Equal(t, uint32(btreeLeafBit), m.internalCount)
-	assert.Equal(t, dataLen, m.dataLen)
-	assert.Equal(t, sizeBytes, m.sizeBytes)
-	assert.Equal(t, count, m.count)
-	assert.Equal(t, uint16(btreeLeafMaxItems), m.leaf(root.index()).n)
-}
-
-func TestBTreeChunksAreSmallLazyAndDenseForAscendingInserts(t *testing.T) {
-	m := newBTreeMemtable().(*btreeMemtable)
-	assert.Equal(t, 128, btreeLeafChunkSize)
-	assert.Equal(t, 32, btreeInternalChunkSize)
-	assert.Len(t, m.leafChunks, 1)
-	assert.Empty(t, m.internalChunks)
-
-	for i := range btreeLeafMaxItems + 1 {
-		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
-	}
-
-	leftIdx := m.firstLeaf
-	left := m.leaf(leftIdx)
-	rightIdx := left.nextLeaf
-	right := m.leaf(rightIdx)
-	assert.Equal(t, uint16(btreeLeafMaxItems), left.n)
-	assert.Equal(t, uint16(1), right.n)
-	assert.Equal(t, rightIdx, m.lastLeaf)
-	assert.Equal(t, uint32(3), m.leafCount) // nil + two leaves
-	assert.Len(t, m.internalChunks, 1)
-}
-
-func TestBTreeAscendingInsertsAcrossInternalSplits(t *testing.T) {
-	const count = 10_000
-	m := newBTreeMemtable().(*btreeMemtable)
-	for i := range count {
-		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%05d", i), []byte("v")))
-	}
-
-	expectedLeaves := (count + btreeLeafMaxItems - 1) / btreeLeafMaxItems
-	assert.Equal(t, uint32(expectedLeaves+1), m.leafCount) // include nil leaf
-
-	leafCount := 0
-	for leafIdx := m.firstLeaf; leafIdx != 0; leafIdx = m.leaf(leafIdx).nextLeaf {
-		leafCount++
-		if leafIdx != m.lastLeaf {
-			assert.Equal(t, uint16(btreeLeafMaxItems), m.leaf(leafIdx).n)
-		}
-	}
-	assert.Equal(t, expectedLeaves, leafCount)
-
-	cursor := m.Cursor(nil, nil)
-	for i := range count {
-		key, value, ok := cursor.Next()
-		require.True(t, ok, "cursor ended at item %d", i)
-		assert.Equal(t, fmt.Sprintf("key-%05d", i), string(key))
-		assert.Equal(t, []byte("v"), value)
-	}
-	_, _, ok := cursor.Next()
-	assert.False(t, ok)
-}
-
-func TestBTreeCanRevisitFullLeafFromBiasedSplit(t *testing.T) {
-	m := newBTreeMemtable().(*btreeMemtable)
-	for i := range btreeLeafMaxItems + 1 {
-		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
-	}
-	require.NoError(t, m.Set([]byte("key-010a"), []byte("middle")))
-
-	value, ok := m.Get([]byte("key-010a"))
-	require.True(t, ok)
-	assert.Equal(t, []byte("middle"), value)
-	assert.Equal(t, btreeLeafMaxItems+2, m.Len())
-
-	var previous []byte
-	seen := 0
-	cursor := m.Cursor(nil, nil)
-	for {
-		key, _, ok := cursor.Next()
-		if !ok {
-			break
-		}
-		if previous != nil {
-			assert.Less(t, bytes.Compare(previous, key), 0)
-		}
-		previous = bytes.Clone(key)
-		seen++
-	}
-	assert.Equal(t, m.Len(), seen)
-}
-
-func TestBTreeCursorSkipsEmptyNonFinalLeaf(t *testing.T) {
-	m := newBTreeMemtable().(*btreeMemtable)
-	for i := range btreeLeafMaxItems + 1 {
-		require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
-	}
-
-	m.leaf(m.firstLeaf).n = 0
-	cursor := m.Cursor(nil, nil)
-	key, value, ok := cursor.Next()
-	require.True(t, ok)
-	assert.Equal(t, []byte("key-063"), key)
-	assert.Equal(t, []byte("v"), value)
-	_, _, ok = cursor.Next()
-	assert.False(t, ok)
-}
-
-func TestMemtableRejectsNilComparator(t *testing.T) {
-	for _, typ := range []MemTableType{Skiplist, BTree} {
-		t.Run(typ.String(), func(t *testing.T) {
+func TestOptions(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name+"/NilComparator", func(t *testing.T) {
 			assert.PanicsWithValue(t, "memtable: nil comparator", func() {
-				New(typ, WithComparator(nil))
+				impl.new(WithComparator(nil))
 			})
 		})
 	}
+
+	assert.PanicsWithValue(t, "invalid memtable type", func() {
+		New(MemTableType(0))
+	})
 }
 
-func TestMemtableComparator(t *testing.T) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
-	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
-	}
+func TestConcurrency(t *testing.T) {
+	const (
+		writerCount     = 8
+		readerCount     = 8
+		writesPerWriter = 2_000
+		readsPerReader  = 4_000
+	)
 
-	for _, impl := range impls {
+	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
-			m := impl.Factory(WithComparator(func(a, b []byte) int {
-				if c := bytes.Compare(a[:1], b[:1]); c != 0 {
-					return c
-				}
-				return int(b[1]) - int(a[1])
-			}))
-
-			m.Set([]byte{'a', 3}, []byte("a3"))
-			m.Set([]byte{'a', 1}, []byte("a1"))
-			m.Set([]byte{'b', 2}, []byte("b2"))
-			m.Set([]byte{'b', 1}, []byte("b1"))
-
-			var iterated [][]byte
-			c := m.Cursor(nil, nil)
-			for {
-				k, _, ok := c.Next()
-				if !ok {
-					break
-				}
-				iterated = append(iterated, bytes.Clone(k))
+			m := impl.new()
+			totalWrites := writerCount * writesPerWriter
+			writeKeys := make([][]byte, totalWrites)
+			writeValues := make([][]byte, totalWrites)
+			published := make([]atomic.Bool, totalWrites)
+			expectedSize := 0
+			for i := range totalWrites {
+				writeKeys[i] = fmt.Appendf(nil, "write-%06d", i)
+				writeValues[i] = fmt.Appendf(nil, "write-value-%06d", i)
+				expectedSize += len(writeKeys[i]) + len(writeValues[i])
 			}
-			assert.Equal(t, [][]byte{
-				{'a', 3},
-				{'a', 1},
-				{'b', 2},
-				{'b', 1},
-			}, iterated)
 
-			key, val, ok := m.Seek([]byte{'a', 2})
-			assert.True(t, ok)
-			assert.Equal(t, []byte{'a', 1}, key)
-			assert.Equal(t, []byte("a1"), val)
+			checkGet := func(key, want []byte) bool {
+				got, ok := m.Get(key)
+				if !ok || !bytes.Equal(got, want) {
+					t.Errorf("Get(%q) = (%q, %t), want (%q, true)", key, got, ok, want)
+					return false
+				}
+				return true
+			}
+			checkSeek := func(key, want []byte) bool {
+				gotKey, gotValue, ok := m.Seek(key)
+				if !ok || !bytes.Equal(gotKey, key) || !bytes.Equal(gotValue, want) {
+					t.Errorf(
+						"Seek(%q) = (%q, %q, %t), want (%q, %q, true)",
+						key, gotKey, gotValue, ok, key, want,
+					)
+					return false
+				}
+				return true
+			}
 
-			key, val, ok = m.Seek([]byte{'b', 3})
-			assert.True(t, ok)
-			assert.Equal(t, []byte{'b', 2}, key)
-			assert.Equal(t, []byte("b2"), val)
-
-			key, _, ok = m.Seek([]byte{'a', 0})
-			assert.True(t, ok)
-			assert.Equal(t, []byte{'b', 2}, key)
-		})
-	}
-}
-
-func TestMemtableConcurrency(t *testing.T) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
-	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
-	}
-
-	for _, impl := range impls {
-		t.Run(impl.name, func(t *testing.T) {
-			m := impl.Factory()
-			const numGoroutines = 50
-			const insertsPerGoroutine = 1000
-
+			start := make(chan struct{})
 			var wg sync.WaitGroup
-			wg.Add(numGoroutines)
+			wg.Add(writerCount + readerCount)
 
-			for g := range numGoroutines {
-				go func(gid int) {
+			for writerID := range writerCount {
+				go func() {
 					defer wg.Done()
-					rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(gid)))
-					for i := range insertsPerGoroutine {
-						// Use keys that naturally hit different shards and some same shards
-						// Key format: "key-<shard-byte>-<random>"
-						key := fmt.Appendf(nil, "key-%d-%d", rng.Intn(256), i)
-						m.Set(key, []byte("value"))
+					<-start
 
-						// Occasionally read back
-						if i%10 == 0 {
-							_, _ = m.Get(key)
+					first := writerID * writesPerWriter
+					for i := range writesPerWriter {
+						idx := first + i
+						if err := m.Set(writeKeys[idx], writeValues[idx]); err != nil {
+							t.Errorf("Set(%q): %v", writeKeys[idx], err)
+							return
+						}
+						published[idx].Store(true)
+						if i%64 == 0 {
+							runtime.Gosched()
 						}
 					}
-				}(g)
+				}()
 			}
 
+			for readerID := range readerCount {
+				go func() {
+					defer wg.Done()
+					<-start
+
+					rng := rand.New(rand.NewSource(int64(readerID + 1)))
+					for reads := range readsPerReader {
+						writeIdx := rng.Intn(totalWrites)
+						if published[writeIdx].Load() {
+							if reads%2 == 0 {
+								if !checkSeek(writeKeys[writeIdx], writeValues[writeIdx]) {
+									return
+								}
+							} else if !checkGet(writeKeys[writeIdx], writeValues[writeIdx]) {
+								return
+							}
+						}
+						if reads%16 == 0 {
+							_ = m.Len()
+							_ = m.SizeBytes()
+						}
+					}
+				}()
+			}
+
+			close(start)
 			wg.Wait()
 
-			total := m.Len()
-			assert.Greater(t, total, 0, "Len is 0 after concurrent inserts")
+			assert.Equal(t, totalWrites, m.Len())
+			assert.Equal(t, expectedSize, m.SizeBytes())
+			for i := range totalWrites {
+				value, ok := m.Get(writeKeys[i])
+				require.True(t, ok, "missing key %q", writeKeys[i])
+				assert.Equal(t, writeValues[i], value)
+			}
+
+			cursor := m.Cursor(nil, nil)
+			for i := range totalWrites {
+				key, value, ok := cursor.Next()
+				require.True(t, ok, "cursor ended at item %d", i)
+				assert.Equal(t, writeKeys[i], key)
+				assert.Equal(t, writeValues[i], value)
+			}
+			_, _, ok := cursor.Next()
+			assert.False(t, ok)
+			assert.NoError(t, cursor.Err())
 		})
 	}
 }
 
-func TestBTreeCursorReleasesReadLockBetweenNextCalls(t *testing.T) {
-	m := newBTreeMemtable()
-	expected := make([]string, 0, btreeLeafMaxItems)
+func TestConcurrencyOverwrite(t *testing.T) {
+	const (
+		keyCount        = 32
+		writerCount     = 8
+		readerCount     = 8
+		writesPerWriter = 1_000
+		readsPerReader  = 2_000
+	)
 
-	for i := range btreeLeafMaxItems {
-		key := fmt.Sprintf("key-%03d", i)
-		expected = append(expected, key)
-		assert.NoError(t, m.Set([]byte(key), []byte("value")))
-	}
-
-	reachedNext := make(chan struct{})
-	releaseNext := make(chan struct{})
-	cursorDone := make(chan []string, 1)
-
-	go func() {
-		got := make([]string, 0, btreeLeafMaxItems)
-		c := m.Cursor(nil, nil)
-
-		key, _, ok := c.Next()
-		if ok {
-			got = append(got, string(key))
-		}
-		close(reachedNext)
-		<-releaseNext
-
-		for {
-			key, _, ok = c.Next()
-			if !ok {
-				break
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new(WithCapacityBytes(32 << 20))
+			keys := make([][]byte, keyCount)
+			for i := range keyCount {
+				keys[i] = fmt.Appendf(nil, "hot-%02d", i)
+				require.NoError(t, m.Set(keys[i], []byte("value-00-00000000")))
 			}
-			got = append(got, string(key))
-		}
 
-		cursorDone <- got
-	}()
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(writerCount + readerCount)
 
-	<-reachedNext
+			for writerID := range writerCount {
+				go func() {
+					defer wg.Done()
+					<-start
 
-	writeDone := make(chan error, 1)
-	go func() {
-		// The root leaf is full, so this write also forces a split while the
-		// cursor is paused between calls to Next.
-		writeDone <- m.Set([]byte("key-999"), []byte("value"))
-	}()
+					for i := range writesPerWriter {
+						key := keys[(writerID+i)%keyCount]
+						value := fmt.Appendf(nil, "value-%02d-%08d", writerID, i)
+						if err := m.Set(key, value); err != nil {
+							t.Errorf("Set(%q): %v", key, err)
+							return
+						}
+						if i%64 == 0 {
+							runtime.Gosched()
+						}
+					}
+				}()
+			}
 
-	select {
-	case err := <-writeDone:
-		assert.NoError(t, err)
-	case <-time.After(time.Second):
-		close(releaseNext)
-		t.Fatal("write blocked while cursor was paused between Next calls")
+			for readerID := range readerCount {
+				go func() {
+					defer wg.Done()
+					<-start
+
+					rng := rand.New(rand.NewSource(int64(readerID + 1)))
+					for range readsPerReader {
+						key := keys[rng.Intn(keyCount)]
+						value, ok := m.Get(key)
+						if !ok || len(value) != len("value-00-00000000") {
+							t.Errorf("Get(%q) returned found=%t len=%d", key, ok, len(value))
+							return
+						}
+						foundKey, value, ok := m.Seek(key)
+						if !ok || !bytes.Equal(foundKey, key) || len(value) != len("value-00-00000000") {
+							t.Errorf("Seek(%q) returned key=%q found=%t len=%d", key, foundKey, ok, len(value))
+							return
+						}
+					}
+				}()
+			}
+
+			close(start)
+			wg.Wait()
+
+			assert.Equal(t, keyCount, m.Len())
+			for _, key := range keys {
+				value, ok := m.Get(key)
+				require.True(t, ok)
+				assert.Len(t, value, len("value-00-00000000"))
+			}
+		})
 	}
-
-	close(releaseNext)
-	assert.Equal(t, expected, <-cursorDone)
 }
 
 const (
-	benchUserKeyLen                  = 16
-	benchInternalKeyTrailerLen       = 8 + 1
-	benchOpSet                 uint8 = 1
-	benchOpSeekMax             uint8 = 0xff
-	benchCursorKeys                  = 10_000
+	mvccKeyTrailerLen       = 8 + 1
+	mvccOpSet         uint8 = 1
+	mvccOpSeekMax     uint8 = 0xff
 )
 
-func makeInternalBenchKey(userKey []byte, seq uint64, op uint8) []byte {
-	key := make([]byte, len(userKey)+benchInternalKeyTrailerLen)
+func makeMVCCKey(userKey []byte, seq uint64, op uint8) []byte {
+	key := make([]byte, len(userKey)+mvccKeyTrailerLen)
 	copy(key, userKey)
 	binary.LittleEndian.PutUint64(key[len(userKey):len(userKey)+8], seq)
 	key[len(userKey)+8] = op
 	return key
 }
 
-func compareInternalBenchKey(a, b []byte) int {
-	aUserLen := len(a) - benchInternalKeyTrailerLen
-	bUserLen := len(b) - benchInternalKeyTrailerLen
-
+func compareMVCCKey(a, b []byte) int {
+	aUserLen := len(a) - mvccKeyTrailerLen
+	bUserLen := len(b) - mvccKeyTrailerLen
 	if c := bytes.Compare(a[:aUserLen], b[:bUserLen]); c != 0 {
 		return c
 	}
@@ -714,311 +832,4 @@ func compareInternalBenchKey(a, b []byte) int {
 		return 1
 	}
 	return 0
-}
-
-func BenchmarkMemtable(b *testing.B) {
-	impls := []struct {
-		name    string
-		Factory func(...Option) Memtable
-	}{
-		{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-		{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
-	}
-
-	val := []byte("value")
-
-	for _, impl := range impls {
-		b.Run(impl.name, func(b *testing.B) {
-			b.Run("Set/Unique/Seq", func(b *testing.B) {
-				m := impl.Factory()
-				keys := make([][]byte, b.N)
-				for i := range b.N {
-					keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					m.Set(keys[i], val)
-				}
-			})
-
-			b.Run("Set/Unique/Rand", func(b *testing.B) {
-				m := impl.Factory()
-				rngLocal := rand.New(rand.NewSource(42))
-				keys := make([][]byte, b.N)
-				for i := range b.N {
-					keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rngLocal.Uint64(), i)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					m.Set(keys[i], val)
-				}
-			})
-
-			b.Run("Get/Seq", func(b *testing.B) {
-				keys := make([][]byte, b.N)
-				for i := range b.N {
-					keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-				}
-
-				m := impl.Factory()
-				for i := 0; i < b.N; i++ {
-					m.Set(keys[i], val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					m.Get(keys[i])
-				}
-			})
-
-			b.Run("Get/Rand", func(b *testing.B) {
-				rngLocal := rand.New(rand.NewSource(42))
-				keys := make([][]byte, b.N)
-				for i := range b.N {
-					keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rngLocal.Uint64(), i)
-				}
-
-				indices := make([]int, b.N)
-				for i := 0; i < b.N; i++ {
-					indices[i] = rngLocal.Intn(b.N)
-				}
-
-				m := impl.Factory()
-				for i := 0; i < b.N; i++ {
-					m.Set(keys[i], val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					m.Get(keys[indices[i]])
-				}
-			})
-
-			b.Run("Seek/Seq", func(b *testing.B) {
-				keys := make([][]byte, b.N)
-				for i := range b.N {
-					keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-				}
-
-				m := impl.Factory()
-				for i := 0; i < b.N; i++ {
-					m.Set(keys[i], val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					m.Seek(keys[i])
-				}
-			})
-
-			b.Run("Seek/Rand", func(b *testing.B) {
-				rngLocal := rand.New(rand.NewSource(42))
-				keys := make([][]byte, b.N)
-				for i := range b.N {
-					keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rngLocal.Uint64(), i)
-				}
-
-				indices := make([]int, b.N)
-				for i := 0; i < b.N; i++ {
-					indices[i] = rngLocal.Intn(b.N)
-				}
-
-				m := impl.Factory()
-				for i := 0; i < b.N; i++ {
-					m.Set(keys[i], val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					m.Seek(keys[indices[i]])
-				}
-			})
-
-			b.Run("Cursor/All", func(b *testing.B) {
-				m := impl.Factory()
-				for i := range benchCursorKeys {
-					m.Set(fmt.Appendf(nil, "unique-seq:%016d", i), val)
-				}
-
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					count := 0
-					c := m.Cursor(nil, nil)
-					for {
-						_, _, ok := c.Next()
-						if !ok {
-							break
-						}
-						count++
-					}
-					if count != benchCursorKeys {
-						b.Fatalf("expected %d, got %d", benchCursorKeys, count)
-					}
-				}
-			})
-
-			b.Run("CustomKey", func(b *testing.B) {
-				b.Run("Set/Unique/Seq", func(b *testing.B) {
-					m := impl.Factory(WithComparator(compareInternalBenchKey))
-					userKey := []byte("bench-user-key-0")
-					keys := make([][]byte, b.N)
-					for i := range b.N {
-						keys[i] = makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet)
-					}
-
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						m.Set(keys[i], val)
-					}
-				})
-
-				b.Run("Set/Unique/Rand", func(b *testing.B) {
-					m := impl.Factory(WithComparator(compareInternalBenchKey))
-					rngLocal := rand.New(rand.NewSource(42))
-					keys := make([][]byte, b.N)
-					for i := range b.N {
-						userKey := make([]byte, benchUserKeyLen)
-						binary.BigEndian.PutUint64(userKey[:8], rngLocal.Uint64())
-						binary.BigEndian.PutUint64(userKey[8:16], uint64(i))
-						keys[i] = makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet)
-					}
-
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						m.Set(keys[i], val)
-					}
-				})
-
-				b.Run("Get/Seq", func(b *testing.B) {
-					m := impl.Factory(WithComparator(compareInternalBenchKey))
-					keys := make([][]byte, b.N)
-					for i := range b.N {
-						keys[i] = makeInternalBenchKey(fmt.Appendf(nil, "unique-seq:%016d", i), uint64(i)+1, benchOpSet)
-					}
-
-					for i := 0; i < b.N; i++ {
-						m.Set(keys[i], val)
-					}
-
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						m.Get(keys[i])
-					}
-				})
-
-				b.Run("Get/Rand", func(b *testing.B) {
-					m := impl.Factory(WithComparator(compareInternalBenchKey))
-					rngLocal := rand.New(rand.NewSource(42))
-					keys := make([][]byte, b.N)
-					for i := range b.N {
-						userKey := make([]byte, benchUserKeyLen)
-						binary.BigEndian.PutUint64(userKey[:8], rngLocal.Uint64())
-						binary.BigEndian.PutUint64(userKey[8:16], uint64(i))
-						keys[i] = makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet)
-					}
-
-					for i := 0; i < b.N; i++ {
-						m.Set(keys[i], val)
-					}
-
-					indices := make([]int, b.N)
-					for i := 0; i < b.N; i++ {
-						indices[i] = rngLocal.Intn(b.N)
-					}
-
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						m.Get(keys[indices[i]])
-					}
-				})
-
-				b.Run("Seek/Seq", func(b *testing.B) {
-					m := impl.Factory(WithComparator(compareInternalBenchKey))
-					keys := make([][]byte, b.N)
-					seekKeys := make([][]byte, b.N)
-					for i := range b.N {
-						userKey := fmt.Appendf(nil, "unique-seq:%016d", i)
-						keys[i] = makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet)
-						seekKeys[i] = makeInternalBenchKey(userKey, uint64(b.N)+1, benchOpSeekMax)
-					}
-
-					for i := 0; i < b.N; i++ {
-						m.Set(keys[i], val)
-					}
-
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						m.Seek(seekKeys[i])
-					}
-				})
-
-				b.Run("Seek/Rand", func(b *testing.B) {
-					m := impl.Factory(WithComparator(compareInternalBenchKey))
-					rngLocal := rand.New(rand.NewSource(42))
-					keys := make([][]byte, b.N)
-					seekKeys := make([][]byte, b.N)
-					for i := range b.N {
-						userKey := make([]byte, benchUserKeyLen)
-						binary.BigEndian.PutUint64(userKey[:8], rngLocal.Uint64())
-						binary.BigEndian.PutUint64(userKey[8:16], uint64(i))
-						keys[i] = makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet)
-						seekKeys[i] = makeInternalBenchKey(userKey, uint64(b.N)+1, benchOpSeekMax)
-					}
-					for i := 0; i < b.N; i++ {
-						m.Set(keys[i], val)
-					}
-
-					indices := make([]int, b.N)
-					for i := 0; i < b.N; i++ {
-						indices[i] = rngLocal.Intn(b.N)
-					}
-
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						m.Seek(seekKeys[indices[i]])
-					}
-				})
-
-				b.Run("Cursor/All", func(b *testing.B) {
-					m := impl.Factory(WithComparator(compareInternalBenchKey))
-					for i := range benchCursorKeys {
-						userKey := fmt.Appendf(nil, "unique-seq:%016d", i)
-						m.Set(makeInternalBenchKey(userKey, uint64(i)+1, benchOpSet), val)
-					}
-
-					b.ReportAllocs()
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						count := 0
-						c := m.Cursor(nil, nil)
-						for {
-							_, _, ok := c.Next()
-							if !ok {
-								break
-							}
-							count++
-						}
-						if count != benchCursorKeys {
-							b.Fatalf("expected %d, got %d", benchCursorKeys, count)
-						}
-					}
-				})
-			})
-		})
-	}
 }

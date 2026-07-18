@@ -10,9 +10,8 @@ import (
 
 const (
 	// With p=1/2, height 24 covers roughly 16 million entries at the top
-	// level, well above what a 16 MiB key/value data arena should hold.
-	slMaxHeight    = 24
-	slMaxDataBytes = 16 << 20 // 16 MiB
+	// level, well above what a typical key/value data arena should hold.
+	slMaxHeight = 24
 )
 
 type slNode struct {
@@ -134,14 +133,15 @@ func (a *slArena) setNext(i uint32, level int, next uint32) {
 }
 
 type slMemtable struct {
-	mu        sync.RWMutex
-	arena     *slArena
-	cmp       Comparator
-	head      uint32
-	tail      [slMaxHeight]uint32
-	height    int
-	len       int
-	sizeBytes int
+	mu            sync.RWMutex
+	arena         *slArena
+	cmp           Comparator
+	capacityBytes int
+	head          uint32
+	tail          [slMaxHeight]uint32
+	height        int
+	len           int
+	sizeBytes     int
 }
 
 //go:linkname fastrand runtime.fastrand
@@ -149,7 +149,10 @@ func fastrand() uint32
 
 func newSkiplistMemtable(opts ...Option) *slMemtable {
 	cfg := makeOptions(opts...)
-	m := &slMemtable{cmp: cfg.Comparator}
+	m := &slMemtable{
+		cmp:           cfg.Comparator,
+		capacityBytes: cfg.CapacityBytes,
+	}
 	m.initLocked()
 	return m
 }
@@ -159,7 +162,7 @@ func (m *slMemtable) initLocked() {
 		return
 	}
 
-	a := newArena(slMaxDataBytes)
+	a := newArena(m.capacityBytes)
 	m.arena = a
 	m.head = a.newHead()
 	m.height = 1
@@ -204,7 +207,7 @@ func (m *slMemtable) Seek(key []byte) ([]byte, []byte, bool) {
 func (m *slMemtable) Set(key, val []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.arena == nil && (len(key) > slMaxDataBytes || len(val) > slMaxDataBytes-len(key)) {
+	if m.arena == nil && (len(key) > m.capacityBytes || len(val) > m.capacityBytes-len(key)) {
 		return ErrMemtableFull
 	}
 	m.initLocked()

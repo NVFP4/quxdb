@@ -11,7 +11,6 @@ const (
 	btreeInternalMaxItems  = 63
 	btreeLeafChunkSize     = 128
 	btreeInternalChunkSize = 32
-	btreeMaxDataBytes      = 16 << 20 // 16 MiB
 	btreeLeafBit           = 1 << 31
 )
 
@@ -61,11 +60,12 @@ type btreeInternalNode struct {
 }
 
 type btreeMemtable struct {
-	mu        sync.RWMutex
-	cmp       Comparator
-	root      btreeNodeRef
-	firstLeaf uint32
-	lastLeaf  uint32
+	mu            sync.RWMutex
+	cmp           Comparator
+	capacityBytes int
+	root          btreeNodeRef
+	firstLeaf     uint32
+	lastLeaf      uint32
 
 	// Index 0 is reserved as nil for both node arrays.
 	leafChunks     []*[btreeLeafChunkSize]btreeLeafNode
@@ -81,7 +81,10 @@ type btreeMemtable struct {
 
 func newBTreeMemtable(opts ...Option) Memtable {
 	cfg := makeOptions(opts...)
-	m := &btreeMemtable{cmp: cfg.Comparator}
+	m := &btreeMemtable{
+		cmp:           cfg.Comparator,
+		capacityBytes: cfg.CapacityBytes,
+	}
 	m.initLocked()
 	return m
 }
@@ -99,7 +102,7 @@ func (m *btreeMemtable) initLocked() {
 	m.root = makeLeafRef(1)
 	m.firstLeaf = 1
 	m.lastLeaf = 1
-	m.data = make([]byte, btreeMaxDataBytes)
+	m.data = make([]byte, m.capacityBytes)
 	m.dataLen = 0
 	m.sizeBytes = 0
 	m.count = 0
@@ -152,7 +155,7 @@ func (m *btreeMemtable) Seek(key []byte) ([]byte, []byte, bool) {
 func (m *btreeMemtable) Set(key, value []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.root == 0 && (len(value) > btreeMaxDataBytes || len(key) > btreeMaxDataBytes-len(value)) {
+	if m.root == 0 && (len(value) > m.capacityBytes || len(key) > m.capacityBytes-len(value)) {
 		return ErrMemtableFull
 	}
 	m.initLocked()
@@ -617,7 +620,7 @@ func (m *btreeMemtable) appendBytesLocked(b []byte) (uint32, uint32) {
 }
 
 func (m *btreeMemtable) checkArenaCapacityForKV(keyLen, valueLen int) error {
-	remaining := btreeMaxDataBytes - m.dataLen
+	remaining := m.capacityBytes - m.dataLen
 	if keyLen > remaining || valueLen > remaining-keyLen {
 		return ErrMemtableFull
 	}
@@ -626,7 +629,7 @@ func (m *btreeMemtable) checkArenaCapacityForKV(keyLen, valueLen int) error {
 }
 
 func (m *btreeMemtable) checkArenaCapacity(n int) error {
-	if n > btreeMaxDataBytes-m.dataLen {
+	if n > m.capacityBytes-m.dataLen {
 		return ErrMemtableFull
 	}
 
