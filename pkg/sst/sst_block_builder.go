@@ -76,11 +76,13 @@ func (bb *blockBuilder) Add(key, val []byte) (*blockState, error) {
 
 	recSpan := bb.addBlockRecord(key, val)
 
-	if bb.shouldIndexRecord() {
-		bb.indexRecord(key)
-	} else if bb.indexState.startKey == nil {
+	if bb.indexState.startKey == nil {
 		bb.indexState.startKey = key
 		bb.indexState.startKeyOffset = recSpan.Offset
+	}
+
+	if bb.shouldIndexRecord() {
+		bb.indexRecord(key)
 	}
 
 	return lastBlock, nil
