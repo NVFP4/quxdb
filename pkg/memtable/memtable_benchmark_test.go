@@ -1,27 +1,29 @@
 package memtable
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const (
-	benchMemtableCapacity = 32 << 20
-	benchUserKeyLen       = 16
-	benchZipfTraceSize    = 64 << 10
-	benchValueSizeN       = 100_000
+	// test against a fixed-sized memtable
+	benchMemtableCapacity = 16 << 20
+	benchRandSeed         = 7129
+	benchKeyLen           = 16
+	benchValueLen         = 128
+	benchScanLen          = 100
+	benchZipfTraceSize    = 1 << 10
 )
 
 var (
-	benchSizes      = []int{100_000, 300_000}
-	benchReaders    = []int{4, 8, 16}
-	benchValueSizes = []int{16, 128, 1024}
-	benchZipfSkews  = []float64{1.1, 1.3}
+	benchSizes     = []int{1_000, 10_000, 100_000}
+	benchReaders   = []int{2, 4, 8, 16}
+	benchZipfSkews = []float64{1.01, 1.2, 1.5}
 )
 
 var benchImpls = []struct {
@@ -39,121 +41,88 @@ var benchImpls = []struct {
 }
 
 func BenchmarkMemtable(b *testing.B) {
-	val := []byte("value")
+	val := benchValue(benchValueLen)
 
 	for _, impl := range benchImpls {
 		b.Run("impl="+impl.name, func(b *testing.B) {
 			for _, benchSize := range benchSizes {
-				b.Run(fmt.Sprintf("N=%d", benchSize), func(b *testing.B) {
-					b.Run("Set/Unique/Seq", func(b *testing.B) {
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-						}
+				b.Run(fmt.Sprintf("keys=%d", benchSize), func(b *testing.B) {
+					keys := benchKeys(b, benchSize)
+					perm := rand.New(rand.NewSource(benchRandSeed)).Perm(benchSize)
 
+					b.Run("Set/Seq", func(b *testing.B) {
 						b.ReportAllocs()
 						for b.Loop() {
 							b.StopTimer()
+							runtime.GC()
 							m := impl.Factory()
 							b.StartTimer()
-							var err error
-							for i := range benchSize {
-								if err = m.Set(keys[i], val); err != nil {
-									break
+
+							for i := range keys {
+								if err := m.Set(keys[i], val); err != nil {
+									b.Fatal(err)
 								}
 							}
-							b.StopTimer()
-							if err != nil {
-								b.Fatal(err)
-							}
-							b.StartTimer()
 						}
 						reportPerKey(b, benchSize)
 					})
 
-					b.Run("Set/Unique/Rand", func(b *testing.B) {
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rng.Uint64(), i)
-						}
-
+					b.Run("Set/Rand", func(b *testing.B) {
 						b.ReportAllocs()
 						for b.Loop() {
 							b.StopTimer()
+							runtime.GC()
 							m := impl.Factory()
 							b.StartTimer()
-							var err error
-							for i := range benchSize {
-								if err = m.Set(keys[i], val); err != nil {
-									break
+
+							for i := range perm {
+								if err := m.Set(keys[perm[i]], val); err != nil {
+									b.Fatal(err)
 								}
 							}
-							b.StopTimer()
-							if err != nil {
-								b.Fatal(err)
-							}
-							b.StartTimer()
 						}
 						reportPerKey(b, benchSize)
 					})
 
-					b.Run("Set/Overwrite/Seq", func(b *testing.B) {
-						m := impl.Factory()
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-							m.Set(keys[i], val)
-						}
+					// b.Run("Set/OverwriteSeq", func(b *testing.B) {
+					// 	b.ReportAllocs()
+					// 	for b.Loop() {
+					// 		b.StopTimer()
+					// 		runtime.GC()
+					// 		m := impl.Factory()
+					// 		benchFill(b, m, keys, val)
+					// 		b.StartTimer()
 
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							if err := m.Set(keys[i], val); err != nil {
-								b.StopTimer()
-								b.Fatal(err)
-							}
-							i++
-							if i == len(keys) {
-								i = 0
-							}
-						}
-					})
+					// 		for i := range keys {
+					// 			if err := m.Set(keys[i], val); err != nil {
+					// 				b.Fatal(err)
+					// 			}
+					// 		}
+					// 	}
+					// 	reportPerKey(b, benchSize)
+					// })
 
-					b.Run("Set/Overwrite/Rand", func(b *testing.B) {
-						m := impl.Factory()
-						rngLocal := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rngLocal.Uint64(), i)
-							m.Set(keys[i], val)
-						}
-						perm := rngLocal.Perm(benchSize)
+					// b.Run("Set/OverwriteRand", func(b *testing.B) {
+					// 	b.ReportAllocs()
+					// 	for b.Loop() {
+					// 		b.StopTimer()
+					// 		runtime.GC()
+					// 		m := impl.Factory()
+					// 		benchFill(b, m, keys, val)
+					// 		b.StartTimer()
 
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							if err := m.Set(keys[perm[i]], val); err != nil {
-								b.StopTimer()
-								b.Fatal(err)
-							}
-							i++
-							if i == len(keys) {
-								i = 0
-							}
-						}
-					})
+					// 		for i := range perm {
+					// 			if err := m.Set(keys[perm[i]], val); err != nil {
+					// 				b.Fatal(err)
+					// 			}
+					// 		}
+					// 	}
+					// 	reportPerKey(b, benchSize)
+					// })
 
 					b.Run("Get/Seq", func(b *testing.B) {
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-						}
-
 						m := impl.Factory()
-						for i := range benchSize {
-							m.Set(keys[i], val)
-						}
+						benchFill(b, m, keys, val)
 
 						b.ReportAllocs()
 						i := 0
@@ -167,18 +136,8 @@ func BenchmarkMemtable(b *testing.B) {
 					})
 
 					b.Run("Get/Rand", func(b *testing.B) {
-						rngLocal := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rngLocal.Uint64(), i)
-						}
-
-						perm := rngLocal.Perm(benchSize)
-
 						m := impl.Factory()
-						for i := range benchSize {
-							m.Set(keys[i], val)
-						}
+						benchFill(b, m, keys, val)
 
 						b.ReportAllocs()
 						i := 0
@@ -191,22 +150,21 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 					})
 
-					b.Run("Get/Miss", func(b *testing.B) {
-						keys := make([][]byte, benchSize)
-						missing := make([][]byte, benchSize)
-						m := impl.Factory()
+					b.Run("Get/Missing", func(b *testing.B) {
+						present := make([][]byte, benchSize)
+						absent := make([][]byte, benchSize)
 						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-							missing[i] = fmt.Appendf(nil, "missing:%016d", i)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
+							present[i] = benchKey(2 * i)
+							absent[i] = benchKey(2*i + 1)
 						}
+
+						m := impl.Factory()
+						benchFill(b, m, present, val)
 
 						b.ReportAllocs()
 						i := 0
 						for b.Loop() {
-							m.Get(missing[i])
+							m.Get(absent[i])
 							i++
 							if i == benchSize {
 								i = 0
@@ -215,18 +173,11 @@ func BenchmarkMemtable(b *testing.B) {
 					})
 
 					b.Run("Get/Skewed", func(b *testing.B) {
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
 						m := impl.Factory()
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rng.Uint64(), i)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
-						}
+						benchFill(b, m, keys, val)
 
 						for _, skew := range benchZipfSkews {
-							b.Run(fmt.Sprintf("s=%.1f", skew), func(b *testing.B) {
+							b.Run(fmt.Sprintf("s=%.2f", skew), func(b *testing.B) {
 								trace := makeBenchZipfTrace(benchSize, skew)
 								b.ReportAllocs()
 								i := 0
@@ -238,28 +189,27 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 					})
 
-					b.Run("Get/Concurrency", func(b *testing.B) {
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
+					b.Run("Get/Concurrent", func(b *testing.B) {
 						m := impl.Factory()
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rng.Uint64(), i)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
-						}
-						perm := rng.Perm(benchSize)
+						benchFill(b, m, keys, val)
 
 						for _, readers := range benchReaders {
 							b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
-								previousProcs := runtime.GOMAXPROCS(readers)
-								defer runtime.GOMAXPROCS(previousProcs)
+								if readers > runtime.NumCPU() {
+									b.Skipf("needs %d CPUs, have %d", readers, runtime.NumCPU())
+								}
+								oldProcs := runtime.GOMAXPROCS(readers)
+								b.Cleanup(func() {
+									runtime.GOMAXPROCS(oldProcs)
+								})
 
 								var workerID atomic.Uint64
 								b.SetParallelism(1)
 								b.ReportAllocs()
+								b.ResetTimer()
 								b.RunParallel(func(pb *testing.PB) {
-									i := int(workerID.Add(1)-1) * (benchSize / readers)
+									id := int(workerID.Add(1) - 1)
+									i := id * (benchSize / readers)
 									for pb.Next() {
 										m.Get(keys[perm[i]])
 										i++
@@ -272,16 +222,103 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 					})
 
-					b.Run("Seek/Seq", func(b *testing.B) {
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-seq:%016d", i)
-						}
+					b.Run("Get/ConcurrentR+W", func(b *testing.B) {
+						for _, readers := range benchReaders {
+							b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
+								if readers+1 > runtime.NumCPU() {
+									b.Skipf("needs %d CPUs, have %d", readers+1, runtime.NumCPU())
+								}
+								oldProcs := runtime.GOMAXPROCS(readers + 1)
+								b.Cleanup(func() {
+									runtime.GOMAXPROCS(oldProcs)
+								})
 
-						m := impl.Factory()
-						for i := range benchSize {
-							m.Set(keys[i], val)
+								m := impl.Factory(WithCapacityBytes(2 * benchMemtableCapacity))
+								benchFill(b, m, keys, val)
+
+								start := make(chan struct{})
+								var stop atomic.Bool
+								var writes atomic.Uint64
+
+								writerDone := make(chan error, 1)
+								go func() {
+									<-start
+
+									for i := 0; i < benchSize && !stop.Load(); i++ {
+										newKey := benchKey(benchSize + i)
+										if err := m.Set(newKey, val); err != nil {
+											writerDone <- err
+											return
+										}
+										writes.Add(1)
+									}
+
+									writerDone <- nil
+								}()
+
+								var wg sync.WaitGroup
+								wg.Add(readers)
+
+								for r := range readers {
+									// Statically divide b.N so there is no atomic counter
+									// in the read hot path.
+									n := b.N / readers
+									if r < b.N%readers {
+										n++
+									}
+
+									// Spread readers across the keyspace.
+									offset := r * benchSize / readers
+
+									go func(n, offset int) {
+										defer wg.Done()
+										<-start
+
+										i := offset
+										for range n {
+											m.Get(keys[perm[i]])
+
+											i++
+											if i == benchSize {
+												i = 0
+											}
+										}
+									}(n, offset)
+								}
+
+								b.ResetTimer()
+								started := time.Now()
+								close(start)
+
+								wg.Wait()
+
+								// Stop the measured read phase here.
+								b.StopTimer()
+								elapsed := time.Since(started)
+
+								stop.Store(true)
+								err := <-writerDone
+
+								if elapsed > 0 {
+									b.ReportMetric(
+										float64(writes.Load())/elapsed.Seconds(),
+										"writes/s",
+									)
+								}
+
+								if err != nil {
+									b.Fatalf(
+										"writer stopped after %d writes: %v",
+										writes.Load(), err,
+									)
+								}
+							})
 						}
+					})
+
+					b.Run("Seek/Seq", func(b *testing.B) {
+						m := impl.Factory()
+						benchFill(b, m, keys, val)
 
 						b.ReportAllocs()
 						i := 0
@@ -295,18 +332,8 @@ func BenchmarkMemtable(b *testing.B) {
 					})
 
 					b.Run("Seek/Rand", func(b *testing.B) {
-						rngLocal := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rngLocal.Uint64(), i)
-						}
-
-						perm := rngLocal.Perm(benchSize)
-
 						m := impl.Factory()
-						for i := range benchSize {
-							m.Set(keys[i], val)
-						}
+						benchFill(b, m, keys, val)
 
 						b.ReportAllocs()
 						i := 0
@@ -319,28 +346,27 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 					})
 
-					b.Run("Seek/Concurrency", func(b *testing.B) {
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
+					b.Run("Seek/Concurrent", func(b *testing.B) {
 						m := impl.Factory()
-						for i := range benchSize {
-							keys[i] = fmt.Appendf(nil, "unique-rand:%016x:%016d", rng.Uint64(), i)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
-						}
-						perm := rng.Perm(benchSize)
+						benchFill(b, m, keys, val)
 
 						for _, readers := range benchReaders {
 							b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
-								previousProcs := runtime.GOMAXPROCS(readers)
-								defer runtime.GOMAXPROCS(previousProcs)
+								if readers > runtime.NumCPU() {
+									b.Skipf("needs %d CPUs, have %d", readers, runtime.NumCPU())
+								}
+								oldProcs := runtime.GOMAXPROCS(readers)
+								b.Cleanup(func() {
+									runtime.GOMAXPROCS(oldProcs)
+								})
 
 								var workerID atomic.Uint64
 								b.SetParallelism(1)
 								b.ReportAllocs()
+								b.ResetTimer()
 								b.RunParallel(func(pb *testing.PB) {
-									i := int(workerID.Add(1)-1) * (benchSize / readers)
+									id := int(workerID.Add(1) - 1)
+									i := id * (benchSize / readers)
 									for pb.Next() {
 										m.Seek(keys[perm[i]])
 										i++
@@ -355,9 +381,7 @@ func BenchmarkMemtable(b *testing.B) {
 
 					b.Run("Cursor/All", func(b *testing.B) {
 						m := impl.Factory()
-						for i := range benchSize {
-							m.Set(fmt.Appendf(nil, "unique-seq:%016d", i), val)
-						}
+						benchFill(b, m, keys, val)
 
 						b.ReportAllocs()
 						for b.Loop() {
@@ -374,447 +398,52 @@ func BenchmarkMemtable(b *testing.B) {
 								b.Fatalf("expected %d, got %d", benchSize, count)
 							}
 						}
+						reportPerKey(b, benchSize)
 					})
-
 				})
 			}
 		})
 	}
 }
 
-func BenchmarkMemtableMVCC(b *testing.B) {
-	val := []byte("value")
+func benchKey(i int) []byte {
+	return fmt.Appendf(nil, "key:%012d", i)
+}
 
-	for _, impl := range benchImpls {
-		b.Run("impl="+impl.name, func(b *testing.B) {
-			for _, benchSize := range benchSizes {
-				b.Run(fmt.Sprintf("N=%d", benchSize), func(b *testing.B) {
-					b.Run("Set/Unique/Seq", func(b *testing.B) {
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							userKey := fmt.Appendf(nil, "%016d", i+1)
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-						}
+func benchValue(n int) []byte {
+	v := make([]byte, n)
+	rand.New(rand.NewSource(benchRandSeed)).Read(v)
+	return v
+}
 
-						b.ReportAllocs()
-						for b.Loop() {
-							b.StopTimer()
-							m := impl.Factory(WithComparator(compareMVCCKey))
-							b.StartTimer()
-							var err error
-							for i := range benchSize {
-								if err = m.Set(keys[i], val); err != nil {
-									break
-								}
-							}
-							b.StopTimer()
-							if err != nil {
-								b.Fatal(err)
-							}
-							b.StartTimer()
-						}
-						reportPerKey(b, benchSize)
-					})
-
-					b.Run("Set/Unique/Rand", func(b *testing.B) {
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							userKey := make([]byte, benchUserKeyLen)
-							binary.BigEndian.PutUint64(userKey[:8], rng.Uint64())
-							binary.BigEndian.PutUint64(userKey[8:16], uint64(i))
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-						}
-
-						b.ReportAllocs()
-						for b.Loop() {
-							b.StopTimer()
-							m := impl.Factory(WithComparator(compareMVCCKey))
-							b.StartTimer()
-							var err error
-							for i := range benchSize {
-								if err = m.Set(keys[i], val); err != nil {
-									break
-								}
-							}
-							b.StopTimer()
-							if err != nil {
-								b.Fatal(err)
-							}
-							b.StartTimer()
-						}
-						reportPerKey(b, benchSize)
-					})
-
-					b.Run("Set/MultiVersion", func(b *testing.B) {
-						for _, vpk := range []int{8, 64, 512} {
-							b.Run(fmt.Sprintf("vpk=%d", vpk), func(b *testing.B) {
-								hotKeys := benchSize / vpk
-								rng := rand.New(rand.NewSource(42))
-								keys := make([][]byte, benchSize)
-								for i := range benchSize {
-									userKey := fmt.Appendf(nil, "hot:%08d", rng.Intn(hotKeys))
-									keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-								}
-
-								b.ReportAllocs()
-								for b.Loop() {
-									b.StopTimer()
-									m := impl.Factory(WithComparator(compareMVCCKey))
-									b.StartTimer()
-									var err error
-									for i := range benchSize {
-										if err = m.Set(keys[i], val); err != nil {
-											break
-										}
-									}
-									b.StopTimer()
-									if err != nil {
-										b.Fatal(err)
-									}
-									b.StartTimer()
-								}
-								reportPerKey(b, benchSize)
-							})
-						}
-					})
-
-					b.Run("Get/Seq", func(b *testing.B) {
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = makeMVCCKey(fmt.Appendf(nil, "%016d", i+1), uint64(i)+1, mvccOpSet)
-						}
-
-						for i := range benchSize {
-							m.Set(keys[i], val)
-						}
-
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							m.Get(keys[i])
-							i++
-							if i == benchSize {
-								i = 0
-							}
-						}
-					})
-
-					b.Run("Get/Rand", func(b *testing.B) {
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						rngLocal := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							userKey := make([]byte, benchUserKeyLen)
-							binary.BigEndian.PutUint64(userKey[:8], rngLocal.Uint64())
-							binary.BigEndian.PutUint64(userKey[8:16], uint64(i))
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-						}
-
-						for i := range benchSize {
-							m.Set(keys[i], val)
-						}
-
-						perm := rngLocal.Perm(benchSize)
-
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							m.Get(keys[perm[i]])
-							i++
-							if i == benchSize {
-								i = 0
-							}
-						}
-					})
-
-					b.Run("Get/Miss", func(b *testing.B) {
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						keys := make([][]byte, benchSize)
-						missing := make([][]byte, benchSize)
-						for i := range benchSize {
-							keys[i] = makeMVCCKey(fmt.Appendf(nil, "%016d", i), uint64(i)+1, mvccOpSet)
-							missing[i] = makeMVCCKey(fmt.Appendf(nil, "missing:%016d", i), uint64(i)+1, mvccOpSet)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
-						}
-
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							m.Get(missing[i])
-							i++
-							if i == benchSize {
-								i = 0
-							}
-						}
-					})
-
-					b.Run("Get/Skewed", func(b *testing.B) {
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						for i := range benchSize {
-							userKey := make([]byte, benchUserKeyLen)
-							binary.BigEndian.PutUint64(userKey[:8], rng.Uint64())
-							binary.BigEndian.PutUint64(userKey[8:], uint64(i))
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
-						}
-
-						for _, skew := range benchZipfSkews {
-							b.Run(fmt.Sprintf("s=%.1f", skew), func(b *testing.B) {
-								trace := makeBenchZipfTrace(benchSize, skew)
-								b.ReportAllocs()
-								i := 0
-								for b.Loop() {
-									m.Get(keys[trace[i]])
-									i = (i + 1) & (len(trace) - 1)
-								}
-							})
-						}
-					})
-
-					b.Run("Get/Concurrency", func(b *testing.B) {
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						for i := range benchSize {
-							userKey := make([]byte, benchUserKeyLen)
-							binary.BigEndian.PutUint64(userKey[:8], rng.Uint64())
-							binary.BigEndian.PutUint64(userKey[8:], uint64(i))
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
-						}
-						perm := rng.Perm(benchSize)
-
-						for _, readers := range benchReaders {
-							b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
-								previousProcs := runtime.GOMAXPROCS(readers)
-								defer runtime.GOMAXPROCS(previousProcs)
-
-								var workerID atomic.Uint64
-								b.SetParallelism(1)
-								b.ReportAllocs()
-								b.RunParallel(func(pb *testing.PB) {
-									i := int(workerID.Add(1)-1) * (benchSize / readers)
-									for pb.Next() {
-										m.Get(keys[perm[i]])
-										i++
-										if i == benchSize {
-											i = 0
-										}
-									}
-								})
-							})
-						}
-					})
-
-					b.Run("Seek/Seq", func(b *testing.B) {
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						keys := make([][]byte, benchSize)
-						seekKeys := make([][]byte, benchSize)
-						for i := range benchSize {
-							userKey := fmt.Appendf(nil, "%016d", i+1)
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-							seekKeys[i] = makeMVCCKey(userKey, uint64(benchSize)+1, mvccOpSeekMax)
-						}
-
-						for i := range benchSize {
-							m.Set(keys[i], val)
-						}
-
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							m.Seek(seekKeys[i])
-							i++
-							if i == benchSize {
-								i = 0
-							}
-						}
-					})
-
-					b.Run("Seek/Rand", func(b *testing.B) {
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						rngLocal := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						seekKeys := make([][]byte, benchSize)
-						for i := range benchSize {
-							userKey := make([]byte, benchUserKeyLen)
-							binary.BigEndian.PutUint64(userKey[:8], rngLocal.Uint64())
-							binary.BigEndian.PutUint64(userKey[8:16], uint64(i))
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-							seekKeys[i] = makeMVCCKey(userKey, uint64(benchSize)+1, mvccOpSeekMax)
-						}
-						for i := range benchSize {
-							m.Set(keys[i], val)
-						}
-
-						perm := rngLocal.Perm(benchSize)
-
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							m.Seek(seekKeys[perm[i]])
-							i++
-							if i == benchSize {
-								i = 0
-							}
-						}
-					})
-
-					b.Run("Seek/Concurrency", func(b *testing.B) {
-						rng := rand.New(rand.NewSource(42))
-						keys := make([][]byte, benchSize)
-						seekKeys := make([][]byte, benchSize)
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						for i := range benchSize {
-							userKey := make([]byte, benchUserKeyLen)
-							binary.BigEndian.PutUint64(userKey[:8], rng.Uint64())
-							binary.BigEndian.PutUint64(userKey[8:], uint64(i))
-							keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-							seekKeys[i] = makeMVCCKey(userKey, uint64(benchSize)+1, mvccOpSeekMax)
-							if err := m.Set(keys[i], val); err != nil {
-								b.Fatal(err)
-							}
-						}
-						perm := rng.Perm(benchSize)
-
-						for _, readers := range benchReaders {
-							b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
-								previousProcs := runtime.GOMAXPROCS(readers)
-								defer runtime.GOMAXPROCS(previousProcs)
-
-								var workerID atomic.Uint64
-								b.SetParallelism(1)
-								b.ReportAllocs()
-								b.RunParallel(func(pb *testing.PB) {
-									i := int(workerID.Add(1)-1) * (benchSize / readers)
-									for pb.Next() {
-										m.Seek(seekKeys[perm[i]])
-										i++
-										if i == benchSize {
-											i = 0
-										}
-									}
-								})
-							})
-						}
-					})
-
-					b.Run("Cursor/All", func(b *testing.B) {
-						m := impl.Factory(WithComparator(compareMVCCKey))
-						for i := range benchSize {
-							userKey := fmt.Appendf(nil, "%016d", i+1)
-							m.Set(makeMVCCKey(userKey, uint64(i)+1, mvccOpSet), val)
-						}
-
-						b.ReportAllocs()
-						for b.Loop() {
-							count := 0
-							c := m.Cursor(nil, nil)
-							for {
-								_, _, ok := c.Next()
-								if !ok {
-									break
-								}
-								count++
-							}
-							if count != benchSize {
-								b.Fatalf("expected %d, got %d", benchSize, count)
-							}
-						}
-					})
-
-				})
-			}
-		})
+func benchFill(tb testing.TB, m Memtable, keys [][]byte, val []byte) {
+	tb.Helper()
+	for i := range keys {
+		if err := m.Set(keys[i], val); err != nil {
+			tb.Fatalf("fill failed at %d/%d: %v", i, len(keys), err)
+		}
 	}
 }
 
-func BenchmarkMemtableMVCCValueSize(b *testing.B) {
-	for _, impl := range benchImpls {
-		b.Run("impl="+impl.name, func(b *testing.B) {
-			for _, valueSize := range benchValueSizes {
-				b.Run(fmt.Sprintf("valueBytes=%d", valueSize), func(b *testing.B) {
-					rng := rand.New(rand.NewSource(42))
-					keys := make([][]byte, benchValueSizeN)
-					capacity := benchMemtableCapacity + benchValueSizeN*valueSize
-					for i := range benchValueSizeN {
-						userKey := make([]byte, benchUserKeyLen)
-						binary.BigEndian.PutUint64(userKey[:8], rng.Uint64())
-						binary.BigEndian.PutUint64(userKey[8:], uint64(i))
-						keys[i] = makeMVCCKey(userKey, uint64(i)+1, mvccOpSet)
-						capacity += len(keys[i])
-					}
-					value := bytes.Repeat([]byte{0xab}, valueSize)
-
-					b.Run("Set/Unique/Rand", func(b *testing.B) {
-						b.ReportAllocs()
-						b.SetBytes(int64(benchValueSizeN * valueSize))
-						for b.Loop() {
-							b.StopTimer()
-							m := impl.Factory(
-								WithCapacityBytes(capacity),
-								WithComparator(compareMVCCKey),
-							)
-							b.StartTimer()
-							var err error
-							for i := range benchValueSizeN {
-								if err = m.Set(keys[i], value); err != nil {
-									break
-								}
-							}
-							b.StopTimer()
-							if err != nil {
-								b.Fatal(err)
-							}
-							b.StartTimer()
-						}
-						reportPerKey(b, benchValueSizeN)
-					})
-
-					b.Run("Get/Rand", func(b *testing.B) {
-						m := impl.Factory(
-							WithCapacityBytes(capacity),
-							WithComparator(compareMVCCKey),
-						)
-						for i := range benchValueSizeN {
-							if err := m.Set(keys[i], value); err != nil {
-								b.Fatal(err)
-							}
-						}
-						perm := rng.Perm(benchValueSizeN)
-
-						b.ReportAllocs()
-						i := 0
-						for b.Loop() {
-							m.Get(keys[perm[i]])
-							i++
-							if i == benchValueSizeN {
-								i = 0
-							}
-						}
-					})
-				})
-			}
-		})
+func benchKeys(tb testing.TB, entries int) [][]byte {
+	tb.Helper()
+	keys := make([][]byte, entries)
+	for i := range keys {
+		keys[i] = benchKey(i)
 	}
+	if len(keys) > 0 && len(keys[0]) != benchKeyLen {
+		tb.Fatalf("benchKey width %d, want %d", len(keys[0]), benchKeyLen)
+	}
+	return keys
 }
 
 func makeBenchZipfTrace(keyCount int, skew float64) []int {
-	rng := rand.New(rand.NewSource(42))
+	rng := rand.New(rand.NewSource(benchRandSeed))
+	rank := rng.Perm(keyCount) // decouple popularity from key order
 	zipf := rand.NewZipf(rng, skew, 1, uint64(keyCount-1))
 	trace := make([]int, benchZipfTraceSize)
 	for i := range trace {
-		trace[i] = int(zipf.Uint64())
+		trace[i] = rank[zipf.Uint64()]
 	}
 	return trace
 }
