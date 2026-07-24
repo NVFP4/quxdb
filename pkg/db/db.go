@@ -25,7 +25,7 @@ import (
 const (
 	memTableType = memtable.BTree
 	maxBatch     = 128
-	fullSync     = false
+	fullSync     = true
 
 	imtFlushThreshold = 1 // holds this many `imt` in memory before flushing
 	maxImt            = 4 // `imt` beyond this value stalls write
@@ -179,12 +179,12 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 		db.lsm.reportTableCleanupError(snapshot.release())
 	}()
 
-	lookupKey := newSeekStart(key, readSeq)
+	lookupKey := newSeekStart(key, readSeq) // heap alloc
 
 	ikey, val, found := snapshot.memtables[0].Seek(lookupKey)
 	if found {
 		if resolved, value, exists := resolvePointLookup(ikey, val, key); resolved {
-			return value, exists
+			return bytes.Clone(value), exists
 		}
 	}
 
@@ -237,10 +237,10 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 
 		var startKey, endKey []byte
 		if start != nil {
-			startKey = newSeekStart(start, readSeq)
+			startKey = newSeekStart(start, readSeq) // heap alloc
 		}
 		if end != nil {
-			endKey = newSeekEndInclusive(end)
+			endKey = newSeekEndInclusive(end) // heap alloc
 		}
 
 		memtables := snapshot.memtables
@@ -316,7 +316,7 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 
 func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) *writeReq {
 	w := db.reqPool.Get().(*writeReq)
-	w.kv.qkey = newQuxKey(key, 0, op)
+	w.kv.qkey = newQuxKey(key, 0, op) // heap alloc
 	w.kv.val = val
 	w.res = writeResult{}
 	w.enqueuedAt = time.Now()
@@ -392,16 +392,16 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 
 	// serialize all records one big buffer
 	batchBuff := bufpool.Get(uint(totalBytes))
-	defer bufpool.Put(batchBuff)
+	defer batchBuff.Release()
 
 	// create batch from slices of the big buff
 	bufOff := 0
 	for i, req := range batch {
 		n := lens[i]
 		end := bufOff + n
-		req.kv.Encode(batchBuff[bufOff:end])
+		req.kv.Encode(batchBuff.B[bufOff:end])
 
-		db.walBuf = append(db.walBuf, batchBuff[bufOff:end])
+		db.walBuf = append(db.walBuf, batchBuff.B[bufOff:end])
 		bufOff = end
 	}
 

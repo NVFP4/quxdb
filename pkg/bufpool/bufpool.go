@@ -6,15 +6,16 @@ import (
 )
 
 const (
-	nBuckets      = 13
-	minBucketSize = 1 << 10                         // min 1 KiB
-	maxBucketSize = minBucketSize << (nBuckets - 1) // max 4 MiB
+	minShift      = 10
+	minBucketSize = 1 << minShift // min 1 KiB
+
+	maxShift      = 22
+	maxBucketSize = 1 << maxShift // max 4 MiB
+
+	nBuckets = maxShift - minShift + 1
 )
 
-var (
-	bufferPools   [nBuckets]sync.Pool
-	log2MinBucket = bits.Len(uint(minBucketSize - 1))
-)
+var bufferPools [nBuckets]sync.Pool
 
 func init() {
 	for i := range nBuckets {
@@ -26,33 +27,35 @@ func init() {
 	}
 }
 
-func Get(size uint) []byte {
+type Buf struct {
+	B []byte
+
+	ptr *[]byte
+	idx int8
+}
+
+// Get borrows byte slice of non-zeroed content from a pool
+func Get(size uint) Buf {
 	pIdx := poolIndex(size)
 	if pIdx < 0 {
-		return make([]byte, 0, size) // too large m8, heap it
+		return Buf{B: make([]byte, size)} // too large m8, heap it
 	}
 
 	bufPtr := bufferPools[pIdx].Get().(*[]byte)
-	return (*bufPtr)[:size]
+	return Buf{B: (*bufPtr)[:size:size], ptr: bufPtr, idx: int8(pIdx)}
 }
 
-func Put(b []byte) {
-	c := cap(b)
-	if c > maxBucketSize {
-		// was heap allocated, let gc manage it
-		return
+// Release returns the buffer back to the pool
+func (b *Buf) Release() {
+	if b.ptr != nil {
+		bufferPools[b.idx].Put(b.ptr)
 	}
 
-	idx := poolIndex(uint(c))
-	bufferPools[idx].Put(&b)
+	*b = Buf{}
 }
 
 func poolIndex(size uint) int {
-	if size <= 1024 {
-		return 0
-	}
-	// cooler way to do ceil(log2)
-	idx := bits.Len(size-1) - log2MinBucket
+	idx := max(0, bits.Len(size-1)-minShift)
 	if idx >= nBuckets {
 		return -1
 	}

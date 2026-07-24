@@ -323,14 +323,14 @@ func (s *walSegment) append(data []byte, flags uint16) (LSN, error) {
 	}
 
 	buf := bufpool.Get(uint(totalBytes))
-	defer bufpool.Put(buf)
+	defer buf.Release()
 
-	_, err := encodeRecord(buf, &rec)
+	_, err := encodeRecord(buf.B, &rec)
 	if err != nil {
 		return 0, err
 	}
 
-	if err := s.writeAtCursor(buf); err != nil {
+	if err := s.writeAtCursor(buf.B); err != nil {
 		return 0, err
 	}
 
@@ -361,8 +361,9 @@ func (s *walSegment) appendBatch(batch [][]byte, flags uint16) ([]AppendResult, 
 
 	recOffset := s.cursor
 	bufOffset := 0
-	buf := bufpool.Get(uint(totalBytes)) // allocate a big buffer pool for the whole batch
-	defer bufpool.Put(buf)
+	// allocate a big buffer pool for the whole batch
+	buf := bufpool.Get(uint(totalBytes))
+	defer buf.Release()
 
 	for i, data := range batch {
 		if results[i].Err != nil {
@@ -373,7 +374,7 @@ func (s *walSegment) appendBatch(batch [][]byte, flags uint16) ([]AppendResult, 
 		results[i].LSN = lsn
 
 		rec := newRecord(lsn, flags, data)
-		n, err := encodeRecord(buf[bufOffset:], &rec)
+		n, err := encodeRecord(buf.B[bufOffset:], &rec)
 		if err != nil {
 			results[i].Err = err
 			continue
@@ -382,7 +383,7 @@ func (s *walSegment) appendBatch(batch [][]byte, flags uint16) ([]AppendResult, 
 		recOffset += uint64(n)
 	}
 
-	if err := s.writeAtCursor(buf); err != nil {
+	if err := s.writeAtCursor(buf.B); err != nil {
 		return nil, err
 	}
 
