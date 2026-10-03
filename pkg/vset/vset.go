@@ -11,8 +11,6 @@ import (
 
 const MaxLevels = 5
 
-type Table = sst.Metadata
-
 type Checkpoint struct {
 	LastSeq uint64 `json:"seq"`
 	LastLSN uint64 `json:"lsn"`
@@ -20,7 +18,7 @@ type Checkpoint struct {
 
 type Change struct {
 	Op         Op
-	Table      Table
+	Table      *sst.Metadata
 	Checkpoint Checkpoint
 }
 
@@ -76,10 +74,9 @@ func (vs *VersionSet) Apply(changes []Change) error {
 	for i, ch := range changes {
 		switch ch.Op {
 		case OpAdd, OpDelete:
-			table := ch.Table
 			newRecords = append(newRecords, catalogRecord{
 				Op:    ch.Op,
-				Table: &table,
+				Table: ch.Table,
 			})
 		case OpCheckpoint:
 			if i != len(changes)-1 {
@@ -128,7 +125,7 @@ func applyRecordLocked(ver *Version, rec catalogRecord) error {
 		if rec.Table.Level >= MaxLevels {
 			return fmt.Errorf("level out of bounds '%d'", rec.Table.Level)
 		}
-		if err := addTableLocked(ver.levels, *rec.Table); err != nil {
+		if err := addTableLocked(ver.levels, rec.Table); err != nil {
 			return err
 		}
 	case OpDelete:
@@ -153,7 +150,7 @@ func applyRecordLocked(ver *Version, rec catalogRecord) error {
 	return nil
 }
 
-func addTableLocked(levels LevelMap, t Table) error {
+func addTableLocked(levels LevelMap, t *sst.Metadata) error {
 	lvl := int(t.Level)
 
 	if lvl == 0 {
@@ -162,7 +159,7 @@ func addTableLocked(levels LevelMap, t Table) error {
 	}
 
 	tables := levels[lvl]
-	idx, _ := slices.BinarySearchFunc(tables, t.MinKey, func(t Table, key []byte) int {
+	idx, _ := slices.BinarySearchFunc(tables, t.MinKey, func(t *sst.Metadata, key []byte) int {
 		return bytes.Compare(t.MinKey, key)
 	})
 
@@ -172,7 +169,7 @@ func addTableLocked(levels LevelMap, t Table) error {
 
 func deleteTableLocked(levels LevelMap, id uint64) {
 	for lvl, metas := range levels {
-		metas = slices.DeleteFunc(metas, func(t Table) bool {
+		metas = slices.DeleteFunc(metas, func(t *sst.Metadata) bool {
 			return t.ID == id
 		})
 		if len(metas) == 0 {

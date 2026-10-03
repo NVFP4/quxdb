@@ -22,7 +22,7 @@ func TestApplyDeleteByIDMatchesReplay(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(1, 0)}}))
-	require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: Table{ID: 1, Level: 1}}}))
+	require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: &sst.Metadata{ID: 1, Level: 1}}}))
 	assertLevelIDs(t, vs.CurrentVersion().Level(0))
 	assertLevelIDs(t, vs.CurrentVersion().Level(1))
 	require.NoError(t, vs.Close())
@@ -110,7 +110,7 @@ func TestApplyPublishesFreshVersion(t *testing.T) {
 	assertLevelIDs(t, prev.Level(0))
 	assertLevelIDs(t, next.Level(0), 1)
 
-	prev.levels[0] = []Table{testTable(99, 0)}
+	prev.levels[0] = []*sst.Metadata{testTable(99, 0)}
 	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
 }
 
@@ -126,7 +126,7 @@ func TestCheckpointPersistsIndependentlyOfTables(t *testing.T) {
 	}))
 	assert.Equal(t, checkpoint, vs.CurrentVersion().Checkpoint())
 
-	require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: Table{ID: 1}}}))
+	require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: &sst.Metadata{ID: 1}}}))
 	assert.Equal(t, checkpoint, vs.CurrentVersion().Checkpoint())
 	require.NoError(t, vs.Close())
 
@@ -236,7 +236,7 @@ func TestCatalogAppendAfterReplayUsesFileSize(t *testing.T) {
 	secondRec := addRecord(testTable(2, 0))
 	secondRec.Table.Path = filepath.Join("sst", string(bytes.Repeat([]byte("x"), 257)))
 	second := mustEncodeRecord(t, secondRec)
-	require.NoError(t, vs.Apply([]Change{{Op: secondRec.Op, Table: *secondRec.Table}}))
+	require.NoError(t, vs.Apply([]Change{{Op: secondRec.Op, Table: secondRec.Table}}))
 
 	st, err := os.Stat(filepath.Join(dir, catFilename))
 	require.NoError(t, err)
@@ -289,8 +289,8 @@ func (w *failAfterWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func testTable(id uint64, level uint8) Table {
-	return Table{
+func testTable(id uint64, level uint8) *sst.Metadata {
+	return &sst.Metadata{
 		Version:   1,
 		ID:        id,
 		Level:     level,
@@ -306,7 +306,7 @@ func testTable(id uint64, level uint8) Table {
 	}
 }
 
-func assertLevelIDs(t *testing.T, tables []Table, ids ...uint64) {
+func assertLevelIDs(t *testing.T, tables []*sst.Metadata, ids ...uint64) {
 	t.Helper()
 	if ids == nil {
 		ids = []uint64{}
@@ -318,8 +318,8 @@ func assertLevelIDs(t *testing.T, tables []Table, ids ...uint64) {
 	assert.Equal(t, ids, got)
 }
 
-func addRecord(table Table) catalogRecord {
-	return catalogRecord{Op: OpAdd, Table: &table}
+func addRecord(table *sst.Metadata) catalogRecord {
+	return catalogRecord{Op: OpAdd, Table: table}
 }
 
 func mustEncodeRecord(t *testing.T, rec catalogRecord) []byte {

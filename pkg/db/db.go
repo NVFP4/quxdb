@@ -28,7 +28,6 @@ const (
 	fullSync     = true
 
 	imtFlushThreshold = 1 // holds this many `imt` in memory before flushing
-	maxImt            = 4 // `imt` beyond this value stalls write
 )
 
 type QuxDB struct {
@@ -70,7 +69,7 @@ func New(dataDir string) (*QuxDB, error) {
 		return nil, err
 	}
 
-	lsm, err := newLsmState(dataDir, maxImt)
+	lsm, err := newLsmState(dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -173,57 +172,42 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 }
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool) {
+	view := db.lsm.acquire()
+	defer view.release()
+	// pin before loading readSeq; a newer view may have compacted away versions visible at it.
 	readSeq := db.committedSeq.Load()
-	snapshot := db.lsm.acquireReadSnapshot()
-	defer func() {
-		db.lsm.reportTableCleanupError(snapshot.release())
-	}()
 
 	lookupKey := newSeekStart(key, readSeq) // heap alloc
 
-	ikey, val, found := snapshot.memtables[0].Seek(lookupKey)
-	if found {
-		switch quxKey(ikey).Match(key) {
-		case keyMatchExact:
-			return bytes.Clone(val), true
-		case keyMatchDeleted:
-			return nil, false
+	for _, mt := range view.memtables {
+		ikey, val, found := mt.Seek(lookupKey)
+		if value, exists, done := resolve(key, ikey, val, found); done {
+			return value, exists
 		}
 	}
 
-	for i := len(snapshot.memtables) - 1; i >= 1; i-- {
-		ikey, val, found := snapshot.memtables[i].Seek(lookupKey)
-		if found {
-			switch quxKey(ikey).Match(key) {
-			case keyMatchExact:
-				return bytes.Clone(val), true
-			case keyMatchDeleted:
-				return nil, false
-			}
-		}
-	}
-
-	tables := snapshot.tableVersion.version.PointLookupCandidates(key)
-	for _, t := range tables {
-		reader, err := snapshot.openTable(sst.Metadata(t))
-		if err != nil {
-			fmt.Printf("db: store error %v\n", err)
-			return nil, false
-		}
-
-		ikey, value, found := reader.Lookup(key, lookupKey)
-		reader.Close()
-		if found {
-			switch quxKey(ikey).Match(key) {
-			case keyMatchExact:
-				return bytes.Clone(value), true
-			case keyMatchDeleted:
-				return nil, false
-			}
+	for table := range view.tableCandidates(key) {
+		ikey, val, found := table.Lookup(key, lookupKey)
+		if value, exists, done := resolve(key, ikey, val, found); done {
+			return value, exists
 		}
 	}
 
 	return nil, false
+}
+
+// `done` reports whether a newest-first seek result decides the lookup.
+func resolve(key, ikey, val []byte, found bool) (value []byte, exists, done bool) {
+	if !found {
+		return nil, false, false
+	}
+	switch quxKey(ikey).Match(key) {
+	case keyMatchExact:
+		return bytes.Clone(val), true, true
+	case keyMatchDeleted:
+		return nil, false, true
+	}
+	return nil, false, false
 }
 
 func (db *QuxDB) Delete(key []byte) error {
@@ -238,11 +222,9 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 			return
 		}
 
+		view := db.lsm.acquire()
+		defer view.release()
 		readSeq := db.committedSeq.Load()
-		snapshot := db.lsm.acquireReadSnapshot()
-		defer func() {
-			db.lsm.reportTableCleanupError(snapshot.release())
-		}()
 
 		var startKey, endKey []byte
 		if start != nil {
@@ -252,8 +234,8 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 			endKey = newSeekEndInclusive(end) // heap alloc
 		}
 
-		memtables := snapshot.memtables
-		tables := snapshot.tableVersion.version.RangeLookupCandidates(start, end)
+		memtables := view.memtables
+		tables := view.tableRangeCandidates(start, end)
 
 		if len(memtables) == 1 && len(tables) == 0 {
 			cur := &mvccCursor{
@@ -280,21 +262,9 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 			})
 		}
 
-		readers := make([]sst.Reader, 0, len(tables))
-		defer func() {
-			for i := range readers {
-				db.lsm.reportTableCleanupError(readers[i].Close())
-			}
-		}()
 		for _, table := range tables {
-			reader, err := snapshot.openTable(sst.Metadata(table))
-			if err != nil {
-				fmt.Printf("db: store error %v\n", err)
-				return
-			}
-			readers = append(readers, reader)
 			cursors = append(cursors, &mvccCursor{
-				cur:     reader.Cursor(startKey, endKey),
+				cur:     table.Cursor(startKey, endKey),
 				readSeq: readSeq,
 			})
 		}

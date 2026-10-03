@@ -23,7 +23,6 @@ var (
 	ErrUnsupportedVersion = errors.New("sst: unsupported version")
 	ErrCorrupt            = errors.New("sst: corrupt")
 	ErrChecksumMismatch   = errors.New("sst: checksum mismatch")
-	ErrTableRetired       = errors.New("sst: table retired")
 )
 
 type FileHashes struct {
@@ -32,6 +31,7 @@ type FileHashes struct {
 	Filter string `json:"qfltr"`
 }
 
+// immutable once built or replayed; versions and registry handles share one pointer.
 type Metadata struct {
 	Version    uint16     `json:"ver"`
 	ID         uint64     `json:"id"`
@@ -52,13 +52,12 @@ type Span struct {
 }
 
 type SST struct {
-	meta   Metadata
 	data   *MappedBlockData
 	index  *MappedSparseIndex
 	filter *MappedFilter
 }
 
-func openSST(meta Metadata) (*SST, error) {
+func openSST(meta *Metadata) (*SST, error) {
 	var (
 		data   *MappedBlockData
 		index  *MappedSparseIndex
@@ -107,7 +106,6 @@ func openSST(meta Metadata) (*SST, error) {
 	}
 
 	return &SST{
-		meta:   meta,
 		data:   data,
 		index:  index,
 		filter: filter,

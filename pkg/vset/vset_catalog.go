@@ -10,6 +10,7 @@ import (
 
 	"github.com/yashgorana/quxdb/pkg/fs"
 	"github.com/yashgorana/quxdb/pkg/jsonl"
+	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
 const (
@@ -32,9 +33,9 @@ const (
 )
 
 type catalogRecord struct {
-	Op         Op          `json:"op"`
-	Table      *Table      `json:"table,omitempty"`
-	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`
+	Op         Op            `json:"op"`
+	Table      *sst.Metadata `json:"table,omitempty"`
+	Checkpoint *Checkpoint   `json:"checkpoint,omitempty"`
 }
 
 type catalog struct {

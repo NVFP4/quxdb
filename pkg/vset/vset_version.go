@@ -3,9 +3,11 @@ package vset
 import (
 	"bytes"
 	"slices"
+
+	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
-type LevelMap map[int][]Table
+type LevelMap map[int][]*sst.Metadata
 
 func newLevelMap(depth int) LevelMap {
 	return make(LevelMap, depth)
@@ -29,7 +31,7 @@ func (v *Version) Checkpoint() Checkpoint {
 }
 
 // caller must clone to mutate
-func (v *Version) Level(n int) []Table {
+func (v *Version) Level(n int) []*sst.Metadata {
 	if v == nil {
 		return nil
 	}
@@ -56,8 +58,8 @@ func (v *Version) Clone() *Version {
 }
 
 // returns all ssts, sorted by L0, L1, ..., Ln and the order in which they were added
-func (v *Version) All() []Table {
-	var meta []Table
+func (v *Version) All() []*sst.Metadata {
+	var meta []*sst.Metadata
 	for _, tables := range v.levels {
 		for i := len(tables) - 1; i >= 0; i-- {
 			meta = append(meta, tables[i])
@@ -67,8 +69,8 @@ func (v *Version) All() []Table {
 }
 
 // point lookup candidate ssts
-func (v *Version) PointLookupCandidates(key []byte) []Table {
-	var meta []Table
+func (v *Version) PointLookupCandidates(key []byte) []*sst.Metadata {
+	var meta []*sst.Metadata
 	if len(key) == 0 {
 		return meta
 	}
@@ -82,7 +84,7 @@ func (v *Version) PointLookupCandidates(key []byte) []Table {
 		}
 	}
 
-	// compaction strat agnostic selection
+	// scan every table instead of binary search, support both tiered/hybrid compaction
 	for lvl := 1; lvl < MaxLevels; lvl++ {
 		for _, tab := range v.levels[lvl] {
 			if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 {
@@ -94,8 +96,8 @@ func (v *Version) PointLookupCandidates(key []byte) []Table {
 }
 
 // range lookup candidate ssts, `start` must be less than `end`
-func (v *Version) RangeLookupCandidates(start, end []byte) []Table {
-	var meta []Table
+func (v *Version) RangeLookupCandidates(start, end []byte) []*sst.Metadata {
+	var meta []*sst.Metadata
 
 	if len(start) > 0 && len(end) > 0 && bytes.Compare(start, end) > 0 {
 		return meta
@@ -118,8 +120,7 @@ func (v *Version) RangeLookupCandidates(start, end []byte) []Table {
 		}
 	}
 
-	// L1+ tables are ordered by MinKey, but may overlap under hybrid
-	// compaction. Test every table rather than assuming a contiguous range.
+	// scan every table instead of binary search, support both tiered/hybrid compaction
 	for lvl := 1; lvl < MaxLevels; lvl++ {
 		for _, tab := range v.levels[lvl] {
 			hasStart := true
