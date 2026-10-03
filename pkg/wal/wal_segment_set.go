@@ -175,7 +175,7 @@ func (s *segmentSet) truncateTail(lsn LSN) error {
 		}
 		delete(s.byID, seg.segId)
 	}
-	// Truncation is irreversible; retain state changes even when cleanup fails.
+	// Truncation is irreversible, so retain state changes even when cleanup fails.
 	clear(s.segments[cut:])
 	s.segments = s.segments[:cut]
 

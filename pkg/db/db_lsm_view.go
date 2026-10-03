@@ -7,11 +7,11 @@ import (
 	"github.com/yashgorana/quxdb/pkg/vset"
 )
 
-// lsmView is immutable; rollover views share tables and the current pointer's ref.
+// lsmView is immutable, rollover views share its tables and ref
 type lsmView struct {
 	version   *vset.Version
 	tables    *sst.View
-	memtables []*quxMemtable // newest first; [0] is the active memtable
+	memtables []*quxMemtable // newest first, [0] is the active memtable
 }
 
 func (v *lsmView) release() {

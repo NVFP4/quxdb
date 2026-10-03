@@ -56,7 +56,7 @@ func (c *lsmCompactor) Start() {
 	go c.compactionLoop()
 }
 
-// dropping a signal is fine since compact runs until every level is within target
+// dropping a signal is fine, compact runs until levels are within target
 func (c *lsmCompactor) Notify() {
 	select {
 	case c.notify <- struct{}{}:
@@ -105,7 +105,7 @@ func (c *lsmCompactor) plan() *compactionPlan {
 }
 
 func pickCompaction(version *vset.Version) (int, []*sst.Metadata) {
-	// cap each l0 job at l0FileTarget files so a flush burst doesn't turn into one huge compaction
+	// cap l0 jobs so a flush burst isn't one huge compaction
 	l0 := version.Level(0)
 	if len(l0) >= l0FileTarget {
 		inputs := slices.Clone(l0[:l0FileTarget])
@@ -136,8 +136,7 @@ func pickCompaction(version *vset.Version) (int, []*sst.Metadata) {
 func (c *lsmCompactor) execute(plan *compactionPlan) error {
 	defer plan.view.release()
 
-	// a lone table changes level in the catalog only; merges into the last level still rewrite
-	// so shadowed versions and tombstones get dropped there.
+	// lone tables move by catalog edit, but the last level still merges to drop garbage
 	targetLevel := plan.sourceLevel + 1
 	if len(plan.inputs) == 1 && targetLevel < vset.MaxLevels-1 {
 		table := plan.inputs[0]
@@ -189,7 +188,7 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 	targetLevel := plan.sourceLevel + 1
 	targetSize := tableTargetBytes[targetLevel]
 	bottomLevel := targetLevel == vset.MaxLevels-1
-	// size the bloom filter from the target, not input key counts, which include versions the merge drops
+	// size the filter by target since input key counts include versions the merge drops
 	opts := sst.BuilderOpts{
 		Dir:       c.dataDir,
 		Level:     uint8(targetLevel),

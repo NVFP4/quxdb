@@ -19,12 +19,14 @@ var (
 	ErrAlreadyFinalized = errors.New("sst: already finalized")
 )
 
+// Record is one table entry.
 type Record struct {
 	OrderedKey []byte
 	FilterKey  []byte
 	Value      []byte
 }
 
+// BuilderOpts configures a table build.
 type BuilderOpts struct {
 	Dir       string
 	ID        uint64
@@ -33,6 +35,7 @@ type BuilderOpts struct {
 	SizeBytes uint64
 }
 
+// Builder writes a table to a tmp dir and publishes it on Finalize.
 type Builder struct {
 	id     uint64
 	sstDir string
@@ -49,12 +52,13 @@ type Builder struct {
 	closed bool
 }
 
+// NewBuilder starts building table opts.ID.
 func NewBuilder(opts BuilderOpts) (*Builder, error) {
 	id := opts.ID
 	finalDir := sstDirPath(opts.Dir, id)
 	sstDir := finalDir + ".tmp"
 
-	// ids of uncommitted tables are reused after a crash, so clear their leftovers.
+	// clear leftovers of an uncommitted build with this id
 	if err := errors.Join(os.RemoveAll(finalDir), os.RemoveAll(sstDir)); err != nil {
 		return nil, err
 	}
@@ -100,6 +104,7 @@ func NewBuilder(opts BuilderOpts) (*Builder, error) {
 	}, nil
 }
 
+// Add appends a record to the table.
 func (b *Builder) Add(r Record) error {
 	if b.closed {
 		return ErrClosed
@@ -132,6 +137,7 @@ func (b *Builder) Add(r Record) error {
 	return nil
 }
 
+// Finalize writes the table and returns its metadata.
 func (b *Builder) Finalize() (*Metadata, error) {
 	if b.closed {
 		return nil, ErrAlreadyFinalized
@@ -185,6 +191,7 @@ func (b *Builder) Finalize() (*Metadata, error) {
 	return metadata, nil
 }
 
+// Abort discards the build.
 func (b *Builder) Abort() error {
 	b.closed = true
 

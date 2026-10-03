@@ -21,6 +21,7 @@ type Registry struct {
 	mu      sync.Mutex
 }
 
+// NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		cache:   make(map[uint64]*tableHandle),
@@ -28,7 +29,7 @@ func NewRegistry() *Registry {
 	}
 }
 
-// on error, callers must Retire the whole batch.
+// Open opens tables for View, callers Retire the batch on error.
 func (r *Registry) Open(tables []*Metadata) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -43,7 +44,7 @@ func (r *Registry) Open(tables []*Metadata) error {
 	return nil
 }
 
-// tables must already be open.
+// View returns a snapshot read-only View of the tables
 func (r *Registry) View(tables []*Metadata) *View {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -58,7 +59,7 @@ func (r *Registry) View(tables []*Metadata) *View {
 	return view
 }
 
-// unpinned tables are deleted synchronously; pinned ones after their last view release.
+// Retire marks the table for deletion & will delete once no reader references the table
 func (r *Registry) Retire(tables []*Metadata) {
 	var obsolete []*tableHandle
 	r.mu.Lock()
@@ -79,7 +80,7 @@ func (r *Registry) Retire(tables []*Metadata) {
 	r.removeTables(obsolete)
 }
 
-// failed removals are logged and stay retired so Close retries them.
+// failed removals stay retired for Close to retry.
 func (r *Registry) removeTables(handles []*tableHandle) {
 	for _, h := range handles {
 		if err := removeTable(h); err != nil {
@@ -103,7 +104,7 @@ func removeTable(h *tableHandle) error {
 	return errors.Join(closeErr, os.RemoveAll(h.meta.Path))
 }
 
-// must run after every view is released.
+// Close closes all tables after every view is released.
 func (r *Registry) Close() error {
 	r.cleanup.Wait()
 

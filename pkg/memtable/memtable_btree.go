@@ -98,7 +98,7 @@ func (m *btreeMemtable) initLocked() {
 	m.leafChunks = append(m.leafChunks, new([btreeLeafChunkSize]btreeLeafNode))
 	m.internalChunks = nil
 	m.leafCount = 2     // leaf 0 = nil, leaf 1 = root
-	m.internalCount = 1 // internal 0 = nil; allocate the first chunk on demand
+	m.internalCount = 1 // internal 0 = nil, allocate the first chunk on demand
 	m.root = makeLeafRef(1)
 	m.firstLeaf = 1
 	m.lastLeaf = 1

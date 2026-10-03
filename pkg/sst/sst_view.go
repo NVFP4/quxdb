@@ -2,19 +2,19 @@ package sst
 
 import "sync/atomic"
 
-// View is a read snapshot of sstables; its tables are not deleted until its last Release.
+// View is a read snapshot of tables, pinned until its last Release.
 type View struct {
 	refs     atomic.Int64
 	registry *Registry
 	handles  map[uint64]*tableHandle
 }
 
-// valid until the view's last Release.
+// Table returns a pinned table, valid until the last Release.
 func (v *View) Table(id uint64) *SST {
 	return v.handles[id].sst
 }
 
-// fails after the last Release; callers reload the current view.
+// TryRetain adds a ref, or returns false once fully released.
 func (v *View) TryRetain() bool {
 	for refs := v.refs.Load(); refs != 0; refs = v.refs.Load() {
 		if v.refs.CompareAndSwap(refs, refs+1) {
@@ -24,7 +24,7 @@ func (v *View) TryRetain() bool {
 	return false
 }
 
-// retired tables are deleted in the background to keep removal off the read path.
+// Release drops a ref, and the last one frees retired tables in the background.
 func (v *View) Release() {
 	if v.refs.Add(-1) != 0 {
 		return

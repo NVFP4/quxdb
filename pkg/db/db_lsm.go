@@ -58,7 +58,7 @@ func (s *lsmState) nextTableID() uint64 {
 	return s.versions.NextTableID()
 }
 
-// write loop only; it is the sole caller of rolloverMemtable.
+// write loop only, the sole caller of rolloverMemtable
 func (s *lsmState) activeMemtable() *quxMemtable {
 	return s.current.Load().memtables[0]
 }
@@ -99,7 +99,7 @@ func (s *lsmState) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) *quxMemtabl
 	return previous
 }
 
-// flushed must be the oldest immutables, oldest first; assumes a single flusher.
+// flushed must be the oldest immutables, oldest first, from a single flusher
 func (s *lsmState) replaceMemtablesWithSSTs(flushed []*quxMemtable, toAdd []*sst.Metadata) error {
 	last := flushed[len(flushed)-1]
 	return s.applyEdit(toAdd, nil, len(flushed), &vset.Checkpoint{
@@ -112,7 +112,7 @@ func (s *lsmState) replaceSSTs(toRemove, toAdd []*sst.Metadata) error {
 	return s.applyEdit(toAdd, toRemove, 0, nil)
 }
 
-// re-adding the same id replaces it in the catalog, so files and pinned tables stay as is.
+// level change only, files and pinned tables stay untouched
 func (s *lsmState) moveTable(table *sst.Metadata, level uint8) error {
 	moved := *table
 	moved.Level = level

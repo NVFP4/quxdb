@@ -16,7 +16,7 @@ const (
 
 	slotBits      = 64
 	maxBitsPerKey = 32      // cap at the 32 bits/key optimum to bound hit/add CPU.
-	maxK          = 22      // k ~= maxBitsPerKey * ln(2);
+	maxK          = 22      // k ~= maxBitsPerKey * ln(2)
 	maxSlots      = 1 << 29 // max 4GiB bitset
 )
 

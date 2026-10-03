@@ -9,4 +9,4 @@ This is QuxDB, a high-performance LSM database written in Go 1.26.
 
 ## Comment Guidelines
 
-Add commments for providing additional context to future coding agents or human readers. Do not write any comments that's obvious or can be inferred from nearby code. Keep comments succinct, lower case and limited to 1 or max 2 lines, something that a staff or principal engineer would write. Add simple one line docstring on public structs, interfaces and methods that explains what it does.
+Comment only to add context a reader can't get from nearby code. Keep it lower case, one line (two at most), in the fewest words that carry the point: state the fact, not the reasoning behind it, e.g. `// set only by catalog snapshots`. No semicolons. Give public structs, interfaces and methods a simple one line docstring saying what they do.

@@ -12,7 +12,7 @@ const (
 
 type Record struct {
 	LSN LSN
-	// Data is valid until the next WAL operation; clone it to retain it.
+	// Data is valid until the next WAL operation, so clone it to retain it.
 	Data []byte
 }
 
@@ -105,7 +105,7 @@ func (w *WAL) TruncateFrom(lsn LSN) error {
 	return w.writer.truncate(lsn)
 }
 
-// PruneBefore deletes sealed segments preceding lsn's segment; zero is a no-op.
+// PruneBefore deletes sealed segments preceding lsn's segment. Zero is a no-op.
 func (w *WAL) PruneBefore(lsn LSN) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -121,7 +121,7 @@ func (w *WAL) Replay(callback func(Record) error) (LSN, error) {
 	return w.reader.replay(callback)
 }
 
-// ReplayAfter replays records following lsn; zero starts at the oldest record.
+// ReplayAfter replays records following lsn. Zero starts at the oldest record.
 func (w *WAL) ReplayAfter(lsn LSN, callback func(Record) error) (LSN, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

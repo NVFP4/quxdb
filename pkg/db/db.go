@@ -174,7 +174,7 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 	view := db.lsm.acquire()
 	defer view.release()
-	// pin before loading readSeq; a newer view may have compacted away versions visible at it.
+	// pin before loading readSeq so compaction can't drop versions visible at it
 	readSeq := db.committedSeq.Load()
 
 	lookupKey := newSeekStart(key, readSeq) // heap alloc
@@ -471,8 +471,7 @@ func (db *QuxDB) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) {
 	fmt.Printf("db: rollover memtable size=%.2fMB keys=%d lastSeq=%d lastLSN=%d\n",
 		float64(mt.SizeBytes())/(1024*1024), mt.Len(), mt.lastSeq, mt.lastLSN)
 
-	// Non-blocking notification; the flush worker determines whether enough
-	// immutable memtables are available.
+	// non-blocking, the flush worker decides whether enough immutables are queued
 	select {
 	case db.imtNotify <- struct{}{}:
 	default:

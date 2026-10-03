@@ -2,6 +2,7 @@ package sst
 
 import "github.com/yashgorana/quxdb/pkg/core"
 
+// Lookup seeks orderedKey if the filter may hold filterKey.
 func (s *SST) Lookup(filterKey, orderedKey []byte) (key, value []byte, found bool) {
 	if !s.MayContain(filterKey) {
 		return nil, nil, false
@@ -10,6 +11,7 @@ func (s *SST) Lookup(filterKey, orderedKey []byte) (key, value []byte, found boo
 	return s.Seek(orderedKey)
 }
 
+// Seek returns the entry at or after orderedKey within its indexed block.
 func (s *SST) Seek(orderedKey []byte) (key, value []byte, found bool) {
 	span, ok := s.index.SearchSpan(orderedKey)
 	if !ok {
@@ -24,11 +26,12 @@ func (s *SST) Seek(orderedKey []byte) (key, value []byte, found bool) {
 	return block.Seek(orderedKey)
 }
 
+// MayContain reports whether the bloom filter may hold filterKey.
 func (s *SST) MayContain(filterKey []byte) bool {
 	return s.filter.Contains(filterKey)
 }
 
-// must not outlive the View that pins s.
+// Cursor iterates a key range and must not outlive the pinning View.
 func (s *SST) Cursor(start, end []byte) core.Cursor {
 	return newSSTCursor(
 		s.data,

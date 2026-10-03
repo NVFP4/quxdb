@@ -24,13 +24,14 @@ var (
 	ErrChecksumMismatch   = errors.New("sst: checksum mismatch")
 )
 
+// FileHashes holds the sha256 of each table file.
 type FileHashes struct {
 	Data   string `json:"qdat"`
 	Index  string `json:"qidx"`
 	Filter string `json:"qfltr"`
 }
 
-// immutable once built or replayed; holders share pointers, so a level move copies.
+// Metadata describes a table, immutable and shared by pointer.
 type Metadata struct {
 	Version    uint16     `json:"ver"`
 	ID         uint64     `json:"id"`
@@ -44,12 +45,13 @@ type Metadata struct {
 	FileHashes FileHashes `json:"sha256"`
 }
 
-// range of bytes
+// Span is a byte range in a table file.
 type Span struct {
 	Offset int
 	Size   int
 }
 
+// SST is an open, memory-mapped table.
 type SST struct {
 	data   *MappedBlockData
 	index  *MappedSparseIndex
@@ -140,7 +142,7 @@ func mmapRead(path string, advice fs.MmapAdvice) ([]byte, error) {
 	return mmapBytes, nil
 }
 
-// fixed width so names stay the same length and sort in id order.
+// fixed width keeps names sorted by id.
 func sstName(id uint64) string {
 	return fmt.Sprintf("%020d", id)
 }
@@ -157,7 +159,7 @@ func sstFilterName(id uint64) string {
 	return sstName(id) + ".qfltr"
 }
 
-// tables live flat under sst/; level is catalog metadata, not part of the path.
+// flat layout, the level lives in the catalog
 func sstDirPath(baseDir string, id uint64) string {
 	return filepath.Join(baseDir, "sst", sstName(id))
 }

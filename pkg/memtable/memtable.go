@@ -42,7 +42,7 @@ type Memtable interface {
 
 	// Clear removes all entries and drops references to data and structural
 	// allocations. The memtable remains reusable and allocates lazily on the
-	// next Set. Clear invalidates borrowed views and cursors; callers must stop
+	// next Set. Clear invalidates borrowed views and cursors, so callers must stop
 	// using them before calling Clear. Reclamation is scheduled by the Go
 	// runtime rather than forced synchronously.
 	Clear()
