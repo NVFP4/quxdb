@@ -33,13 +33,6 @@ const (
 )
 
 type QuxDB struct {
-	committedSeq atomic.Uint64
-	_            [56]byte // cache line padding
-
-	// writeSeq and lastCommittedLSN are owned by writeLoop after recovery.
-	writeSeq         quxSeq
-	lastCommittedLSN wal.LSN
-
 	dataDir string
 	flock   *flock.Flock
 
@@ -54,6 +47,10 @@ type QuxDB struct {
 
 	lsm       *lsmState
 	compactor *lsmCompactor
+
+	committedSeq     atomic.Uint64
+	writeSeq         quxSeq
+	lastCommittedLSN wal.LSN
 }
 
 func New(dataDir string) (*QuxDB, error) {
@@ -394,8 +391,9 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 			}
 			lastSeq = req.kv.qkey.Seq()
 			lastLSN = results[i].LSN
-			db.committedSeq.Store(lastSeq)
 		}
+		// one store per batch keeps readers' copy of this line valid between batches
+		db.committedSeq.Store(lastSeq)
 		db.lastCommittedLSN = lastLSN
 	}
 
