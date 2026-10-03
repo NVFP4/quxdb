@@ -183,16 +183,22 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 
 	ikey, val, found := snapshot.memtables[0].Seek(lookupKey)
 	if found {
-		if resolved, value, exists := resolvePointLookup(ikey, val, key); resolved {
-			return bytes.Clone(value), exists
+		switch quxKey(ikey).Match(key) {
+		case keyMatchExact:
+			return bytes.Clone(val), true
+		case keyMatchDeleted:
+			return nil, false
 		}
 	}
 
 	for i := len(snapshot.memtables) - 1; i >= 1; i-- {
 		ikey, val, found := snapshot.memtables[i].Seek(lookupKey)
 		if found {
-			if resolved, value, exists := resolvePointLookup(ikey, val, key); resolved {
-				return bytes.Clone(value), exists
+			switch quxKey(ikey).Match(key) {
+			case keyMatchExact:
+				return bytes.Clone(val), true
+			case keyMatchDeleted:
+				return nil, false
 			}
 		}
 	}
@@ -208,8 +214,11 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 		ikey, value, found := reader.Lookup(key, lookupKey)
 		reader.Close()
 		if found {
-			if resolved, value, exists := resolvePointLookup(ikey, value, key); resolved {
-				return bytes.Clone(value), exists
+			switch quxKey(ikey).Match(key) {
+			case keyMatchExact:
+				return bytes.Clone(value), true
+			case keyMatchDeleted:
+				return nil, false
 			}
 		}
 	}

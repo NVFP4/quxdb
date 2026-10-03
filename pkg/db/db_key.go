@@ -6,14 +6,21 @@ import (
 )
 
 type (
-	quxKey []byte
-	quxOp  uint8
-	quxSeq = uint64
+	quxKey      []byte
+	quxOp       uint8
+	quxSeq      = uint64
+	quxKeyMatch int
 )
 
 const (
 	quxOpSet quxOp = 1 << iota
 	quxOpDelete
+)
+
+const (
+	keyMatchDeleted quxKeyMatch = -1 // exact match, but tombstoned
+	keyMatchExact   quxKeyMatch = 0  // exact match
+	keyMatchNone    quxKeyMatch = 1  // different key
 )
 
 const (
@@ -76,14 +83,14 @@ func (k quxKey) Compare(userKey []byte) int {
 	return bytes.Compare(k.UserKey(), userKey)
 }
 
-func resolvePointLookup(key quxKey, value, userKey []byte) (bool, []byte, bool) {
-	if key.Compare(userKey) != 0 {
-		return false, nil, false
+func (k quxKey) Match(userKey []byte) quxKeyMatch {
+	if k.Compare(userKey) != 0 {
+		return keyMatchNone
 	}
-	if key.Op() == quxOpDelete {
-		return true, nil, false
+	if k.Op() == quxOpDelete {
+		return keyMatchDeleted
 	}
-	return true, value, true
+	return keyMatchExact
 }
 
 // seek start (inclusive)
@@ -96,4 +103,12 @@ func newSeekStart(userKey []byte, seq quxSeq) quxKey {
 // returns last possible `quxKey` for this `userKey`
 func newSeekEndInclusive(userKey []byte) quxKey {
 	return newQuxKey(userKey, quxSeq(0), quxOp(0))
+}
+
+func isValidQuxKey(key quxKey) bool {
+	if len(key) < quxKeyAlign+quxKeyTrailerLen || (len(key)-quxKeyTrailerLen)%quxKeyAlign != 0 {
+		return false
+	}
+	marker := len(key) - quxKeyTrailerLen
+	return key[marker] < quxKeyAlign && (key.Op() == quxOpSet || key.Op() == quxOpDelete)
 }
