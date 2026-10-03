@@ -34,7 +34,7 @@ runb: ## Run the server binary
 
 .PHONY: build
 build: ## Build the server
-	@mkdir -p .out && rm -f .out/*
+	@mkdir -p .out
 	$(BUILD_ENV) go build -trimpath -ldflags="$(BUILD_LDFLAGS)" -o .out/quxdb-server ./cmd/server/
 
 .PHONY: test
