@@ -2,7 +2,6 @@ package db
 
 import (
 	"bytes"
-	"iter"
 
 	"github.com/yashgorana/quxdb/pkg/core"
 )
@@ -99,24 +98,4 @@ func (h *mergeHeap) siftDown() {
 func mergeLess(a, b *mergeCursor) bool {
 	cmp := bytes.Compare(a.qkey, b.qkey)
 	return cmp < 0 || cmp == 0 && a.order < b.order
-}
-
-// mergeIter performs k-way merge of cursors by qkey.
-func mergeIter[T core.Cursor](cursors []T) iter.Seq2[quxKey, []byte] {
-	return func(yield func(quxKey, []byte) bool) {
-		h, err := newMergeHeap(cursors)
-		if err != nil {
-			return
-		}
-
-		for len(h) > 0 {
-			cursor := h[0]
-			if !yield(cursor.qkey, cursor.value) {
-				return
-			}
-			if err := h.advanceRoot(); err != nil {
-				return
-			}
-		}
-	}
 }

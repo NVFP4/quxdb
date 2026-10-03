@@ -67,30 +67,29 @@ func (b *Block) clear() {
 	b.index.clear()
 }
 
-func (b *Block) Seek(target []byte) (key []byte, value []byte, ok bool) {
+func (b *Block) Seek(target []byte) (key []byte, value []byte, ok bool, err error) {
 	entry, found := b.index.Search(target)
 	if !found {
-		return nil, nil, false
+		return nil, nil, false, nil
 	}
 	return b.scan(target, entry.offset, uint32(b.recLen))
 }
 
-func (b *Block) scan(target []byte, start uint32, limit uint32) ([]byte, []byte, bool) {
+func (b *Block) scan(target []byte, start uint32, limit uint32) ([]byte, []byte, bool, error) {
 	for offset := start; offset < limit; {
 		rec, err := b.recordAt(offset)
 		if err != nil {
-			fmt.Printf("sst: block record error at offset=%d\n", offset)
-			return nil, nil, false
+			return nil, nil, false, fmt.Errorf("block record at %d: %w", offset, err)
 		}
 
 		if bytes.Compare(rec.key, target) >= 0 {
-			return rec.key, rec.value, true
+			return rec.key, rec.value, true, nil
 		}
 
 		offset += uint32(rec.size)
 	}
 
-	return nil, nil, false
+	return nil, nil, false, nil
 }
 
 func (b *Block) recordAt(offset uint32) (recordView, error) {
@@ -112,7 +111,7 @@ type MappedBlockData struct {
 
 func (bd *MappedBlockData) BlockAt(span Span) (Block, error) {
 	if span.Offset > len(bd.mmap) || span.Offset+span.Size > len(bd.mmap) {
-		return Block{}, fmt.Errorf("invalid span bounds")
+		return Block{}, fmt.Errorf("%w: block span out of bounds", ErrCorrupt)
 	}
 	block, _, err := decodeBlock(bd.mmap[span.Offset : span.Offset+span.Size])
 	return block, err

@@ -171,7 +171,7 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 	return res.err
 }
 
-func (db *QuxDB) Get(key []byte) ([]byte, bool) {
+func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
 	view := db.lsm.acquire()
 	defer view.release()
 	// pin before loading readSeq so compaction can't drop versions visible at it
@@ -182,18 +182,21 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool) {
 	for _, mt := range view.memtables {
 		ikey, val, found := mt.Seek(lookupKey)
 		if value, exists, done := resolve(key, ikey, val, found); done {
-			return value, exists
+			return value, exists, nil
 		}
 	}
 
 	for table := range view.tableCandidates(key) {
-		ikey, val, found := table.Lookup(key, lookupKey)
+		ikey, val, found, err := table.Lookup(key, lookupKey)
+		if err != nil {
+			return nil, false, err
+		}
 		if value, exists, done := resolve(key, ikey, val, found); done {
-			return value, exists
+			return value, exists, nil
 		}
 	}
 
-	return nil, false
+	return nil, false, nil
 }
 
 // `done` reports whether a newest-first seek result decides the lookup.
@@ -216,15 +219,35 @@ func (db *QuxDB) Delete(key []byte) error {
 	return res.err
 }
 
-func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
+// Iterator scans a key range; check Err after ranging over All.
+type Iterator struct {
+	db         *QuxDB
+	start, end []byte
+	err        error
+}
+
+// Iter returns an iterator over live keys in [start, end], nil bounds are open.
+func (db *QuxDB) Iter(start, end []byte) *Iterator {
+	return &Iterator{db: db, start: start, end: end}
+}
+
+// Err returns the read error that ended the last All, if any.
+func (it *Iterator) Err() error {
+	return it.err
+}
+
+// All yields live keys in order from a view pinned for the whole range.
+func (it *Iterator) All() iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
+		it.err = nil
+		start, end := it.start, it.end
 		if start != nil && end != nil && bytes.Compare(start, end) > 0 {
 			return
 		}
 
-		view := db.lsm.acquire()
+		view := it.db.lsm.acquire()
 		defer view.release()
-		readSeq := db.committedSeq.Load()
+		readSeq := it.db.committedSeq.Load()
 
 		var startKey, endKey []byte
 		if start != nil {
@@ -261,7 +284,6 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 				readSeq: readSeq,
 			})
 		}
-
 		for _, table := range tables {
 			cursors = append(cursors, &mvccCursor{
 				cur:     table.Cursor(startKey, endKey),
@@ -269,24 +291,26 @@ func (db *QuxDB) Iter(start, end []byte) iter.Seq2[[]byte, []byte] {
 			})
 		}
 
-		var currentUserKey []byte
-		resolved := false
+		merge, err := newMergeHeap(cursors)
+		if err != nil {
+			it.err = err
+			return
+		}
+		var lastUserKey []byte
+		for len(merge) > 0 {
+			item := merge[0]
+			userKey := item.qkey.UserKey()
 
-		for qkey, val := range mergeIter(cursors) {
-			userKey := qkey.UserKey()
-			op := qkey.Op()
-
-			if !bytes.Equal(userKey, currentUserKey) {
-				currentUserKey = userKey
-				resolved = false
+			// sources are newest first per key, so the first one seen wins
+			if !bytes.Equal(userKey, lastUserKey) {
+				lastUserKey = userKey
+				if item.qkey.Op() != quxOpDelete && !yield(userKey, item.value) {
+					return
+				}
 			}
 
-			if resolved {
-				continue
-			}
-			resolved = true
-
-			if op != quxOpDelete && !yield(userKey, val) {
+			if err := merge.advanceRoot(); err != nil {
+				it.err = err
 				return
 			}
 		}

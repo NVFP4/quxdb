@@ -2,11 +2,15 @@ package db
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
 func TestQuxDB(t *testing.T) {
@@ -23,14 +27,16 @@ func TestQuxDB(t *testing.T) {
 	err = db.Set(key, []byte("val3"))
 	assert.NoError(t, err)
 
-	val, found := db.Get(key)
+	val, found, err := db.Get(key)
+	require.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, []byte("val3"), val)
 
 	err = db.Delete(key)
 	assert.NoError(t, err)
 
-	val, found = db.Get(key)
+	val, found, err = db.Get(key)
+	require.NoError(t, err)
 	assert.False(t, found)
 	assert.Nil(t, val)
 }
@@ -42,7 +48,8 @@ func TestPointTombstoneShadowsOlderMemtable(t *testing.T) {
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	require.NoError(t, db.Delete([]byte("key")))
 
-	value, found := db.Get([]byte("key"))
+	value, found, err := db.Get([]byte("key"))
+	require.NoError(t, err)
 	assert.False(t, found)
 	assert.Nil(t, value)
 }
@@ -73,7 +80,8 @@ func TestPointTombstoneShadowsOlderSST(t *testing.T) {
 			db.lsm.immutableMemtableCount() == imtFlushThreshold
 	}, time.Second, 10*time.Millisecond)
 
-	value, found := db.Get([]byte("key"))
+	value, found, err := db.Get([]byte("key"))
+	require.NoError(t, err)
 	assert.False(t, found)
 	assert.Nil(t, value)
 }
@@ -87,9 +95,9 @@ func TestQuxDBRange(t *testing.T) {
 	assert.NoError(t, db.Set([]byte("c"), []byte("c1")))
 	assert.NoError(t, db.Delete([]byte("a")))
 
-	assert.Equal(t, []string{"b=b2", "c=c1"}, collectRange(db, nil, nil))
-	assert.Equal(t, []string{"b=b2"}, collectRange(db, []byte("b"), []byte("b")))
-	assert.Empty(t, collectRange(db, []byte("c"), []byte("b")))
+	assert.Equal(t, []string{"b=b2", "c=c1"}, collectRange(t, db, nil, nil))
+	assert.Equal(t, []string{"b=b2"}, collectRange(t, db, []byte("b"), []byte("b")))
+	assert.Empty(t, collectRange(t, db, []byte("c"), []byte("b")))
 }
 
 func TestQuxDBRangeAcrossMemtablesAndSSTs(t *testing.T) {
@@ -119,9 +127,9 @@ func TestQuxDBRangeAcrossMemtablesAndSSTs(t *testing.T) {
 
 	assert.Equal(t,
 		[]string{"a=new-a", "b=new-b", "c=new-c", "e=old-e", "retained-0=value"},
-		collectRange(db, nil, nil),
+		collectRange(t, db, nil, nil),
 	)
-	assert.Equal(t, []string{"b=new-b", "c=new-c"}, collectRange(db, []byte("b"), []byte("d")))
+	assert.Equal(t, []string{"b=new-b", "c=new-c"}, collectRange(t, db, []byte("b"), []byte("d")))
 }
 
 func TestMemtableCheckpointCapturedAtRollover(t *testing.T) {
@@ -148,7 +156,7 @@ func TestQuxDBRangeUsesCommittedSequence(t *testing.T) {
 		[]byte("uncommitted"),
 	))
 
-	assert.Equal(t, []string{"key=committed"}, collectRange(db, nil, nil))
+	assert.Equal(t, []string{"key=committed"}, collectRange(t, db, nil, nil))
 }
 
 func TestQuxDBRangeEarlyStopReleasesMemtables(t *testing.T) {
@@ -157,7 +165,7 @@ func TestQuxDBRangeEarlyStopReleasesMemtables(t *testing.T) {
 	require.NoError(t, db.Set([]byte("a"), []byte("1")))
 	require.NoError(t, db.Set([]byte("b"), []byte("2")))
 
-	for range db.Iter(nil, nil) {
+	for range db.Iter(nil, nil).All() {
 		break
 	}
 
@@ -244,10 +252,50 @@ func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 
 	assert.Equal(t, newestSeq, reopened.committedSeq.Load())
 	for key, want := range expected {
-		got, found := reopened.Get([]byte(key))
+		got, found, err := reopened.Get([]byte(key))
+		require.NoError(t, err)
 		assert.True(t, found)
 		assert.Equal(t, []byte(want), got)
 	}
+}
+
+func TestCorruptBlockSurfacesAsReadError(t *testing.T) {
+	dir := t.TempDir()
+	db, err := New(dir)
+	require.NoError(t, err)
+	require.NoError(t, db.Start(t.Context()))
+	require.NoError(t, db.Set([]byte("key"), []byte("value")))
+	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
+	for i := range imtFlushThreshold {
+		require.NoError(t, db.Set(fmt.Appendf(nil, "later-%d", i), []byte("value")))
+		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
+	}
+	require.Eventually(t, func() bool {
+		return db.lsm.currentVersion().Checkpoint().LastSeq == 1
+	}, time.Second, 10*time.Millisecond)
+	tables := db.lsm.currentVersion().All()
+	require.Len(t, tables, 1)
+	require.NoError(t, db.Stop(t.Context()))
+
+	data, err := filepath.Glob(filepath.Join(tables[0].Path, "*.qdat"))
+	require.NoError(t, err)
+	require.Len(t, data, 1)
+	raw, err := os.ReadFile(data[0])
+	require.NoError(t, err)
+	raw[16] ^= 0x01 // inside the first block's records
+	require.NoError(t, os.WriteFile(data[0], raw, 0o644))
+
+	reopened, err := New(dir)
+	require.NoError(t, err)
+	require.NoError(t, reopened.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, reopened.Stop(t.Context())) })
+
+	_, _, err = reopened.Get([]byte("key"))
+	require.ErrorIs(t, err, sst.ErrChecksumMismatch)
+	it := reopened.Iter(nil, nil)
+	for range it.All() {
+	}
+	require.ErrorIs(t, it.Err(), sst.ErrChecksumMismatch)
 }
 
 func newTestQuxDB(t *testing.T) *QuxDB {
@@ -260,10 +308,13 @@ func newTestQuxDB(t *testing.T) *QuxDB {
 	return db
 }
 
-func collectRange(db *QuxDB, start, end []byte) []string {
+func collectRange(t *testing.T, db *QuxDB, start, end []byte) []string {
+	t.Helper()
 	var items []string
-	for key, value := range db.Iter(start, end) {
+	it := db.Iter(start, end)
+	for key, value := range it.All() {
 		items = append(items, string(key)+"="+string(value))
 	}
+	require.NoError(t, it.Err())
 	return items
 }

@@ -21,7 +21,11 @@ func hGetKey(db *db.QuxDB) http.HandlerFunc {
 			return
 		}
 
-		value, ok := db.Get([]byte(key))
+		value, ok, err := db.Get([]byte(key))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		if !ok {
 			http.Error(w, "key not found", http.StatusNotFound)
 			return
@@ -47,11 +51,16 @@ func hGetKeys(db *db.QuxDB) http.HandlerFunc {
 
 		bw := bufio.NewWriter(w)
 		defer bw.Flush()
-		for key, value := range db.Iter(start, end) {
+		it := db.Iter(start, end)
+		for key, value := range it.All() {
 			_, _ = bw.Write(key)
 			_ = bw.WriteByte('\t')
 			_, _ = bw.Write(value)
 			_ = bw.WriteByte('\n')
+		}
+		if it.Err() != nil {
+			// the 200 is already sent, so cut the connection rather than end the stream cleanly
+			panic(http.ErrAbortHandler)
 		}
 	}
 }

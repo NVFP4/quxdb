@@ -27,7 +27,8 @@ func TestLsmStatePinnedViewKeepsRetiredTableReadable(t *testing.T) {
 	assert.DirExists(t, table.Path)
 	assert.Empty(t, state.currentVersion().All())
 
-	_, _, found := oldView.tables.Table(table.ID).Lookup([]byte("key"), newSeekStart([]byte("key"), 1))
+	_, _, found, err := oldView.tables.Table(table.ID).Lookup([]byte("key"), newSeekStart([]byte("key"), 1))
+	require.NoError(t, err)
 	assert.True(t, found)
 
 	oldView.release()
@@ -103,7 +104,8 @@ func TestLsmStateMoveTableChangesLevelWithoutTouchingFiles(t *testing.T) {
 	assert.Empty(t, view.version.Level(0))
 	require.Len(t, view.version.Level(2), 1)
 	assert.Equal(t, table.Path, view.version.Level(2)[0].Path)
-	_, _, found := view.tables.Table(table.ID).Lookup([]byte("key"), newSeekStart([]byte("key"), 1))
+	_, _, found, err := view.tables.Table(table.ID).Lookup([]byte("key"), newSeekStart([]byte("key"), 1))
+	require.NoError(t, err)
 	assert.True(t, found)
 	view.release()
 	require.NoError(t, state.close())

@@ -2,7 +2,6 @@ package sst
 
 import (
 	"encoding/binary"
-	"fmt"
 	"hash/crc32"
 
 	"github.com/yashgorana/quxdb/pkg/codec"
@@ -50,7 +49,7 @@ func decodeBlock(src []byte) (Block, int, error) {
 	// validate start
 	magic := decoder.Uint32BE("block.magic")
 	if magic != blockMagic32 {
-		return block, 0, fmt.Errorf("invalid format")
+		return block, 0, ErrInvalidFormat
 	}
 
 	// verify checksum of the payload
@@ -58,7 +57,7 @@ func decodeBlock(src []byte) (Block, int, error) {
 	crcOff := end - 4
 	crc := decoder.Uint32At("block.crc", crcOff)
 	if crc != crc32.Checksum(src[0:crcOff], crc32Table) {
-		return block, 0, fmt.Errorf("checksum mismatch")
+		return block, 0, ErrChecksumMismatch
 	}
 
 	// a magic + crc validation means len safe to read
