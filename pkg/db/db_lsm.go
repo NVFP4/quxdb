@@ -2,6 +2,7 @@ package db
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,11 @@ func newLsmState(dataDir string) (*lsmState, error) {
 	registry := sst.NewRegistry()
 	if err := registry.Open(tables); err != nil {
 		return nil, errors.Join(err, registry.Close(), versions.Close())
+	}
+
+	// after Open, so every live table is known good before anything is deleted
+	if err := sst.RemoveOrphans(dataDir, tables); err != nil {
+		fmt.Printf("db: orphan table cleanup error %v\n", err)
 	}
 
 	state := &lsmState{versions: versions, registry: registry}

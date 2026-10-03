@@ -6,6 +6,8 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yashgorana/quxdb/pkg/fs"
@@ -142,9 +144,14 @@ func mmapRead(path string, advice fs.MmapAdvice) ([]byte, error) {
 	return mmapBytes, nil
 }
 
+const (
+	tablesDir    = "sst"
+	sstNameWidth = 20 // digits in max uint64
+)
+
 // fixed width keeps names sorted by id.
 func sstName(id uint64) string {
-	return fmt.Sprintf("%020d", id)
+	return fmt.Sprintf("%0*d", sstNameWidth, id)
 }
 
 func sstBlockDataName(id uint64) string {
@@ -161,5 +168,44 @@ func sstFilterName(id uint64) string {
 
 // flat layout, the level lives in the catalog
 func sstDirPath(baseDir string, id uint64) string {
-	return filepath.Join(baseDir, "sst", sstName(id))
+	return filepath.Join(baseDir, tablesDir, sstName(id))
+}
+
+// RemoveOrphans deletes table dirs not in live, call only while no builder runs.
+func RemoveOrphans(baseDir string, live []*Metadata) error {
+	dir := filepath.Join(baseDir, tablesDir)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	ids := make(map[uint64]struct{}, len(live))
+	for _, meta := range live {
+		ids[meta.ID] = struct{}{}
+	}
+
+	var errs []error
+	for _, entry := range entries {
+		name, tmp := strings.CutSuffix(entry.Name(), ".tmp")
+		if len(name) != sstNameWidth {
+			continue
+		}
+		id, err := strconv.ParseUint(name, 10, 64)
+		if err != nil {
+			continue
+		}
+		if _, isLive := ids[id]; isLive && !tmp {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		fmt.Printf("sst: removed orphan table %s\n", path)
+	}
+	return errors.Join(errs...)
 }
