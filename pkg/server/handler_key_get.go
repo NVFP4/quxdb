@@ -59,7 +59,7 @@ func hGetKeys(db *db.QuxDB) http.HandlerFunc {
 			_ = bw.WriteByte('\n')
 		}
 		if it.Err() != nil {
-			// the 200 is already sent, so cut the connection rather than end the stream cleanly
+			// status is already sent, so abort instead of ending cleanly
 			panic(http.ErrAbortHandler)
 		}
 	}

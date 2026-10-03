@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/yashgorana/quxdb/pkg/bufpool"
+	"github.com/yashgorana/quxdb/pkg/core"
 	"github.com/yashgorana/quxdb/pkg/memtable"
 	"github.com/yashgorana/quxdb/pkg/metrics"
 	"github.com/yashgorana/quxdb/pkg/pathlib"
@@ -219,7 +221,7 @@ func (db *QuxDB) Delete(key []byte) error {
 	return res.err
 }
 
-// Iterator scans a key range; check Err after ranging over All.
+// Iterator scans a key range, check Err after ranging over All.
 type Iterator struct {
 	db         *QuxDB
 	start, end []byte
@@ -257,60 +259,23 @@ func (it *Iterator) All() iter.Seq2[[]byte, []byte] {
 			endKey = newSeekEndInclusive(end) // heap alloc
 		}
 
-		memtables := view.memtables
 		tables := view.tableRangeCandidates(start, end)
-
-		if len(memtables) == 1 && len(tables) == 0 {
-			cur := &mvccCursor{
-				cur:     memtables[0].Cursor(startKey, endKey),
-				readSeq: readSeq,
-			}
-			for {
-				key, val, ok := cur.Next()
-				if !ok {
-					return
-				}
-				userKey, _, op := quxKey(key).Decode()
-				if op != quxOpDelete && !yield(userKey, val) {
-					return
-				}
-			}
-		}
-
-		cursors := make([]*mvccCursor, 0, len(memtables)+len(tables))
-		for _, mt := range memtables {
-			cursors = append(cursors, &mvccCursor{
-				cur:     mt.Cursor(startKey, endKey),
-				readSeq: readSeq,
-			})
+		sources := make([]core.Cursor, 0, len(view.memtables)+len(tables))
+		for _, mt := range view.memtables {
+			sources = append(sources, mt.Cursor(startKey, endKey))
 		}
 		for _, table := range tables {
-			cursors = append(cursors, &mvccCursor{
-				cur:     table.Cursor(startKey, endKey),
-				readSeq: readSeq,
-			})
+			sources = append(sources, table.Cursor(startKey, endKey))
 		}
 
-		merge, err := newMergeHeap(cursors)
-		if err != nil {
-			it.err = err
-			return
-		}
-		var lastUserKey []byte
-		for len(merge) > 0 {
-			item := merge[0]
-			userKey := item.qkey.UserKey()
-
-			// sources are newest first per key, so the first one seen wins
-			if !bytes.Equal(userKey, lastUserKey) {
-				lastUserKey = userKey
-				if item.qkey.Op() != quxOpDelete && !yield(userKey, item.value) {
-					return
-				}
+		cur := newMVCCCursor(newMergeCursor(sources), readSeq, false)
+		for {
+			key, val, ok := cur.Next()
+			if !ok {
+				it.err = cur.Err()
+				return
 			}
-
-			if err := merge.advanceRoot(); err != nil {
-				it.err = err
+			if !yield(quxKey(key).UserKey(), val) {
 				return
 			}
 		}
@@ -528,17 +493,17 @@ func (db *QuxDB) flushMemtables() {
 			if err != nil {
 				panic(err)
 			}
-			c := mt.Cursor(nil, nil)
+			// a single memtable needs no merge
+			c := newMVCCCursor(mt.Cursor(nil, nil), math.MaxUint64, true)
 			for {
 				key, val, ok := c.Next()
 				if !ok {
 					break
 				}
 
-				qkey := quxKey(key)
 				err := b.Add(sst.Record{
 					OrderedKey: key,
-					FilterKey:  qkey.UserKey(),
+					FilterKey:  quxKey(key).UserKey(),
 					Value:      val,
 				})
 				if err != nil {

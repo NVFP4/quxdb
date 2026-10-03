@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 
@@ -173,21 +174,15 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 		outputs = nil
 	}()
 
-	cursors := make([]core.Cursor, 0, len(plan.inputs))
+	sources := make([]core.Cursor, 0, len(plan.inputs))
 	for _, table := range plan.inputs {
-		cursors = append(cursors, plan.view.tables.Table(table.ID).Cursor(nil, nil))
-	}
-	merge, err := newMergeHeap(cursors)
-	if err != nil {
-		return nil, err
-	}
-	if len(merge) == 0 {
-		return nil, sst.ErrCorrupt
+		sources = append(sources, plan.view.tables.Table(table.ID).Cursor(nil, nil))
 	}
 
 	targetLevel := plan.sourceLevel + 1
 	targetSize := tableTargetBytes[targetLevel]
-	bottomLevel := targetLevel == vset.MaxLevels-1
+	// tombstones only drop at the last level, where nothing older can resurface
+	cur := newMVCCCursor(newMergeCursor(sources), math.MaxUint64, targetLevel < vset.MaxLevels-1)
 	// size the filter by target since input key counts include versions the merge drops
 	opts := sst.BuilderOpts{
 		Dir:       c.dataDir,
@@ -206,42 +201,35 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 	}
 
 	var outputBytes int64
-	var lastUserKey []byte
-	for len(merge) > 0 {
-		item := merge[0]
-		userKey := item.qkey.UserKey()
+	for {
+		key, value, ok := cur.Next()
+		if !ok {
+			if err := cur.Err(); err != nil {
+				return outputs, err
+			}
+			break
+		}
 
-		// newest version sorts first, so older versions of the same key are dropped
-		if !bytes.Equal(userKey, lastUserKey) {
-			lastUserKey = userKey
-
-			if !bottomLevel || item.qkey.Op() != quxOpDelete {
-				if builder != nil && outputBytes >= targetSize {
-					if err := finish(); err != nil {
-						return outputs, err
-					}
-				}
-				if builder == nil {
-					opts.ID = c.state.nextTableID()
-					if builder, err = sst.NewBuilder(opts); err != nil {
-						return outputs, err
-					}
-					outputBytes = 0
-				}
-				if err := builder.Add(sst.Record{
-					OrderedKey: item.qkey,
-					FilterKey:  userKey,
-					Value:      item.value,
-				}); err != nil {
-					return outputs, err
-				}
-				outputBytes += int64(len(item.qkey) + len(item.value))
+		if builder != nil && outputBytes >= targetSize {
+			if err := finish(); err != nil {
+				return outputs, err
 			}
 		}
-
-		if err := merge.advanceRoot(); err != nil {
+		if builder == nil {
+			opts.ID = c.state.nextTableID()
+			if builder, err = sst.NewBuilder(opts); err != nil {
+				return outputs, err
+			}
+			outputBytes = 0
+		}
+		if err := builder.Add(sst.Record{
+			OrderedKey: key,
+			FilterKey:  quxKey(key).UserKey(),
+			Value:      value,
+		}); err != nil {
 			return outputs, err
 		}
+		outputBytes += int64(len(key) + len(value))
 	}
 
 	if builder != nil {
