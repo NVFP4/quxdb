@@ -7,17 +7,20 @@ import (
 	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
+// LevelMap maps a level to its tables.
 type LevelMap map[int][]*sst.Metadata
 
 func newLevelMap(depth int) LevelMap {
 	return make(LevelMap, depth)
 }
 
+// Version is an immutable set of tables per level.
 type Version struct {
 	levels     LevelMap
 	checkpoint Checkpoint
 }
 
+// Len returns the table count.
 func (v *Version) Len() int {
 	count := 0
 	for _, tab := range v.levels {
@@ -26,11 +29,12 @@ func (v *Version) Len() int {
 	return count
 }
 
+// Checkpoint returns the version's checkpoint.
 func (v *Version) Checkpoint() Checkpoint {
 	return v.checkpoint
 }
 
-// caller must clone to mutate
+// Level returns tables at level n, clone before mutating.
 func (v *Version) Level(n int) []*sst.Metadata {
 	if v == nil {
 		return nil
@@ -38,7 +42,7 @@ func (v *Version) Level(n int) []*sst.Metadata {
 	return v.levels[n]
 }
 
-// caller must clone to mutate
+// Levels returns all levels, clone before mutating.
 func (v *Version) Levels() LevelMap {
 	if v == nil {
 		return nil
@@ -46,6 +50,7 @@ func (v *Version) Levels() LevelMap {
 	return v.levels
 }
 
+// Clone returns a mutable copy.
 func (v *Version) Clone() *Version {
 	clone := &Version{
 		levels:     newLevelMap(len(v.levels)),
@@ -57,7 +62,7 @@ func (v *Version) Clone() *Version {
 	return clone
 }
 
-// returns all ssts, sorted by L0, L1, ..., Ln and the order in which they were added
+// All returns every table in unspecified level order, l0 newest first.
 func (v *Version) All() []*sst.Metadata {
 	var meta []*sst.Metadata
 	for _, tables := range v.levels {
@@ -68,7 +73,7 @@ func (v *Version) All() []*sst.Metadata {
 	return meta
 }
 
-// point lookup candidate ssts
+// PointLookupCandidates returns tables that may hold key, l0 newest first.
 func (v *Version) PointLookupCandidates(key []byte) []*sst.Metadata {
 	var meta []*sst.Metadata
 	if len(key) == 0 {
@@ -95,7 +100,7 @@ func (v *Version) PointLookupCandidates(key []byte) []*sst.Metadata {
 	return meta
 }
 
-// range lookup candidate ssts, `start` must be less than `end`
+// RangeLookupCandidates returns tables overlapping start..end, with start <= end.
 func (v *Version) RangeLookupCandidates(start, end []byte) []*sst.Metadata {
 	var meta []*sst.Metadata
 

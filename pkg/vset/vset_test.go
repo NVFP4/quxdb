@@ -325,6 +325,79 @@ func testTable(id uint64, level uint8) *sst.Metadata {
 	}
 }
 
+func TestSnapshotPreservesLiveStateAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	vs, err := New(dir)
+	require.NoError(t, err)
+
+	checkpoint := Checkpoint{LastSeq: 17, LastLSN: 42}
+	require.NoError(t, vs.Apply([]Change{
+		{Op: OpAdd, Table: testTable(50, 0)},
+		{Op: OpAdd, Table: testTable(40, 0)},
+		{Op: OpAdd, Table: testTable(60, 0)},
+		{Op: OpAdd, Table: testTable(3, 1)},
+		{Op: OpAdd, Table: testTable(9, 2)},
+		{Op: OpCheckpoint, Checkpoint: checkpoint},
+	}))
+	before := catalogLines(t, dir)
+	for id := uint64(1000); id < 1000+snapshotThreshold/2; id++ {
+		require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(id, 0)}}))
+		require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: &sst.Metadata{ID: id}}}))
+	}
+	assert.Greater(t, before+snapshotThreshold, catalogLines(t, dir), "catalog was rewritten")
+
+	require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(70, 1)}}))
+	require.NoError(t, vs.Close())
+
+	reopened, err := New(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	version := reopened.CurrentVersion()
+	assertLevelIDs(t, version.Level(0), 50, 40, 60)
+	assertLevelIDs(t, version.Level(1), 3, 70)
+	assertLevelIDs(t, version.Level(2), 9)
+	assert.Equal(t, checkpoint, version.Checkpoint())
+	assert.Greater(t, reopened.NextTableID(), uint64(1000+snapshotThreshold/2-1))
+}
+
+func TestStaleSnapshotTmpIsDiscardedOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	writeCatalog(t, dir, mustEncodeRecord(t, addRecord(testTable(1, 0))))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, catFilename+".tmp"), []byte("{torn"), 0o644))
+
+	vs, err := New(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = vs.Close() })
+	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
+	assert.NoFileExists(t, filepath.Join(dir, catFilename+".tmp"))
+}
+
+func TestOversizedCatalogIsSnapshottedOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	records := [][]byte{mustEncodeRecord(t, addRecord(testTable(1, 0)))}
+	for id := uint64(2); id < 2+snapshotThreshold; id++ {
+		records = append(records,
+			mustEncodeRecord(t, addRecord(testTable(id, 1))),
+			mustEncodeRecord(t, catalogRecord{Op: OpDelete, Table: &sst.Metadata{ID: id}}),
+		)
+	}
+	writeCatalog(t, dir, records...)
+
+	vs, err := New(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = vs.Close() })
+	assert.Equal(t, 2, catalogLines(t, dir))
+	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
+	assert.Equal(t, uint64(2+snapshotThreshold), vs.NextTableID())
+}
+
+func catalogLines(t *testing.T, dir string) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, catFilename))
+	require.NoError(t, err)
+	return bytes.Count(data, []byte("\n"))
+}
+
 func assertLevelIDs(t *testing.T, tables []*sst.Metadata, ids ...uint64) {
 	t.Helper()
 	if ids == nil {

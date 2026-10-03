@@ -12,17 +12,22 @@ import (
 
 const MaxLevels = 5
 
+// Checkpoint marks the wal position covered by tables.
 type Checkpoint struct {
 	LastSeq uint64 `json:"seq"`
 	LastLSN uint64 `json:"lsn"`
+	// set only by catalog snapshots
+	LastTableID uint64 `json:"tid,omitempty"`
 }
 
+// Change is one catalog edit.
 type Change struct {
 	Op         Op
 	Table      *sst.Metadata
 	Checkpoint Checkpoint
 }
 
+// VersionSet tracks table versions in an append-only catalog.
 type VersionSet struct {
 	catalog     *catalog
 	latest      *Version
@@ -30,6 +35,7 @@ type VersionSet struct {
 	mu          sync.RWMutex
 }
 
+// New replays the catalog in dir.
 func New(dir string) (*VersionSet, error) {
 	catalog, err := openCatalog(dir)
 	if err != nil {
@@ -40,14 +46,17 @@ func New(dir string) (*VersionSet, error) {
 		levels: newLevelMap(MaxLevels),
 	}
 
-	// deleted tables count too, so their ids are never reused.
+	// include deleted tables so ids are never reused
 	var lastTableID uint64
 	err = catalog.replay(func(rec catalogRecord) error {
 		if err := applyRecordLocked(ver, rec); err != nil {
 			return err
 		}
-		if rec.Op == OpAdd {
+		switch rec.Op {
+		case OpAdd:
 			lastTableID = max(lastTableID, rec.Table.ID)
+		case OpCheckpoint:
+			lastTableID = max(lastTableID, rec.Checkpoint.LastTableID)
 		}
 		return nil
 	})
@@ -61,19 +70,32 @@ func New(dir string) (*VersionSet, error) {
 		latest:  ver,
 	}
 	vs.lastTableID.Store(lastTableID)
+	vs.snapshotLocked()
 	return vs, nil
 }
 
+// NextTableID returns an unused table id.
 func (vs *VersionSet) NextTableID() uint64 {
 	return vs.lastTableID.Add(1)
 }
 
+// keeps the counter at or above every added id.
+func (vs *VersionSet) raiseTableID(id uint64) {
+	for last := vs.lastTableID.Load(); last < id; last = vs.lastTableID.Load() {
+		if vs.lastTableID.CompareAndSwap(last, id) {
+			return
+		}
+	}
+}
+
+// CurrentVersion returns the latest version.
 func (vs *VersionSet) CurrentVersion() *Version {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 	return vs.latest
 }
 
+// Apply persists changes and publishes the next version.
 func (vs *VersionSet) Apply(changes []Change) error {
 	if len(changes) == 0 {
 		return nil
@@ -118,7 +140,36 @@ func (vs *VersionSet) Apply(changes []Change) error {
 	}
 
 	vs.latest = next
+	for _, rec := range newRecords {
+		if rec.Op == OpAdd {
+			vs.raiseTableID(rec.Table.ID)
+		}
+	}
+	vs.snapshotLocked()
 	return nil
+}
+
+// snapshots the catalog once dead records reach the threshold.
+func (vs *VersionSet) snapshotLocked() {
+	live := vs.latest.Len() + 1
+	if vs.catalog.records-live < snapshotThreshold {
+		return
+	}
+
+	records := make([]catalogRecord, 0, live)
+	for level := range MaxLevels {
+		// keep l0 order, it encodes recency
+		for _, table := range vs.latest.Level(level) {
+			records = append(records, catalogRecord{Op: OpAdd, Table: table})
+		}
+	}
+	checkpoint := vs.latest.Checkpoint()
+	checkpoint.LastTableID = vs.lastTableID.Load()
+	records = append(records, catalogRecord{Op: OpCheckpoint, Checkpoint: &checkpoint})
+
+	if err := vs.catalog.rewrite(records); err != nil {
+		fmt.Printf("vset: catalog snapshot error %v\n", err)
+	}
 }
 
 func buildNextVersion(current *Version, newRecords []catalogRecord) (*Version, error) {
@@ -159,7 +210,7 @@ func applyRecordLocked(ver *Version, rec catalogRecord) error {
 			(checkpoint.LastSeq == ver.checkpoint.LastSeq && checkpoint.LastLSN != ver.checkpoint.LastLSN) {
 			return ErrRecordCorrupt
 		}
-		ver.checkpoint = checkpoint
+		ver.checkpoint = Checkpoint{LastSeq: checkpoint.LastSeq, LastLSN: checkpoint.LastLSN}
 	default:
 		return ErrRecordCorrupt
 	}
@@ -196,6 +247,7 @@ func deleteTableLocked(levels LevelMap, id uint64) {
 	}
 }
 
+// Close closes the catalog.
 func (vs *VersionSet) Close() error {
 	vs.mu.Lock()
 	vs.latest = nil
