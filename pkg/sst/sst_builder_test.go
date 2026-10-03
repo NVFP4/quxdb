@@ -40,7 +40,7 @@ func TestTableDirsSortInIDOrder(t *testing.T) {
 
 func buildTable(t *testing.T, dir string, id uint64) *Metadata {
 	t.Helper()
-	builder, err := NewBuilder(BuilderOpts{Dir: dir, ID: id, Keys: 1, SizeBytes: 64 << 10})
+	builder, err := NewBuilder(BuilderOpts{Dir: dir, ID: id, SizeBytes: 64 << 10})
 	require.NoError(t, err)
 	require.NoError(t, builder.Add(Record{OrderedKey: []byte("a"), FilterKey: []byte("a"), Value: []byte("one")}))
 	meta, err := builder.Finalize()

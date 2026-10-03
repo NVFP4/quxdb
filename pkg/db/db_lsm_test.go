@@ -201,7 +201,6 @@ func buildLsmTestTable(t *testing.T) *sst.Metadata {
 		Dir:       t.TempDir(),
 		ID:        lsmTestTableID.Add(1),
 		Level:     0,
-		Keys:      1,
 		SizeBytes: 64,
 	})
 	require.NoError(t, err)

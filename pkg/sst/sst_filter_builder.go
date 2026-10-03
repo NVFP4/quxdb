@@ -33,13 +33,11 @@ type filterBuilder struct {
 	filter *bloom.BloomFilter
 }
 
-func newFilterWriter(dir string, id uint64, expectedKeys uint64) (*filterBuilder, error) {
-	path := filepath.Join(dir, sstFilterName(id))
-
+func newFilterWriter(dir string, id uint64, expectedKeys uint64) *filterBuilder {
 	return &filterBuilder{
-		path:   path,
-		filter: bloom.NewWithBitsPerKey(uint64(expectedKeys), filterBitsPerKey),
-	}, nil
+		path:   filepath.Join(dir, sstFilterName(id)),
+		filter: bloom.NewWithBitsPerKey(expectedKeys, filterBitsPerKey),
+	}
 }
 
 func (fb *filterBuilder) Add(key []byte) {

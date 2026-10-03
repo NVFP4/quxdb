@@ -183,11 +183,10 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 	targetSize := tableTargetBytes[targetLevel]
 	// tombstones only drop at the last level, where nothing older can resurface
 	cur := newMVCCCursor(newMergeCursor(sources), math.MaxUint64, targetLevel < vset.MaxLevels-1)
-	// size the filter by target since input key counts include versions the merge drops
 	opts := sst.BuilderOpts{
 		Dir:       c.dataDir,
 		Level:     uint8(targetLevel),
-		Keys:      uint64(targetSize/128) + 1,
+		Keys:      estimateOutputKeys(plan.inputs, targetSize),
 		SizeBytes: uint64(targetSize),
 	}
 	finish := func() error {
@@ -269,4 +268,17 @@ func tablesSize(tables []*sst.Metadata) int64 {
 		total += int64(table.SizeBytes)
 	}
 	return total
+}
+
+// estimate output keys based on inputs: we don't know the overlap, and bloom needs keys to be known upfront
+func estimateOutputKeys(inputs []*sst.Metadata, targetSize int64) uint64 {
+	var keys uint64
+	for _, table := range inputs {
+		keys += table.Keys
+	}
+	size := uint64(tablesSize(inputs))
+	if size == 0 {
+		return keys
+	}
+	return min(keys, uint64(targetSize)*keys/size)
 }

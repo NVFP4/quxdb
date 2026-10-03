@@ -30,7 +30,7 @@ type BuilderOpts struct {
 	Dir       string
 	ID        uint64
 	Level     uint8
-	Keys      uint64
+	Keys      uint64 // expected keys, sizes the bloom filter
 	SizeBytes uint64
 }
 
@@ -82,15 +82,7 @@ func NewBuilder(opts BuilderOpts) (*Builder, error) {
 		)
 	}
 
-	fw, err := newFilterWriter(sstDir, id, opts.Keys)
-	if err != nil {
-		return nil, errors.Join(
-			err,
-			bw.Close(),
-			iw.Close(),
-			os.RemoveAll(sstDir),
-		)
-	}
+	fw := newFilterWriter(sstDir, id, opts.Keys)
 
 	return &Builder{
 		id:           id,

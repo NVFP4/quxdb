@@ -131,7 +131,6 @@ func testTable(t *testing.T, dir string) *Metadata {
 		Dir:       dir,
 		ID:        testTableID.Add(1),
 		Level:     0,
-		Keys:      2,
 		SizeBytes: 64 << 10,
 	})
 	require.NoError(t, err)
