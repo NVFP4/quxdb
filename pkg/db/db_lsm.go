@@ -119,14 +119,18 @@ func (s *lsmState) replaceSSTs(toRemove, toAdd []*sst.Metadata) error {
 }
 
 // level change only, files and pinned tables stay untouched
-func (s *lsmState) moveTable(table *sst.Metadata, level uint8) error {
-	moved := *table
-	moved.Level = level
+func (s *lsmState) moveTables(tables []*sst.Metadata, level uint8) error {
+	changes := make([]vset.Change, len(tables))
+	for i, table := range tables {
+		moved := *table
+		moved.Level = level
+		changes[i] = vset.Change{Op: vset.OpAdd, Table: &moved}
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.versions.Apply([]vset.Change{{Op: vset.OpAdd, Table: &moved}}); err != nil {
+	if err := s.versions.Apply(changes); err != nil {
 		return err
 	}
 	current := s.current.Load()

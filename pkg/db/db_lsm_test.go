@@ -99,7 +99,7 @@ func TestLsmStateMoveTableChangesLevelWithoutTouchingFiles(t *testing.T) {
 	flushed := state.rolloverMemtable(1, 1)
 	require.NoError(t, state.replaceMemtablesWithSSTs([]*quxMemtable{flushed}, []*sst.Metadata{table}))
 
-	require.NoError(t, state.moveTable(table, 2))
+	require.NoError(t, state.moveTables([]*sst.Metadata{table}, 2))
 	view := state.acquire()
 	assert.Empty(t, view.version.Level(0))
 	require.Len(t, view.version.Level(2), 1)

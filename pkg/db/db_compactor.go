@@ -13,23 +13,15 @@ import (
 	"github.com/yashgorana/quxdb/pkg/vset"
 )
 
-const l0FileTarget = 4
+const (
+	l0FileTarget = 4
+	levelFanout  = 10
+	// l1 holds a few tables so picking by overlap has a choice
+	l1TargetBytes = 256 << 20
+)
 
-var tableTargetBytes = [vset.MaxLevels]int64{
-	0, // l0 tables take the memtable's size
-	32 << 20,
-	64 << 20,
-	128 << 20,
-	256 << 20,
-}
-
-var levelTargetBytes = [vset.MaxLevels]int64{
-	0, // l0 is triggered by file count, see l0FileTarget
-	320 << 20,
-	3200 << 20,
-	32000 << 20,
-	320000 << 20,
-}
+// compaction outputs split at this size, l0 tables take the memtable's size.
+var tableTargetBytes int64 = 64 << 20
 
 type compactionPlan struct {
 	sourceLevel int
@@ -115,36 +107,63 @@ func pickCompaction(version *vset.Version) (int, []*sst.Metadata) {
 		return 0, inputs
 	}
 
+	targets := levelTargets(version)
 	for level := 1; level < vset.MaxLevels-1; level++ {
 		tables := version.Level(level)
-		size := tablesSize(tables)
-		if size <= levelTargetBytes[level] {
+		if tablesSize(tables) <= targets[level] {
 			continue
 		}
 
 		// move one table at a time to bound write amp and rescore after each edit
-		source := tables[0]
+		next := version.Level(level + 1)
+		source := leastOverlapping(tables, next)
 		inputs := []*sst.Metadata{source}
-		inputs = append(inputs, overlapping(
-			version.Level(level+1), source.MinKey, source.MaxKey,
-		)...)
+		inputs = append(inputs, overlapping(next, source.MinKey, source.MaxKey)...)
 		return level, inputs
 	}
 
 	return 0, nil
 }
 
+// static targets grow by the fanout from l1, and once the bottom outgrows them each level
+// tracks a fanout fraction of the one below, so no level pair drifts past the fanout.
+func levelTargets(version *vset.Version) [vset.MaxLevels]int64 {
+	var targets [vset.MaxLevels]int64
+	static := int64(l1TargetBytes)
+	for level := 1; level < vset.MaxLevels-1; level++ {
+		targets[level] = static
+		static *= levelFanout
+	}
+	scaled := tablesSize(version.Level(vset.MaxLevels - 1))
+	for level := vset.MaxLevels - 2; level >= 1; level-- {
+		scaled /= levelFanout
+		targets[level] = max(targets[level], scaled)
+	}
+	return targets
+}
+
+// the table that rewrites the fewest next-level bytes per byte it pushes down.
+func leastOverlapping(tables, next []*sst.Metadata) *sst.Metadata {
+	best, bestRatio := tables[0], math.Inf(1)
+	for _, table := range tables {
+		ratio := float64(overlapBytes(next, table.MinKey, table.MaxKey)) / float64(max(table.SizeBytes, 1))
+		if ratio < bestRatio {
+			best, bestRatio = table, ratio
+		}
+	}
+	return best
+}
+
 func (c *lsmCompactor) execute(plan *compactionPlan) error {
 	defer plan.view.release()
 
-	// lone tables move by catalog edit, but the last level still merges to drop garbage
+	// moves rewrite nothing, but the last level still merges to drop garbage
 	targetLevel := plan.sourceLevel + 1
-	if len(plan.inputs) == 1 && targetLevel < vset.MaxLevels-1 {
-		table := plan.inputs[0]
-		if err := c.state.moveTable(table, uint8(targetLevel)); err != nil {
+	if targetLevel < vset.MaxLevels-1 && movable(plan.inputs, targetLevel) {
+		if err := c.state.moveTables(plan.inputs, uint8(targetLevel)); err != nil {
 			return err
 		}
-		fmt.Printf("db: moved L%d -> L%d table=%d\n", plan.sourceLevel, targetLevel, table.ID)
+		fmt.Printf("db: moved L%d -> L%d tables=%d\n", plan.sourceLevel, targetLevel, len(plan.inputs))
 		return nil
 	}
 
@@ -180,7 +199,7 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 	}
 
 	targetLevel := plan.sourceLevel + 1
-	targetSize := tableTargetBytes[targetLevel]
+	targetSize := tableTargetBytes
 	// tombstones only drop at the last level, where nothing older can resurface
 	cur := newMVCCCursor(newMergeCursor(sources), math.MaxUint64, targetLevel < vset.MaxLevels-1)
 	opts := sst.BuilderOpts{
@@ -239,14 +258,46 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 	return outputs, nil
 }
 
+// inputs can change level as is when none already sit there and none overlap each other.
+func movable(inputs []*sst.Metadata, targetLevel int) bool {
+	for _, table := range inputs {
+		if int(table.Level) == targetLevel {
+			return false
+		}
+	}
+	sorted := slices.SortedFunc(slices.Values(inputs), func(a, b *sst.Metadata) int {
+		return bytes.Compare(a.MinKey, b.MinKey)
+	})
+	for i := 1; i < len(sorted); i++ {
+		if bytes.Compare(sorted[i-1].MaxKey, sorted[i].MinKey) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func overlaps(table *sst.Metadata, minKey, maxKey []byte) bool {
+	return bytes.Compare(table.MaxKey, minKey) >= 0 && bytes.Compare(table.MinKey, maxKey) <= 0
+}
+
 func overlapping(tables []*sst.Metadata, minKey, maxKey []byte) []*sst.Metadata {
 	var result []*sst.Metadata
 	for _, table := range tables {
-		if bytes.Compare(table.MaxKey, minKey) >= 0 && bytes.Compare(table.MinKey, maxKey) <= 0 {
+		if overlaps(table, minKey, maxKey) {
 			result = append(result, table)
 		}
 	}
 	return result
+}
+
+func overlapBytes(tables []*sst.Metadata, minKey, maxKey []byte) int64 {
+	var total int64
+	for _, table := range tables {
+		if overlaps(table, minKey, maxKey) {
+			total += int64(table.SizeBytes)
+		}
+	}
+	return total
 }
 
 func tableRange(tables []*sst.Metadata) (minKey, maxKey []byte) {
