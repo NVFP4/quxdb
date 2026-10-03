@@ -17,9 +17,6 @@ All fixed-size int fields are stored in LE byte-order, except for `magic`
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"hash"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -33,7 +30,6 @@ const (
 
 type filterBuilder struct {
 	path   string
-	sha256 hash.Hash
 	filter *bloom.BloomFilter
 }
 
@@ -42,7 +38,6 @@ func newFilterWriter(dir string, id uint64, expectedKeys uint64) (*filterBuilder
 
 	return &filterBuilder{
 		path:   path,
-		sha256: sha256.New(),
 		filter: bloom.NewWithBitsPerKey(uint64(expectedKeys), filterBitsPerKey),
 	}, nil
 }
@@ -59,9 +54,7 @@ func (fb *filterBuilder) Finalize() error {
 	defer fd.Close()
 
 	bw := bufio.NewWriterSize(fd, indexBufCap)
-	mw := io.MultiWriter(fb.sha256, bw)
-
-	_, err = WriteFilter(mw, fb.filter)
+	_, err = WriteFilter(bw, fb.filter)
 	if err != nil {
 		return err
 	}
@@ -72,10 +65,6 @@ func (fb *filterBuilder) Finalize() error {
 
 	err = fs.Fdatasync(fd)
 	return err
-}
-
-func (fb *filterBuilder) SHA256() []byte {
-	return fb.sha256.Sum(nil)
 }
 
 func (fb *filterBuilder) Close() error {

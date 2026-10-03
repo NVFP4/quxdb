@@ -2,7 +2,6 @@ package sst
 
 import (
 	"bytes"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -166,15 +165,10 @@ func (b *Builder) Finalize() (*Metadata, error) {
 	_ = fs.Fdatasync(final)
 
 	metadata := &Metadata{
-		Version: sstVersion,
-		ID:      b.id,
-		Path:    sstFinalPath,
-		Level:   b.level,
-		FileHashes: FileHashes{
-			Data:   hex.EncodeToString(b.blockWriter.SHA256()),
-			Index:  hex.EncodeToString(b.indexWriter.SHA256()),
-			Filter: hex.EncodeToString(b.filterWriter.SHA256()),
-		},
+		Version:   sstVersion,
+		ID:        b.id,
+		Path:      sstFinalPath,
+		Level:     b.level,
 		MinKey:    bytes.Clone(b.sstMinKey),
 		MaxKey:    bytes.Clone(b.sstMaxKey),
 		Keys:      b.keys,

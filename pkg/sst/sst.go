@@ -26,25 +26,17 @@ var (
 	ErrChecksumMismatch   = errors.New("sst: checksum mismatch")
 )
 
-// FileHashes holds the sha256 of each table file.
-type FileHashes struct {
-	Data   string `json:"qdat"`
-	Index  string `json:"qidx"`
-	Filter string `json:"qfltr"`
-}
-
 // Metadata describes a table, immutable and shared by pointer.
 type Metadata struct {
-	Version    uint16     `json:"ver"`
-	ID         uint64     `json:"id"`
-	Level      uint8      `json:"lvl"`
-	Path       string     `json:"path"`
-	CreatedAt  time.Time  `json:"ts"`
-	MinKey     []byte     `json:"minKey"`
-	MaxKey     []byte     `json:"maxKey"`
-	Keys       uint64     `json:"keys,omitempty"`
-	SizeBytes  uint64     `json:"sizeBytes,omitempty"`
-	FileHashes FileHashes `json:"sha256"`
+	Version   uint16    `json:"ver"`
+	ID        uint64    `json:"id"`
+	Level     uint8     `json:"lvl"`
+	Path      string    `json:"path"`
+	CreatedAt time.Time `json:"ts"`
+	MinKey    []byte    `json:"minKey"`
+	MaxKey    []byte    `json:"maxKey"`
+	Keys      uint64    `json:"keys,omitempty"`
+	SizeBytes uint64    `json:"sizeBytes,omitempty"`
 }
 
 // Span is a byte range in a table file.

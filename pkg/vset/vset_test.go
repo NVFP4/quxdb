@@ -315,13 +315,8 @@ func testTable(id uint64, level uint8) *sst.Metadata {
 		Level:     level,
 		Path:      filepath.Join("sst", strconv.FormatUint(id, 10)),
 		CreatedAt: time.Unix(123, int64(id)).UTC(),
-		FileHashes: sst.FileHashes{
-			Data:   "1",
-			Index:  "2",
-			Filter: "3",
-		},
-		MinKey: []byte{byte(id), 4},
-		MaxKey: []byte{byte(id), 5},
+		MinKey:    []byte{byte(id), 4},
+		MaxKey:    []byte{byte(id), 5},
 	}
 }
 

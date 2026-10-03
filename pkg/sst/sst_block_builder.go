@@ -1,10 +1,8 @@
 package sst
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -26,9 +24,7 @@ type BlockSpan Span
 type blockBuilder struct {
 	fd       *os.File // .qdat file
 	fdOff    int      // offset in .qdat
-	sha256   hash.Hash
-	mw       io.Writer // writes to both `fd` and `sha256`
-	writeBuf []byte    // write buffer for `fd`
+	writeBuf []byte   // write buffer for `fd`
 	written  int
 
 	blockData  Block
@@ -49,13 +45,8 @@ func newBlockWriter(dir string, id uint64, dataSizeBytes uint64) (*blockBuilder,
 		return nil, err
 	}
 
-	sha := sha256.New()
-	mw := io.MultiWriter(sha, fd)
-
 	return &blockBuilder{
 		fd:        fd,
-		mw:        mw,
-		sha256:    sha,
 		writeBuf:  make([]byte, 0, alignUpPage(blockSizeTarget)),
 		blockData: newBlock(blockIndexCap),
 	}, nil
@@ -99,10 +90,6 @@ func (bb *blockBuilder) Finalize() (state *blockState, err error) {
 	return state, fs.Fdatasync(bb.fd)
 }
 
-func (bb *blockBuilder) SHA256() []byte {
-	return bb.sha256.Sum(nil)
-}
-
 func (bb *blockBuilder) Close() error {
 	err := errors.Join(
 		bb.fd.Truncate(int64(bb.fdOff)),
@@ -111,7 +98,6 @@ func (bb *blockBuilder) Close() error {
 
 	bb.reset()
 	bb.fd = nil
-	bb.mw = nil
 	return err
 }
 
@@ -180,7 +166,7 @@ func (bb *blockBuilder) writeBlock(isLastBlock bool) (*blockState, error) {
 	bb.blockState.sealed = true
 
 	// write file to disk
-	nn, err := bb.mw.Write(bb.writeBuf)
+	nn, err := bb.fd.Write(bb.writeBuf)
 	if err != nil {
 		return nil, err
 	}
