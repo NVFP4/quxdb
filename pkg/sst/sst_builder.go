@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/yashgorana/quxdb/pkg/fs"
@@ -28,24 +27,10 @@ type Record struct {
 
 type BuilderOpts struct {
 	Dir       string
+	ID        uint64
 	Level     uint8
 	Keys      uint64
 	SizeBytes uint64
-}
-
-var lastTableID atomic.Uint64
-
-func nextTableID() uint64 {
-	for {
-		last := lastTableID.Load()
-		next := uint64(time.Now().UTC().UnixMilli())
-		if next <= last {
-			next = last + 1
-		}
-		if lastTableID.CompareAndSwap(last, next) {
-			return next
-		}
-	}
 }
 
 type Builder struct {
@@ -65,9 +50,14 @@ type Builder struct {
 }
 
 func NewBuilder(opts BuilderOpts) (*Builder, error) {
-	id := nextTableID()
-	sstDir := sstDirPath(opts.Dir, opts.Level, id) + ".tmp"
+	id := opts.ID
+	finalDir := sstDirPath(opts.Dir, id)
+	sstDir := finalDir + ".tmp"
 
+	// ids of uncommitted tables are reused after a crash, so clear their leftovers.
+	if err := errors.Join(os.RemoveAll(finalDir), os.RemoveAll(sstDir)); err != nil {
+		return nil, err
+	}
 	if err := pathlib.EnsureDir(sstDir); err != nil {
 		return nil, err
 	}

@@ -497,6 +497,7 @@ func (db *QuxDB) flushMemtables() {
 		for _, mt := range mtsToFlush {
 			b, err := sst.NewBuilder(sst.BuilderOpts{
 				Dir:       db.dataDir,
+				ID:        db.lsm.nextTableID(),
 				Level:     0,
 				Keys:      uint64(mt.Len()),
 				SizeBytes: uint64(mt.SizeBytes()),

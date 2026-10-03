@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,6 +90,32 @@ func TestLsmStateCompactionPublishesOutputAndRetiresInputs(t *testing.T) {
 	currentView.release()
 }
 
+func TestLsmStateMoveTableChangesLevelWithoutTouchingFiles(t *testing.T) {
+	dir := t.TempDir()
+	state, err := newLsmState(dir)
+	require.NoError(t, err)
+	table := buildLsmTestTable(t)
+	flushed := state.rolloverMemtable(1, 1)
+	require.NoError(t, state.replaceMemtablesWithSSTs([]*quxMemtable{flushed}, []*sst.Metadata{table}))
+
+	require.NoError(t, state.moveTable(table, 2))
+	view := state.acquire()
+	assert.Empty(t, view.version.Level(0))
+	require.Len(t, view.version.Level(2), 1)
+	assert.Equal(t, table.Path, view.version.Level(2)[0].Path)
+	_, _, found := view.tables.Table(table.ID).Lookup([]byte("key"), newSeekStart([]byte("key"), 1))
+	assert.True(t, found)
+	view.release()
+	require.NoError(t, state.close())
+	assert.DirExists(t, table.Path)
+
+	reopened, err := newLsmState(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.close()) })
+	assert.Empty(t, reopened.currentVersion().Level(0))
+	require.Len(t, reopened.currentVersion().Level(2), 1)
+}
+
 func TestLsmStateFlushRemovesOldestMemtables(t *testing.T) {
 	state := newTestLsmState(t)
 	oldest := state.rolloverMemtable(1, 1)
@@ -163,11 +190,14 @@ func requireNoDirEventually(t *testing.T, path string) {
 	}, time.Second, time.Millisecond)
 }
 
+var lsmTestTableID atomic.Uint64
+
 func buildLsmTestTable(t *testing.T) *sst.Metadata {
 	t.Helper()
 
 	builder, err := sst.NewBuilder(sst.BuilderOpts{
 		Dir:       t.TempDir(),
+		ID:        lsmTestTableID.Add(1),
 		Level:     0,
 		Keys:      1,
 		SizeBytes: 64,

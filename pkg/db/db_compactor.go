@@ -136,6 +136,18 @@ func pickCompaction(version *vset.Version) (int, []*sst.Metadata) {
 func (c *lsmCompactor) execute(plan *compactionPlan) error {
 	defer plan.view.release()
 
+	// a lone table changes level in the catalog only; merges into the last level still rewrite
+	// so shadowed versions and tombstones get dropped there.
+	targetLevel := plan.sourceLevel + 1
+	if len(plan.inputs) == 1 && targetLevel < vset.MaxLevels-1 {
+		table := plan.inputs[0]
+		if err := c.state.moveTable(table, uint8(targetLevel)); err != nil {
+			return err
+		}
+		fmt.Printf("db: moved L%d -> L%d table=%d\n", plan.sourceLevel, targetLevel, table.ID)
+		return nil
+	}
+
 	toAdd, err := c.buildSSTs(plan)
 	if err != nil {
 		return err
@@ -211,6 +223,7 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 					}
 				}
 				if builder == nil {
+					opts.ID = c.state.nextTableID()
 					if builder, err = sst.NewBuilder(opts); err != nil {
 						return outputs, err
 					}

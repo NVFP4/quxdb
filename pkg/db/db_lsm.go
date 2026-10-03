@@ -54,6 +54,10 @@ func (s *lsmState) currentVersion() *vset.Version {
 	return s.current.Load().version
 }
 
+func (s *lsmState) nextTableID() uint64 {
+	return s.versions.NextTableID()
+}
+
 // write loop only; it is the sole caller of rolloverMemtable.
 func (s *lsmState) activeMemtable() *quxMemtable {
 	return s.current.Load().memtables[0]
@@ -106,6 +110,26 @@ func (s *lsmState) replaceMemtablesWithSSTs(flushed []*quxMemtable, toAdd []*sst
 
 func (s *lsmState) replaceSSTs(toRemove, toAdd []*sst.Metadata) error {
 	return s.applyEdit(toAdd, toRemove, 0, nil)
+}
+
+// re-adding the same id replaces it in the catalog, so files and pinned tables stay as is.
+func (s *lsmState) moveTable(table *sst.Metadata, level uint8) error {
+	moved := *table
+	moved.Level = level
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.versions.Apply([]vset.Change{{Op: vset.OpAdd, Table: &moved}}); err != nil {
+		return err
+	}
+	current := s.current.Load()
+	s.current.Store(&lsmView{
+		version:   s.versions.CurrentVersion(),
+		tables:    current.tables,
+		memtables: current.memtables,
+	})
+	return nil
 }
 
 // opens toAdd before Apply so a failed open leaves catalog and view unchanged.

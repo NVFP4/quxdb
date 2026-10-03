@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/yashgorana/quxdb/pkg/sst"
 )
@@ -23,9 +24,10 @@ type Change struct {
 }
 
 type VersionSet struct {
-	catalog *catalog
-	latest  *Version
-	mu      sync.RWMutex
+	catalog     *catalog
+	latest      *Version
+	lastTableID atomic.Uint64
+	mu          sync.RWMutex
 }
 
 func New(dir string) (*VersionSet, error) {
@@ -38,18 +40,32 @@ func New(dir string) (*VersionSet, error) {
 		levels: newLevelMap(MaxLevels),
 	}
 
+	// deleted tables count too, so their ids are never reused.
+	var lastTableID uint64
 	err = catalog.replay(func(rec catalogRecord) error {
-		return applyRecordLocked(ver, rec)
+		if err := applyRecordLocked(ver, rec); err != nil {
+			return err
+		}
+		if rec.Op == OpAdd {
+			lastTableID = max(lastTableID, rec.Table.ID)
+		}
+		return nil
 	})
 	if err != nil {
 		catalog.close()
 		return nil, err
 	}
 
-	return &VersionSet{
+	vs := &VersionSet{
 		catalog: catalog,
 		latest:  ver,
-	}, nil
+	}
+	vs.lastTableID.Store(lastTableID)
+	return vs, nil
+}
+
+func (vs *VersionSet) NextTableID() uint64 {
+	return vs.lastTableID.Add(1)
 }
 
 func (vs *VersionSet) CurrentVersion() *Version {

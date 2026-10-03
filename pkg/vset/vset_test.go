@@ -137,6 +137,25 @@ func TestCheckpointPersistsIndependentlyOfTables(t *testing.T) {
 	assert.Equal(t, checkpoint, reopened.CurrentVersion().Checkpoint())
 }
 
+func TestTableIDsResumeAboveDeletedTablesAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	vs, err := New(dir)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), vs.NextTableID())
+
+	require.NoError(t, vs.Apply([]Change{
+		{Op: OpAdd, Table: testTable(2, 0)},
+		{Op: OpAdd, Table: testTable(7, 0)},
+	}))
+	require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: &sst.Metadata{ID: 7}}}))
+	require.NoError(t, vs.Close())
+
+	reopened, err := New(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	assert.Equal(t, uint64(8), reopened.NextTableID())
+}
+
 func TestApplyRejectsCheckpointRegression(t *testing.T) {
 	dir := t.TempDir()
 	vs, err := New(dir)

@@ -6,7 +6,6 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/yashgorana/quxdb/pkg/fs"
@@ -31,7 +30,7 @@ type FileHashes struct {
 	Filter string `json:"qfltr"`
 }
 
-// immutable once built or replayed; versions and registry handles share one pointer.
+// immutable once built or replayed; holders share pointers, so a level move copies.
 type Metadata struct {
 	Version    uint16     `json:"ver"`
 	ID         uint64     `json:"id"`
@@ -141,22 +140,24 @@ func mmapRead(path string, advice fs.MmapAdvice) ([]byte, error) {
 	return mmapBytes, nil
 }
 
+// fixed width so names stay the same length and sort in id order.
+func sstName(id uint64) string {
+	return fmt.Sprintf("%020d", id)
+}
+
 func sstBlockDataName(id uint64) string {
-	return strconv.FormatUint(id, 10) + ".qdat"
+	return sstName(id) + ".qdat"
 }
 
 func sstIndexName(id uint64) string {
-	return strconv.FormatUint(id, 10) + ".qidx"
+	return sstName(id) + ".qidx"
 }
 
 func sstFilterName(id uint64) string {
-	return strconv.FormatUint(id, 10) + ".qfltr"
+	return sstName(id) + ".qfltr"
 }
 
-func sstDirPath(baseDir string, level uint8, id uint64) string {
-	return filepath.Join(sstLevelPath(baseDir, level), strconv.FormatUint(id, 10))
-}
-
-func sstLevelPath(baseDir string, level uint8) string {
-	return filepath.Join(baseDir, fmt.Sprintf("L%d", level))
+// tables live flat under sst/; level is catalog metadata, not part of the path.
+func sstDirPath(baseDir string, id uint64) string {
+	return filepath.Join(baseDir, "sst", sstName(id))
 }

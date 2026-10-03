@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -123,10 +124,13 @@ func requireNoDirEventually(t *testing.T, path string) {
 	}, time.Second, time.Millisecond)
 }
 
+var testTableID atomic.Uint64
+
 func testTable(t *testing.T, dir string) *sst.Metadata {
 	t.Helper()
 	builder, err := sst.NewBuilder(sst.BuilderOpts{
 		Dir:       dir,
+		ID:        testTableID.Add(1),
 		Level:     0,
 		Keys:      2,
 		SizeBytes: 64 << 10,
