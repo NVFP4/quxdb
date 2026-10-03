@@ -129,10 +129,10 @@ func OpenBlockData(path string) (*MappedBlockData, error) {
 	}
 
 	size := len(mmapBytes)
-	_, _, err = decodeHeader(mmapBytes[size-sstHeaderLen:size], sstTypeData)
+	_, _, err = decodeHeader(mmapBytes[max(size-sstHeaderLen, 0):], sstTypeData)
 	if err != nil {
 		_ = fs.Munmap(mmapBytes)
-		return nil, fmt.Errorf("sparse index decode %w", err)
+		return nil, fmt.Errorf("block data decode %w", err)
 	}
 
 	return &MappedBlockData{mmapBytes}, nil

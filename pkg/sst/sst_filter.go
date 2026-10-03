@@ -1,7 +1,9 @@
 package sst
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"time"
 
@@ -26,15 +28,20 @@ func OpenFilter(path string) (*MappedFilter, error) {
 		return nil, err
 	}
 
-	// decoded header
-	_, n, err := decodeHeader(mmapBytes[0:], sstTypeFilter)
+	_, n, err := decodeHeader(mmapBytes, sstTypeFilter)
 	if err != nil {
 		_ = fs.Munmap(mmapBytes)
-		return nil, fmt.Errorf("sparse index decode %w", err)
+		return nil, fmt.Errorf("filter decode %w", err)
+	}
+
+	crcOff := len(mmapBytes) - 4
+	if crcOff < n || binary.LittleEndian.Uint32(mmapBytes[crcOff:]) != crc32.Checksum(mmapBytes[:crcOff], crc32Table) {
+		_ = fs.Munmap(mmapBytes)
+		return nil, fmt.Errorf("filter decode %w", ErrChecksumMismatch)
 	}
 
 	var filter bloom.BloomFilter
-	err = filter.UnmarshalSlice(mmapBytes[n:])
+	err = filter.UnmarshalSlice(mmapBytes[n:crcOff])
 	if err != nil {
 		_ = fs.Munmap(mmapBytes)
 		return nil, err
@@ -47,22 +54,26 @@ func OpenFilter(path string) (*MappedFilter, error) {
 }
 
 func WriteFilter(w io.Writer, filter *bloom.BloomFilter) (int, error) {
-	// write header
-	h := sstHeader{sstTypeFilter, sstVersion, time.Now()}
-	hn, err := writeHeader(w, h)
+	crc := crc32.New(crc32Table)
+	mw := io.MultiWriter(w, crc)
+
+	hn, err := writeHeader(mw, sstHeader{sstTypeFilter, sstVersion, time.Now()})
 	if err != nil {
 		return 0, fmt.Errorf("filter write %w", err)
 	}
 
-	// write data
-	buf, err := filter.MarshalBinary()
+	data, err := filter.MarshalBinary()
 	if err != nil {
 		return 0, fmt.Errorf("filter encode %w", err)
 	}
-	dn, err := w.Write(buf)
+	dn, err := mw.Write(data)
 	if err != nil {
 		return 0, fmt.Errorf("filter write %w", err)
 	}
 
-	return hn + dn, nil
+	cn, err := w.Write(binary.LittleEndian.AppendUint32(nil, crc.Sum32()))
+	if err != nil {
+		return 0, fmt.Errorf("filter write %w", err)
+	}
+	return hn + dn + cn, nil
 }

@@ -1,4 +1,4 @@
-package sst_test
+package sst
 
 import (
 	"bytes"
@@ -13,28 +13,27 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
 func TestFailedOpenAndRetirementStillRemovesTable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid-table")
 	require.NoError(t, os.Mkdir(path, 0o755))
-	meta := &sst.Metadata{ID: 7, Path: path}
-	registry := sst.NewRegistry()
+	meta := &Metadata{ID: 7, Path: path}
+	registry := NewRegistry()
 
-	require.Error(t, registry.Open([]*sst.Metadata{meta}))
+	require.Error(t, registry.Open([]*Metadata{meta}))
 
-	registry.Retire([]*sst.Metadata{meta})
+	registry.Retire([]*Metadata{meta})
 	assert.NoDirExists(t, path)
 	require.NoError(t, registry.Close())
 }
 
 func TestRetiredTableStaysReadableUntilViewRelease(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	meta := testTable(t, t.TempDir())
-	view := requireView(t, registry, []*sst.Metadata{meta})
+	view := requireView(t, registry, []*Metadata{meta})
 
-	registry.Retire([]*sst.Metadata{meta})
+	registry.Retire([]*Metadata{meta})
 	assert.DirExists(t, meta.Path)
 	assert.Equal(t, []byte("two"), tableValue(t, view.Table(meta.ID), []byte("b")))
 
@@ -44,12 +43,12 @@ func TestRetiredTableStaysReadableUntilViewRelease(t *testing.T) {
 }
 
 func TestRetirementWaitsForEveryView(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	meta := testTable(t, t.TempDir())
-	first := requireView(t, registry, []*sst.Metadata{meta})
-	second := registry.View([]*sst.Metadata{meta})
+	first := requireView(t, registry, []*Metadata{meta})
+	second := registry.View([]*Metadata{meta})
 
-	registry.Retire([]*sst.Metadata{meta})
+	registry.Retire([]*Metadata{meta})
 	first.Release()
 	assert.DirExists(t, meta.Path)
 	second.Release()
@@ -58,21 +57,21 @@ func TestRetirementWaitsForEveryView(t *testing.T) {
 }
 
 func TestRetiringUnpinnedTableRemovesItImmediately(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	meta := testTable(t, t.TempDir())
 
-	registry.Retire([]*sst.Metadata{meta})
+	registry.Retire([]*Metadata{meta})
 	assert.NoDirExists(t, meta.Path)
 	require.NoError(t, registry.Close())
 }
 
 func TestViewPinsMultipleTablesIndependently(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	first := testTable(t, t.TempDir())
 	second := testTable(t, t.TempDir())
-	view := requireView(t, registry, []*sst.Metadata{first, second})
+	view := requireView(t, registry, []*Metadata{first, second})
 
-	registry.Retire([]*sst.Metadata{first})
+	registry.Retire([]*Metadata{first})
 	assert.DirExists(t, first.Path)
 	assert.DirExists(t, second.Path)
 
@@ -84,17 +83,17 @@ func TestViewPinsMultipleTablesIndependently(t *testing.T) {
 }
 
 func TestCloseWaitsForBackgroundRemoval(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	meta := testTable(t, t.TempDir())
-	view := requireView(t, registry, []*sst.Metadata{meta})
+	view := requireView(t, registry, []*Metadata{meta})
 
-	registry.Retire([]*sst.Metadata{meta})
+	registry.Retire([]*Metadata{meta})
 	view.Release()
 	require.NoError(t, registry.Close())
 	assert.NoDirExists(t, meta.Path)
 }
 
-func tableValue(t *testing.T, table *sst.SST, target []byte) []byte {
+func tableValue(t *testing.T, table *SST, target []byte) []byte {
 	t.Helper()
 	cursor := table.Cursor(nil, nil)
 	for {
@@ -110,7 +109,7 @@ func tableValue(t *testing.T, table *sst.SST, target []byte) []byte {
 }
 
 // opens tables, so call once per table set and use registry.View for more views.
-func requireView(t testing.TB, registry *sst.Registry, tables []*sst.Metadata) *sst.View {
+func requireView(t testing.TB, registry *Registry, tables []*Metadata) *View {
 	t.Helper()
 	require.NoError(t, registry.Open(tables))
 	return registry.View(tables)
@@ -126,9 +125,9 @@ func requireNoDirEventually(t *testing.T, path string) {
 
 var testTableID atomic.Uint64
 
-func testTable(t *testing.T, dir string) *sst.Metadata {
+func testTable(t *testing.T, dir string) *Metadata {
 	t.Helper()
-	builder, err := sst.NewBuilder(sst.BuilderOpts{
+	builder, err := NewBuilder(BuilderOpts{
 		Dir:       dir,
 		ID:        testTableID.Add(1),
 		Level:     0,
@@ -136,7 +135,7 @@ func testTable(t *testing.T, dir string) *sst.Metadata {
 		SizeBytes: 64 << 10,
 	})
 	require.NoError(t, err)
-	for _, record := range []sst.Record{
+	for _, record := range []Record{
 		{OrderedKey: []byte("a"), FilterKey: []byte("a"), Value: []byte("one")},
 		{OrderedKey: []byte("b"), FilterKey: []byte("b"), Value: []byte("two")},
 	} {

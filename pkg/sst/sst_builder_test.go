@@ -1,4 +1,4 @@
-package sst_test
+package sst
 
 import (
 	"os"
@@ -8,7 +8,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
 func TestBuilderReplacesLeftoversOfUncommittedID(t *testing.T) {
@@ -21,8 +20,8 @@ func TestBuilderReplacesLeftoversOfUncommittedID(t *testing.T) {
 
 	assert.Equal(t, first.Path, second.Path)
 	assert.NoDirExists(t, second.Path+".tmp")
-	registry := sst.NewRegistry()
-	view := requireView(t, registry, []*sst.Metadata{second})
+	registry := NewRegistry()
+	view := requireView(t, registry, []*Metadata{second})
 	assert.Equal(t, []byte("one"), tableValue(t, view.Table(second.ID), []byte("a")))
 	view.Release()
 	require.NoError(t, registry.Close())
@@ -39,11 +38,11 @@ func TestTableDirsSortInIDOrder(t *testing.T) {
 	assert.True(t, slices.IsSorted(names))
 }
 
-func buildTable(t *testing.T, dir string, id uint64) *sst.Metadata {
+func buildTable(t *testing.T, dir string, id uint64) *Metadata {
 	t.Helper()
-	builder, err := sst.NewBuilder(sst.BuilderOpts{Dir: dir, ID: id, Keys: 1, SizeBytes: 64 << 10})
+	builder, err := NewBuilder(BuilderOpts{Dir: dir, ID: id, Keys: 1, SizeBytes: 64 << 10})
 	require.NoError(t, err)
-	require.NoError(t, builder.Add(sst.Record{OrderedKey: []byte("a"), FilterKey: []byte("a"), Value: []byte("one")}))
+	require.NoError(t, builder.Add(Record{OrderedKey: []byte("a"), FilterKey: []byte("a"), Value: []byte("one")}))
 	meta, err := builder.Finalize()
 	require.NoError(t, err)
 	return meta

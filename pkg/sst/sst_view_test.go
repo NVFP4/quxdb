@@ -1,4 +1,4 @@
-package sst_test
+package sst
 
 import (
 	"path/filepath"
@@ -7,13 +7,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/yashgorana/quxdb/pkg/sst"
 )
 
 func TestViewReadsTable(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	meta := testTable(t, t.TempDir())
-	view := requireView(t, registry, []*sst.Metadata{meta})
+	view := requireView(t, registry, []*Metadata{meta})
 
 	assert.Equal(t, []byte("one"), tableValue(t, view.Table(meta.ID), []byte("a")))
 	assert.Equal(t, []byte("two"), tableValue(t, view.Table(meta.ID), []byte("b")))
@@ -24,10 +23,10 @@ func TestViewReadsTable(t *testing.T) {
 }
 
 func TestRetainedViewOutlivesCreatorRelease(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	meta := testTable(t, t.TempDir())
-	view := requireView(t, registry, []*sst.Metadata{meta})
-	registry.Retire([]*sst.Metadata{meta})
+	view := requireView(t, registry, []*Metadata{meta})
+	registry.Retire([]*Metadata{meta})
 
 	require.True(t, view.TryRetain())
 	view.Release()
@@ -41,17 +40,17 @@ func TestRetainedViewOutlivesCreatorRelease(t *testing.T) {
 }
 
 func TestNextViewDropsTableForDeletion(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	kept := testTable(t, t.TempDir())
 	removed := testTable(t, t.TempDir())
 	added := testTable(t, t.TempDir())
-	base := requireView(t, registry, []*sst.Metadata{kept, removed})
+	base := requireView(t, registry, []*Metadata{kept, removed})
 
-	require.NoError(t, registry.Open([]*sst.Metadata{added}))
-	next := registry.View([]*sst.Metadata{kept, added})
+	require.NoError(t, registry.Open([]*Metadata{added}))
+	next := registry.View([]*Metadata{kept, added})
 	assert.Equal(t, []byte("one"), tableValue(t, next.Table(added.ID), []byte("a")))
 
-	registry.Retire([]*sst.Metadata{removed})
+	registry.Retire([]*Metadata{removed})
 	base.Release()
 	requireNoDirEventually(t, removed.Path)
 	assert.Equal(t, []byte("one"), tableValue(t, next.Table(kept.ID), []byte("a")))
@@ -63,13 +62,13 @@ func TestNextViewDropsTableForDeletion(t *testing.T) {
 }
 
 func TestFailedOpenLeavesExistingViewUsable(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	kept := testTable(t, t.TempDir())
-	invalid := &sst.Metadata{ID: 9, Path: filepath.Join(t.TempDir(), "missing")}
-	base := requireView(t, registry, []*sst.Metadata{kept})
+	invalid := &Metadata{ID: 9, Path: filepath.Join(t.TempDir(), "missing")}
+	base := requireView(t, registry, []*Metadata{kept})
 
-	require.Error(t, registry.Open([]*sst.Metadata{invalid}))
-	registry.Retire([]*sst.Metadata{invalid})
+	require.Error(t, registry.Open([]*Metadata{invalid}))
+	registry.Retire([]*Metadata{invalid})
 
 	assert.Equal(t, []byte("one"), tableValue(t, base.Table(kept.ID), []byte("a")))
 	base.Release()
@@ -78,10 +77,10 @@ func TestFailedOpenLeavesExistingViewUsable(t *testing.T) {
 }
 
 func TestConcurrentRetainReleaseDelaysRetirementUntilAllRelease(t *testing.T) {
-	registry := sst.NewRegistry()
+	registry := NewRegistry()
 	meta := testTable(t, t.TempDir())
-	view := requireView(t, registry, []*sst.Metadata{meta})
-	registry.Retire([]*sst.Metadata{meta})
+	view := requireView(t, registry, []*Metadata{meta})
+	registry.Retire([]*Metadata{meta})
 
 	const readers = 32
 	var wg sync.WaitGroup

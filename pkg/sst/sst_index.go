@@ -216,10 +216,13 @@ func decodeSparseIndex(src []byte) (SparseIndex, int, error) {
 
 	// verify the whole payload
 	end := len(src)
+	if end < 4 {
+		return si, 0, ErrCorrupt
+	}
 	crcOff := end - 4
 	crc := decoder.Uint32At("crc", crcOff)
 	if crc != crc32.Checksum(src[0:crcOff], crc32Table) {
-		return si, 0, fmt.Errorf("checksum mismatch")
+		return si, 0, ErrChecksumMismatch
 	}
 
 	// load up entries
