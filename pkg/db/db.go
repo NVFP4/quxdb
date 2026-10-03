@@ -29,7 +29,7 @@ const (
 	maxBatch     = 128
 	fullSync     = true
 
-	imtFlushThreshold = 1 // holds this many `imt` in memory before flushing
+	cachedImmutables = 1 // immutable memtables kept in memory to serve reads before flushing
 )
 
 type QuxDB struct {
@@ -476,7 +476,7 @@ func (db *QuxDB) flushMemtables() {
 			break
 		}
 
-		mtsToFlush := db.lsm.flushableMemtables(imtFlushThreshold)
+		mtsToFlush := db.lsm.flushableMemtables(cachedImmutables)
 		if len(mtsToFlush) == 0 {
 			continue
 		}

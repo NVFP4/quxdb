@@ -59,25 +59,25 @@ func TestPointTombstoneShadowsOlderSST(t *testing.T) {
 
 	require.NoError(t, db.Set([]byte("key"), []byte("old")))
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range imtFlushThreshold {
+	for i := range cachedImmutables {
 		require.NoError(t, db.Set(fmt.Appendf(nil, "before-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
 		return db.lsm.currentVersion().Checkpoint().LastSeq == 1 &&
-			db.lsm.immutableMemtableCount() == imtFlushThreshold
+			db.lsm.immutableMemtableCount() == cachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
 	require.NoError(t, db.Delete([]byte("key")))
 	tombstoneSeq := db.committedSeq.Load()
 	db.rolloverMemtable(tombstoneSeq, db.lastCommittedLSN)
-	for i := range imtFlushThreshold {
+	for i := range cachedImmutables {
 		require.NoError(t, db.Set(fmt.Appendf(nil, "after-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
 		return db.lsm.currentVersion().Checkpoint().LastSeq == tombstoneSeq &&
-			db.lsm.immutableMemtableCount() == imtFlushThreshold
+			db.lsm.immutableMemtableCount() == cachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
 	value, found, err := db.Get([]byte("key"))
@@ -111,13 +111,13 @@ func TestQuxDBRangeAcrossMemtablesAndSSTs(t *testing.T) {
 
 	flushedSeq := db.committedSeq.Load()
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range imtFlushThreshold {
+	for i := range cachedImmutables {
 		assert.NoError(t, db.Set(fmt.Appendf(nil, "retained-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
 		return db.lsm.currentVersion().Checkpoint().LastSeq == flushedSeq &&
-			db.lsm.immutableMemtableCount() == imtFlushThreshold
+			db.lsm.immutableMemtableCount() == cachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
 	assert.NoError(t, db.Set([]byte("a"), []byte("new-a")))
@@ -222,7 +222,7 @@ func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 	require.NoError(t, db.Set([]byte("first"), []byte("1")))
 	require.NoError(t, db.Set([]byte("second"), []byte("2")))
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range imtFlushThreshold {
+	for i := range cachedImmutables {
 		key := fmt.Sprintf("retained-%d", i)
 		value := fmt.Sprintf("%d", i+3)
 		expected[key] = value
@@ -232,12 +232,12 @@ func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return db.lsm.currentVersion().Checkpoint().LastSeq == 2 &&
-			db.lsm.immutableMemtableCount() == imtFlushThreshold
+			db.lsm.immutableMemtableCount() == cachedImmutables
 	}, time.Second, 10*time.Millisecond)
 	checkpoint := db.lsm.currentVersion().Checkpoint()
 	require.NotZero(t, checkpoint.LastLSN)
 
-	newestSeq := uint64(imtFlushThreshold + 3)
+	newestSeq := uint64(cachedImmutables + 3)
 	expected["newest"] = fmt.Sprintf("%d", newestSeq)
 	require.NoError(t, db.Set([]byte("newest"), []byte(expected["newest"])))
 	require.NoError(t, db.Stop(t.Context()))
@@ -266,7 +266,7 @@ func TestCorruptBlockSurfacesAsReadError(t *testing.T) {
 	require.NoError(t, db.Start(t.Context()))
 	require.NoError(t, db.Set([]byte("key"), []byte("value")))
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range imtFlushThreshold {
+	for i := range cachedImmutables {
 		require.NoError(t, db.Set(fmt.Appendf(nil, "later-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
