@@ -326,48 +326,48 @@ func (s *walSegment) munmap() error {
 	return err
 }
 
-func (s *walSegment) read(lsn LSN) (rec *walRecord, next LSN, err error) {
+func (s *walSegment) read(lsn LSN) (rec walRecord, next LSN, err error) {
 	switch s.mode {
 	case segmentModeReadWrite:
 		if s.file == nil {
-			return nil, 0, fmt.Errorf("wal: active segment id=%d has no file descriptor", s.segId)
+			return walRecord{}, 0, fmt.Errorf("wal: active segment id=%d has no file descriptor", s.segId)
 		}
 		return s.readFromReader(s.file, lsn)
 	case segmentModeReadOnly:
 		mmap, err := s.getMmap()
 		if err != nil {
-			return nil, 0, err
+			return walRecord{}, 0, err
 		}
 		return s.readFromBytes(mmap, lsn)
 	default:
-		return nil, 0, fmt.Errorf("wal: segment id=%d has invalid mode=%d", s.segId, s.mode)
+		return walRecord{}, 0, fmt.Errorf("wal: segment id=%d has invalid mode=%d", s.segId, s.mode)
 	}
 }
 
-func (s *walSegment) readFromReader(r io.ReaderAt, lsn LSN) (*walRecord, LSN, error) {
+func (s *walSegment) readFromReader(r io.ReaderAt, lsn LSN) (walRecord, LSN, error) {
 	offset, err := s.offsetFromLSN(lsn)
 	if err != nil {
-		return nil, 0, err
+		return walRecord{}, 0, err
 	}
 
 	rec, _, err := readRecord(r, offset)
 	if err != nil {
-		return nil, 0, err
+		return walRecord{}, 0, err
 	}
-	return s.finishRead(&rec, lsn, offset)
+	return s.finishRead(rec, lsn, offset)
 }
 
-func (s *walSegment) readFromBytes(src []byte, lsn LSN) (*walRecord, LSN, error) {
+func (s *walSegment) readFromBytes(src []byte, lsn LSN) (walRecord, LSN, error) {
 	offset, err := s.offsetFromLSN(lsn)
 	if err != nil {
-		return nil, 0, err
+		return walRecord{}, 0, err
 	}
 
 	rec, err := readRecordBytes(src, offset)
 	if err != nil {
-		return nil, 0, err
+		return walRecord{}, 0, err
 	}
-	return s.finishRead(&rec, lsn, offset)
+	return s.finishRead(rec, lsn, offset)
 }
 
 func (s *walSegment) offsetFromLSN(lsn LSN) (uint64, error) {
@@ -385,14 +385,14 @@ func (s *walSegment) offsetFromLSN(lsn LSN) (uint64, error) {
 	return offset, nil
 }
 
-func (s *walSegment) finishRead(rec *walRecord, lsn LSN, offset uint64) (*walRecord, LSN, error) {
+func (s *walSegment) finishRead(rec walRecord, lsn LSN, offset uint64) (walRecord, LSN, error) {
 	if LSN(rec.lsn) != lsn {
-		return nil, 0, fmt.Errorf("%w: expected=%d got=%d", ErrRecordInvalidLSN, lsn, rec.lsn)
+		return walRecord{}, 0, fmt.Errorf("%w: expected=%d got=%d", ErrRecordInvalidLSN, lsn, rec.lsn)
 	}
 
 	nextOffset := offset + uint64(rec.recLen)
 	if nextOffset > s.cursor || nextOffset >= s.segMaxSize {
-		return nil, 0, ErrRecordTorn
+		return walRecord{}, 0, ErrRecordTorn
 	}
 	return rec, newLSN(s.segId, nextOffset, s.segMaxSize), nil
 }

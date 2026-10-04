@@ -52,9 +52,10 @@ type recordView struct {
 }
 
 type Block struct {
-	data   []byte // raw contiguous byes
-	recLen int
-	index  BlockIndex
+	data     []byte // raw contiguous byes
+	recLen   int
+	index    BlockIndex // write path
+	rawIndex []byte     // read path encoded index
 }
 
 func newBlock(indexCap int) Block {
@@ -68,11 +69,11 @@ func (b *Block) clear() {
 }
 
 func (b *Block) Seek(target []byte) (key []byte, value []byte, ok bool, err error) {
-	entry, found := b.index.Search(target)
-	if !found {
-		return nil, nil, false, nil
+	off, found, err := searchBlockIndex(b.rawIndex, target)
+	if err != nil || !found {
+		return nil, nil, false, err
 	}
-	return b.scan(target, entry.offset, uint32(b.recLen))
+	return b.scan(target, off, uint32(b.recLen))
 }
 
 func (b *Block) scan(target []byte, start uint32, limit uint32) ([]byte, []byte, bool, error) {

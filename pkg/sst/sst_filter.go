@@ -11,8 +11,9 @@ import (
 	"github.com/yashgorana/quxdb/pkg/fs"
 )
 
+// bloom filter aliasing a mapped filter file
 type MappedFilter struct {
-	bloom.Reader
+	bloom.BloomFilter
 	mmap []byte
 }
 
@@ -40,17 +41,14 @@ func OpenFilter(path string) (*MappedFilter, error) {
 		return nil, fmt.Errorf("filter decode %w", ErrChecksumMismatch)
 	}
 
-	var filter bloom.BloomFilter
-	err = filter.UnmarshalSlice(mmapBytes[n:crcOff])
+	mf := &MappedFilter{mmap: mmapBytes}
+	err = mf.UnmarshalSlice(mmapBytes[n:crcOff])
 	if err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, err
 	}
 
-	return &MappedFilter{
-		Reader: &filter,
-		mmap:   mmapBytes,
-	}, nil
+	return mf, nil
 }
 
 func WriteFilter(w io.Writer, filter *bloom.BloomFilter) (int, error) {

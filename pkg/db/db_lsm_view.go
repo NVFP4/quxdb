@@ -20,11 +20,9 @@ func (v *lsmView) release() {
 
 func (v *lsmView) tableCandidates(key []byte) iter.Seq[*sst.SST] {
 	return func(yield func(*sst.SST) bool) {
-		for _, table := range v.version.PointLookupCandidates(key) {
-			if !yield(v.tables.Table(table.ID)) {
-				return
-			}
-		}
+		v.version.PointLookup(key, func(table *sst.Metadata) bool {
+			return yield(v.tables.Table(table.ID))
+		})
 	}
 }
 

@@ -112,10 +112,8 @@ func (si *SparseIndex) add(minKey, maxKey []byte, span Span) error {
 			return fmt.Errorf("sparse index: minKey(%v) must be greater than previous upperBoundKey(%v)", minKey, last.sepKey)
 		}
 
-		buf := make([]byte, max(len(last.sepKey), len(minKey)))
-		n := shortestSeparator(last.sepKey, minKey, buf)
-		if n > 0 {
-			last.sepKey = buf[:n]
+		if sep := separator(last.sepKey, minKey); sep != nil {
+			last.sepKey = sep
 		}
 	}
 
@@ -145,47 +143,45 @@ func (mi *MappedSparseIndex) Close() error {
 	return err
 }
 
-// use `start` if this returns -1
-func shortestSeparator(start, limit, dst []byte) int {
+// separator returns the shortest key in [start, limit) when shorter than start, else nil
+// borrows a prefix of limit and allocates only when limit ends at the first differing byte
+func separator(start, limit []byte) []byte {
 	ls := len(start)
-	n := min(len(limit), ls)
+	n := min(ls, len(limit))
 
 	i := 0
 	for i < n && start[i] == limit[i] {
 		i++
 	}
 
-	// start is a prefix of limit, so start itself is already shortest.
-	if i == ls {
-		return -1
+	// every separator is at least i+1 bytes
+	if i+1 >= ls {
+		return nil
 	}
 
-	max := ls - 1
-
-	s := start[i]
-	lim := limit[i]
-	next := s + 1
-
-	if next > s && i <= max && (next < lim || next == lim && i+1 < len(limit)) {
-		dst = dst[:i+1]
-		copy(dst, start[:i])
-		dst[i] = next
-		return i + 1
+	// start[i] < limit[i] so a proper prefix of limit through i sits in between
+	if i+1 < len(limit) {
+		return limit[:i+1]
 	}
 
-	// Keep start[i], which is already < limit[i], and increment the first
-	// later byte that can be incremented.
-	for j := i + 1; j <= max; j++ {
-		s = start[j]
-		if s != 0xff {
-			dst = dst[:j+1]
-			copy(dst, start[:j])
-			dst[j] = s + 1
-			return j + 1
+	if start[i]+1 < limit[i] {
+		sep := make([]byte, i+1)
+		copy(sep, start[:i])
+		sep[i] = start[i] + 1
+		return sep
+	}
+
+	// keep start[i] and bump the first later byte that can be incremented
+	for j := i + 1; j < ls-1; j++ {
+		if start[j] != 0xff {
+			sep := make([]byte, j+1)
+			copy(sep, start[:j])
+			sep[j] = start[j] + 1
+			return sep
 		}
 	}
 
-	return -1
+	return nil
 }
 
 // ------ sparse index codec ------

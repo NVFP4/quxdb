@@ -73,31 +73,29 @@ func (v *Version) All() []*sst.Metadata {
 	return meta
 }
 
-// PointLookupCandidates returns tables that may hold key, l0 newest first.
-func (v *Version) PointLookupCandidates(key []byte) []*sst.Metadata {
-	var meta []*sst.Metadata
+// PointLookup calls yield for tables that may hold key, l0 newest first, until yield returns false.
+func (v *Version) PointLookup(key []byte, yield func(*sst.Metadata) bool) {
 	if len(key) == 0 {
-		return meta
+		return
 	}
 
 	// L0 overlap, so sort latest first
 	tables := v.levels[0]
 	for i := len(tables) - 1; i >= 0; i-- {
 		tab := tables[i]
-		if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 {
-			meta = append(meta, tab)
+		if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 && !yield(tab) {
+			return
 		}
 	}
 
 	// scan every table instead of binary search, support both tiered/hybrid compaction
 	for lvl := 1; lvl < MaxLevels; lvl++ {
 		for _, tab := range v.levels[lvl] {
-			if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 {
-				meta = append(meta, tab)
+			if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 && !yield(tab) {
+				return
 			}
 		}
 	}
-	return meta
 }
 
 // RangeLookupCandidates returns tables overlapping start..end, with start <= end.

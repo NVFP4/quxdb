@@ -72,13 +72,14 @@ func (c *blockCursor) reset(b *Block, start, end []byte) {
 
 	// Only used when the block has a lower bound.
 	if start != nil {
-		entry, ok := b.index.Search(start)
-		if !ok {
+		indexOff, ok, err := searchBlockIndex(b.rawIndex, start)
+		if err != nil || !ok {
+			c.err = err
 			c.off = c.limit
 			return
 		}
 
-		off := int(entry.offset)
+		off := int(indexOff)
 		if off < blockHeaderLen || off >= c.limit {
 			c.err = ErrCorrupt
 			c.off = c.limit

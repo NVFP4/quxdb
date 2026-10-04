@@ -33,6 +33,11 @@ const (
 	walCorruptionPolicy = wal.StopOnCorruption
 )
 
+// larger buffers are dropped rather than pooled
+const maxPooledKeyCap = 4 << 10
+
+var seekKeyPool = sync.Pool{New: func() any { return new([]byte) }}
+
 var ErrReadOnly = errors.New("db: read-only after a wal failure")
 
 type QuxDB struct {
@@ -190,7 +195,15 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
 	// pin before loading readSeq so compaction can't drop versions visible at it
 	readSeq := db.committedSeq.Load()
 
-	lookupKey := newSeekStart(key, readSeq) // heap alloc
+	// seek start, the newest version of key at or below readSeq
+	bp := seekKeyPool.Get().(*[]byte)
+	lookupKey := appendQuxKey((*bp)[:0], key, readSeq, quxOp(0xFF))
+	defer func() {
+		if cap(lookupKey) <= maxPooledKeyCap {
+			*bp = lookupKey
+			seekKeyPool.Put(bp)
+		}
+	}()
 
 	for _, mt := range view.memtables {
 		ikey, val, found := mt.Seek(lookupKey)
@@ -324,7 +337,8 @@ func (it *Iterator) All() iter.Seq2[[]byte, []byte] {
 
 func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) *writeReq {
 	w := db.reqPool.Get().(*writeReq)
-	w.qkey = newQuxKey(key, 0, op) // heap alloc
+	w.qkey = appendQuxKey(w.keyBuf[:0], key, 0, op)
+	w.keyBuf = w.qkey
 	w.val = val
 	w.res = writeResult{}
 	w.enqueuedAt = time.Now()
@@ -338,6 +352,9 @@ func (db *QuxDB) awaitResult(req *writeReq) writeResult {
 	res := req.res
 
 	req.qkey, req.val = nil, nil
+	if cap(req.keyBuf) > maxPooledKeyCap {
+		req.keyBuf = nil
+	}
 	req.res = writeResult{}
 	db.reqPool.Put(req)
 

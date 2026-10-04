@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 )
 
 type (
@@ -33,26 +34,24 @@ const (
 
 // byte sortable internal key - userKey ASC, seq DESC, op DESC
 func newQuxKey(userKey []byte, seq quxSeq, op quxOp) quxKey {
+	return appendQuxKey(nil, userKey, seq, op)
+}
+
+// appendQuxKey appends the encoded key to dst.
+func appendQuxKey(dst, userKey []byte, seq quxSeq, op quxOp) quxKey {
 	n := len(userKey)
 
 	// If n%quxKeyAlign == 0, add a whole empty terminating group.
 	padLen := quxKeyAlign - (n % quxKeyAlign)
-	paddedKeyLen := n + padLen
 
-	qkey := make([]byte, paddedKeyLen+quxKeyTrailerLen)
-	off := 0
+	dst = slices.Grow(dst, n+padLen+quxKeyTrailerLen)
+	dst = append(dst, userKey...)
+	dst = append(dst, make([]byte, padLen)...)
+	dst = append(dst, byte(n%quxKeyAlign))
+	dst = binary.BigEndian.AppendUint64(dst, ^seq)
+	dst = append(dst, ^byte(op))
 
-	// key + delimiter
-	copy(qkey[0:n], userKey)
-	qkey[paddedKeyLen] = byte(n % quxKeyAlign)
-	off += paddedKeyLen + quxKeyMarker
-
-	binary.BigEndian.PutUint64(qkey[off:off+quxKeySeqLen], ^seq)
-	off += quxKeySeqLen
-
-	qkey[off] = ^byte(op)
-
-	return quxKey(qkey)
+	return quxKey(dst)
 }
 
 func (k quxKey) UserKey() []byte {

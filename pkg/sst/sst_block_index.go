@@ -66,39 +66,14 @@ func (bi *BlockIndex) Get(idx int) *blockIndexEntry {
 	return &bi.entries[idx]
 }
 
-func (bi *BlockIndex) Search(targetKey []byte) (*blockIndexEntry, bool) {
-	lo, hi := 0, len(bi.entries)
-
-	// find first entry such that targetKey <= key
-	for lo < hi {
-		mid := lo + ((hi - lo) >> 1)
-		cmp := bytes.Compare(bi.entries[mid].key, targetKey)
-
-		if cmp < 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-
-	// you've reached beyond the end m8 - every key is smaller than targetKey
-	if lo == len(bi.entries) {
-		return nil, false
-	}
-
-	return &bi.entries[lo], true
-}
-
 func (bi *BlockIndex) add(minKey, maxKey []byte, offset int) {
 	if n := len(bi.entries); n > 0 {
 		last := &bi.entries[n-1]
 
-		buf := make([]byte, max(len(last.key), len(minKey)))
-		n := shortestSeparator(last.key, minKey, buf)
-		if n > 0 {
-			// update bytes
-			bi.sizeBytes -= uint64(len(last.key) - len(buf[:n]))
-			last.key = buf[:n]
+		if sep := separator(last.key, minKey); sep != nil {
+			off := int(last.offset)
+			bi.sizeBytes -= uint64(encodedBlockIndexEntryLen(last.key, off) - encodedBlockIndexEntryLen(sep, off))
+			last.key = sep
 		}
 	}
 
@@ -136,32 +111,26 @@ func encodeBlockIndex(dst []byte, bi *BlockIndex) []byte {
 	return dst
 }
 
-func decodeBlockIndex(src []byte) (BlockIndex, int, error) {
-	var bi BlockIndex
+// returns the record offset of the first entry with key >= target
+func searchBlockIndex(src, target []byte) (uint32, bool, error) {
 	decoder := codec.NewDecoder(src)
-
 	if decoder.Uint32BE("magic") != blockIndexMagic32 {
-		return bi, 0, ErrInvalidFormat
+		return 0, false, ErrInvalidFormat
 	}
 
 	ne := decoder.UVarint("entries")
-	entries := make([]blockIndexEntry, ne)
-	for i := range ne {
-		entry := blockIndexEntry{}
-		keylen := decoder.UVarint("blockIndex.keyLen")
-		entry.key = decoder.Bytes("blockIndex.key", int(keylen))
-		entry.offset = uint32(decoder.UVarint("blockIndex.recOff"))
-		entries[i] = entry
+	for range ne {
+		keyLen := decoder.UVarint("blockIndex.keyLen")
+		key := decoder.Bytes("blockIndex.key", int(keyLen))
+		off := uint32(decoder.UVarint("blockIndex.recOff"))
+		if err := decoder.Err(); err != nil {
+			return 0, false, err
+		}
+		if bytes.Compare(key, target) >= 0 {
+			return off, true, nil
+		}
 	}
-
-	// return any decoder error
-	err := decoder.Err()
-	if err != nil {
-		return bi, 0, err
-	}
-
-	bi.entries = entries
-	return bi, decoder.Offset(), nil
+	return 0, false, decoder.Err()
 }
 
 func uvarintSize(x int) int {

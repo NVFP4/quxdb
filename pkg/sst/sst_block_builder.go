@@ -31,6 +31,7 @@ type blockBuilder struct {
 	blockData  Block
 	blockState blockState
 	indexState indexState
+	lastSealed blockState // reused return of writeBlock, valid until the next seal
 }
 
 func newBlockWriter(dir string, id uint64, dataSizeBytes uint64) (*blockBuilder, error) {
@@ -177,13 +178,13 @@ func (bb *blockBuilder) writeBlock(isLastBlock bool) (*blockState, error) {
 	}
 
 	// decoupling block span with file span, because blocks will be compressed
-	blockState := bb.blockState
-	blockState.fileSpan = Span{bb.fdOff, blockState.fileSpan.Size}
+	bb.lastSealed = bb.blockState
+	bb.lastSealed.fileSpan = Span{bb.fdOff, bb.lastSealed.fileSpan.Size}
 	bb.fdOff += nn
 
 	bb.reset()
 
-	return &blockState, nil
+	return &bb.lastSealed, nil
 }
 
 func (bb *blockBuilder) shouldIndexRecord() bool {

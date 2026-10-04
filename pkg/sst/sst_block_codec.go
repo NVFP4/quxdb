@@ -65,19 +65,14 @@ func decodeBlock(src []byte) (Block, int, error) {
 	recLen := int(decoder.Uint32("block.recLen"))
 	_ = decoder.Bytes("block.records", recLen)
 
-	index, _, err := decodeBlockIndex(src[decoder.Offset():])
-	if err != nil {
-		return block, 0, err
-	}
-
-	err = decoder.Err()
+	err := decoder.Err()
 	if err != nil {
 		return block, 0, err
 	}
 
 	block.recLen = recLen
 	block.data = src[:blockLen]
-	block.index = index
+	block.rawIndex = src[decoder.Offset():crcOff]
 	return block, blockLen, nil
 }
 

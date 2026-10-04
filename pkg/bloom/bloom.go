@@ -28,10 +28,6 @@ var (
 	ErrFilterTooLarge           = errors.New("bloom: filter too large")
 )
 
-type Reader interface {
-	Contains(key []byte) bool
-}
-
 type Writer interface {
 	Add(key []byte)
 }

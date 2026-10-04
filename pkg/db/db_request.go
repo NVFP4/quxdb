@@ -4,6 +4,7 @@ import "time"
 
 type writeReq struct {
 	qkey       quxKey
+	keyBuf     []byte // reused across pooled requests, qkey aliases it
 	val        []byte
 	res        writeResult
 	enqueuedAt time.Time
