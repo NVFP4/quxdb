@@ -118,11 +118,11 @@ func (bd *MappedBlockData) BlockAt(span Span) (Block, error) {
 }
 
 func (bd *MappedBlockData) Close() error {
-	return fs.Munmap(bd.mmap)
+	return fs.Unmap(bd.mmap)
 }
 
 func OpenBlockData(path string) (*MappedBlockData, error) {
-	mmapBytes, err := mmapRead(path, fs.MADV_RANDOM)
+	mmapBytes, err := fs.MapFile(path, fs.AdviceRandom)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +130,7 @@ func OpenBlockData(path string) (*MappedBlockData, error) {
 	size := len(mmapBytes)
 	_, _, err = decodeHeader(mmapBytes[max(size-sstHeaderLen, 0):], sstTypeData)
 	if err != nil {
-		_ = fs.Munmap(mmapBytes)
+		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("block data decode %w", err)
 	}
 

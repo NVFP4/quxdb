@@ -41,7 +41,7 @@ func newBlockWriter(dir string, id uint64, dataSizeBytes uint64) (*blockBuilder,
 
 	fileSize := int(dataSizeBytes + dataSizeBytes>>4)
 	fileSize = alignUpPage(fileSize)
-	if err := fs.Fallocate(fd, 0, int64(fileSize)); err != nil {
+	if err := fs.Reserve(fd, int64(fileSize)); err != nil {
 		return nil, err
 	}
 
@@ -87,7 +87,7 @@ func (bb *blockBuilder) Finalize() (state *blockState, err error) {
 		}
 	}
 
-	return state, fs.Fdatasync(bb.fd)
+	return state, fs.SyncData(bb.fd)
 }
 
 func (bb *blockBuilder) Close() error {

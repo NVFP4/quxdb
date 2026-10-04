@@ -47,7 +47,7 @@ func (ib *indexBuilder) Finalize() (err error) {
 		return err
 	}
 
-	err = fs.Fdatasync(fd)
+	err = fs.SyncData(fd)
 	return err
 }
 

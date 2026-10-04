@@ -17,33 +17,33 @@ type MappedFilter struct {
 }
 
 func (mi *MappedFilter) Close() error {
-	err := fs.Munmap(mi.mmap)
+	err := fs.Unmap(mi.mmap)
 	mi.mmap = nil
 	return err
 }
 
 func OpenFilter(path string) (*MappedFilter, error) {
-	mmapBytes, err := mmapRead(path, fs.MADV_RANDOM)
+	mmapBytes, err := fs.MapFile(path, fs.AdviceRandom)
 	if err != nil {
 		return nil, err
 	}
 
 	_, n, err := decodeHeader(mmapBytes, sstTypeFilter)
 	if err != nil {
-		_ = fs.Munmap(mmapBytes)
+		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("filter decode %w", err)
 	}
 
 	crcOff := len(mmapBytes) - 4
 	if crcOff < n || binary.LittleEndian.Uint32(mmapBytes[crcOff:]) != crc32.Checksum(mmapBytes[:crcOff], crc32Table) {
-		_ = fs.Munmap(mmapBytes)
+		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("filter decode %w", ErrChecksumMismatch)
 	}
 
 	var filter bloom.BloomFilter
 	err = filter.UnmarshalSlice(mmapBytes[n:crcOff])
 	if err != nil {
-		_ = fs.Munmap(mmapBytes)
+		_ = fs.Unmap(mmapBytes)
 		return nil, err
 	}
 

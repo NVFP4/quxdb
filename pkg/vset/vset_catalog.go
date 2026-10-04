@@ -138,7 +138,7 @@ func (c *catalog) rewrite(records []catalogRecord) error {
 		if err := bw.Flush(); err != nil {
 			return err
 		}
-		if err := fs.Fdatasync(fd); err != nil {
+		if err := fs.SyncData(fd); err != nil {
 			return err
 		}
 		return os.Rename(tmpPath, c.path)
@@ -150,15 +150,7 @@ func (c *catalog) rewrite(records []catalogRecord) error {
 	// the new file is the catalog now, never fall back
 	old := c.fd
 	c.fd, c.bw, c.jw, c.records = fd, bw, jw, len(records)
-	return errors.Join(old.Close(), syncDir(filepath.Dir(c.path)))
-}
-
-func syncDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return errors.Join(old.Close(), fs.SyncDir(filepath.Dir(c.path)))
 }
 
 func (c *catalog) size() (int64, error) {
@@ -181,7 +173,7 @@ func (c *catalog) truncate(size int64) error {
 }
 
 func (c *catalog) sync() error {
-	return fs.Fdatasync(c.fd)
+	return fs.SyncData(c.fd)
 }
 
 func (c *catalog) close() error {

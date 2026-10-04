@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yashgorana/quxdb/pkg/fs"
 	"github.com/yashgorana/quxdb/pkg/pathlib"
 	"golang.org/x/sync/errgroup"
 )
@@ -109,31 +108,6 @@ func openSST(meta *Metadata) (*SST, error) {
 
 func (s *SST) close() error {
 	return errors.Join(s.data.Close(), s.index.Close(), s.filter.Close())
-}
-
-func mmapRead(path string, advice fs.MmapAdvice) ([]byte, error) {
-	fd, err := os.OpenFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, fmt.Errorf("file read %w", err)
-	}
-	defer fd.Close()
-
-	info, err := fd.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("file stat %w", err)
-	}
-
-	mmapBytes, err := fs.Mmap(fd, 0, info.Size())
-	if err != nil {
-		return nil, fmt.Errorf("file mmap %w", err)
-	}
-
-	if err := fs.Madvice(mmapBytes, advice); err != nil {
-		_ = fs.Munmap(mmapBytes)
-		return nil, err
-	}
-
-	return mmapBytes, nil
 }
 
 const (

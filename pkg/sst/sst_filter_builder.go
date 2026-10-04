@@ -61,7 +61,7 @@ func (fb *filterBuilder) Finalize() error {
 		return err
 	}
 
-	err = fs.Fdatasync(fd)
+	err = fs.SyncData(fd)
 	return err
 }
 

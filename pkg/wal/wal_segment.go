@@ -72,7 +72,7 @@ func newSegment(dir string, id segID, segSize uint64) (*walSegment, error) {
 		return nil, fmt.Errorf("wal: %w", err)
 	}
 
-	if err := fs.Fallocate(file, 0, int64(segSize)); err != nil {
+	if err := fs.Reserve(file, int64(segSize)); err != nil {
 		return nil, errors.Join(fmt.Errorf("wal: %w", err), file.Close())
 	}
 
@@ -195,18 +195,18 @@ func (s *walSegment) openReadOnlyMmapLocked() ([]byte, error) {
 		s.file = file
 	}
 
-	mmap, err := fs.Mmap(s.file, 0, int64(s.cursor))
+	mmap, err := fs.Map(s.file, 0, int64(s.cursor))
 	if err != nil {
 		return nil, err
 	}
 
-	err = fs.Madvice(mmap, fs.MADV_SEQUENTIAL)
+	err = fs.Advise(mmap, fs.AdviceSequential)
 	if err != nil {
 		fmt.Printf("wal: madvice err %s\n", err)
 	}
 
 	if err := s.closeFile(); err != nil {
-		_ = fs.Munmap(mmap)
+		_ = fs.Unmap(mmap)
 		return nil, err
 	}
 	s.mmap = mmap
@@ -231,7 +231,7 @@ func (s *walSegment) munmap() error {
 	if s.mmap == nil {
 		return nil
 	}
-	err := fs.Munmap(s.mmap)
+	err := fs.Unmap(s.mmap)
 	s.mmap = nil
 	return err
 }
@@ -406,7 +406,7 @@ func (s *walSegment) sync() error {
 	if s.mode != segmentModeReadWrite || s.file == nil {
 		return ErrSegmentReadOnly
 	}
-	return fs.Fdatasync(s.file)
+	return fs.SyncData(s.file)
 }
 
 func (s *walSegment) writeAtCursor(buf []byte) error {
@@ -427,7 +427,7 @@ func (s *walSegment) seal() error {
 	if s.mode != segmentModeReadWrite || s.file == nil {
 		return ErrSegmentReadOnly
 	}
-	if err := fs.Fdatasync(s.file); err != nil {
+	if err := fs.SyncData(s.file); err != nil {
 		return err
 	}
 	if err := s.closeFile(); err != nil {
@@ -454,7 +454,7 @@ func (s *walSegment) truncate(lsn LSN) error {
 	if err := s.file.Truncate(int64(offset)); err != nil {
 		return err
 	}
-	if err := fs.Fdatasync(s.file); err != nil {
+	if err := fs.SyncData(s.file); err != nil {
 		return err
 	}
 	s.cursor = offset

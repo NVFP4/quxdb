@@ -3,7 +3,6 @@ package sst
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -143,18 +142,14 @@ func (b *Builder) Finalize() (*Metadata, error) {
 		return nil, err
 	}
 
-	// rename .tmp dir to final dir
-	sstFinalPath := strings.TrimSuffix(b.sstDir, ".tmp")
-	if err := os.Rename(b.sstDir, sstFinalPath); err != nil {
+	// persist the table files' entries, then the rename of their dir
+	if err := fs.SyncDir(b.sstDir); err != nil {
 		return nil, err
 	}
-
-	// fdatasync the dir
-	final, err := os.Open(sstFinalPath)
-	if err != nil {
-		fmt.Printf("sst: could not sync sst dir '%s' %v", sstFinalPath, err)
+	sstFinalPath := strings.TrimSuffix(b.sstDir, ".tmp")
+	if err := fs.RenameDurable(b.sstDir, sstFinalPath); err != nil {
+		return nil, err
 	}
-	_ = fs.Fdatasync(final)
 
 	metadata := &Metadata{
 		Version:   sstVersion,

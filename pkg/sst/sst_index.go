@@ -139,7 +139,7 @@ type MappedSparseIndex struct {
 }
 
 func (mi *MappedSparseIndex) Close() error {
-	err := fs.Munmap(mi.mmap)
+	err := fs.Unmap(mi.mmap)
 	mi.SparseIndex.clear()
 	mi.mmap = nil
 	return err
@@ -269,7 +269,7 @@ func WriteSparseIndex(w io.Writer, idx *SparseIndex) (int, error) {
 }
 
 func OpenSparseIndex(path string) (*MappedSparseIndex, error) {
-	mmapBytes, err := mmapRead(path, fs.MADV_WILLNEED)
+	mmapBytes, err := fs.MapFile(path, fs.AdviceWillNeed)
 	if err != nil {
 		return nil, err
 	}
@@ -277,14 +277,14 @@ func OpenSparseIndex(path string) (*MappedSparseIndex, error) {
 	// decoded header
 	_, n, err := decodeHeader(mmapBytes[0:], sstTypeIndex)
 	if err != nil {
-		_ = fs.Munmap(mmapBytes)
+		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("sparse index decode %w", err)
 	}
 
 	// decode payload
 	idx, _, err := decodeSparseIndex(mmapBytes[n:])
 	if err != nil {
-		_ = fs.Munmap(mmapBytes)
+		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("sparse index decode %w", err)
 	}
 
