@@ -2,15 +2,6 @@ package sst
 
 import "github.com/yashgorana/quxdb/pkg/core"
 
-// Lookup seeks orderedKey if the filter may hold filterKey.
-func (s *SST) Lookup(filterKey, orderedKey []byte) (key, value []byte, found bool, err error) {
-	if !s.MayContain(filterKey) {
-		return nil, nil, false, nil
-	}
-
-	return s.Seek(orderedKey)
-}
-
 // Seek returns the entry at or after orderedKey within its indexed block.
 func (s *SST) Seek(orderedKey []byte) (key, value []byte, found bool, err error) {
 	span, ok := s.index.SearchSpan(orderedKey)

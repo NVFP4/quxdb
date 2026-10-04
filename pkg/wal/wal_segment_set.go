@@ -9,6 +9,9 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/yashgorana/quxdb/pkg/metrics"
 )
 
 const (
@@ -78,8 +81,14 @@ func (s *segmentSet) open() error {
 	}
 	s.segments = append(s.segments, segments...)
 	s.active = s.segments[len(s.segments)-1]
+	s.publishMetricsLocked()
 
 	return nil
+}
+
+func (s *segmentSet) publishMetricsLocked() {
+	metrics.WalSegments.Set(float64(len(s.segments)))
+	metrics.WalRetainedBytes.Set(float64(uint64(len(s.segments)) * s.segSize))
 }
 
 func (s *segmentSet) close() error {
@@ -113,11 +122,14 @@ func (s *segmentSet) segmentForLSN(lsn LSN) (*walSegment, error) {
 
 // rollover seals the active segment and switches to the next one, prepared or built inline.
 func (s *segmentSet) rollover() error {
+	start := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// the preparer is building the segment this rollover needs
+	observe := metrics.WalRolloverPrepared
 	for s.preparing {
+		observe = metrics.WalRolloverStalled
 		s.prepared.Wait()
 	}
 
@@ -138,6 +150,7 @@ func (s *segmentSet) rollover() error {
 			return errors.Join(err, seg.close(), old.openReadWrite())
 		}
 	} else {
+		observe = metrics.WalRolloverUnprepared
 		var err error
 		if seg, err = s.buildSegment(s.takeSpareLocked(), nextID, ""); err != nil {
 			if old == nil {
@@ -151,7 +164,12 @@ func (s *segmentSet) rollover() error {
 	s.segments = append(s.segments, seg)
 	s.byID[seg.segId] = seg
 	s.active = seg
+	s.publishMetricsLocked()
 	s.notifyPreparer()
+	// the first segment of an empty log is not a switch
+	if old != nil {
+		observe.Observe(time.Since(start).Seconds())
+	}
 
 	return nil
 }
@@ -267,6 +285,7 @@ func (s *segmentSet) detachRetiredLocked() []*walSegment {
 	}
 	clear(s.segments[:n])
 	s.segments = s.segments[n:]
+	s.publishMetricsLocked()
 	return retired
 }
 
@@ -332,6 +351,7 @@ func (s *segmentSet) truncateTail(lsn LSN) error {
 	// Truncation is irreversible, so retain state changes even when cleanup fails.
 	clear(s.segments[cut:])
 	s.segments = s.segments[:cut]
+	s.publishMetricsLocked()
 
 	return errors.Join(errs...)
 }

@@ -184,6 +184,7 @@ func (db *QuxDB) Err() error {
 }
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
+	start := time.Now()
 	view := db.lsm.acquire()
 	defer view.release()
 	// pin before loading readSeq so compaction can't drop versions visible at it
@@ -194,21 +195,47 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
 	for _, mt := range view.memtables {
 		ikey, val, found := mt.Seek(lookupKey)
 		if value, exists, done := resolve(key, ikey, val, found); done {
+			metrics.SstProbesPerGet.Observe(0)
+			metrics.DbGetMemtable.Observe(time.Since(start).Seconds())
 			return value, exists, nil
 		}
 	}
 
+	var probed, negatives, falsePositives int
 	for table := range view.tableCandidates(key) {
-		ikey, val, found, err := table.Lookup(key, lookupKey)
+		probed++
+		if !table.MayContain(key) {
+			negatives++
+			continue
+		}
+		ikey, val, found, err := table.Seek(lookupKey)
 		if err != nil {
+			observeProbes(probed, negatives, falsePositives)
+			metrics.DbGetError.Observe(time.Since(start).Seconds())
 			return nil, false, err
 		}
 		if value, exists, done := resolve(key, ikey, val, found); done {
+			metrics.SstBloomTruePositive.Inc()
+			observeProbes(probed, negatives, falsePositives)
+			metrics.DbGetSST.Observe(time.Since(start).Seconds())
 			return value, exists, nil
 		}
+		falsePositives++
 	}
 
+	observeProbes(probed, negatives, falsePositives)
+	metrics.DbGetNotFound.Observe(time.Since(start).Seconds())
 	return nil, false, nil
+}
+
+func observeProbes(probed, negatives, falsePositives int) {
+	metrics.SstProbesPerGet.Observe(float64(probed))
+	if negatives > 0 {
+		metrics.SstBloomNegative.Add(float64(negatives))
+	}
+	if falsePositives > 0 {
+		metrics.SstBloomFalsePositive.Add(float64(falsePositives))
+	}
 }
 
 // `done` reports whether a newest-first seek result decides the lookup.
@@ -375,13 +402,16 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	memStart := time.Now()
 	if err == nil {
 		lastSeq := db.committedSeq.Load()
+		var userBytes int
 		for _, req := range batch {
 			// a rollover here checkpoints the previous wal Record's lsn
 			if err := db.setMemtable(req.qkey, req.val, lastSeq, db.lastCommittedLSN); err != nil {
 				panic(fmt.Sprintf("unknown error %v", err))
 			}
 			lastSeq = req.qkey.Seq()
+			userBytes += len(req.qkey.UserKey()) + len(req.val)
 		}
+		metrics.DbUserBytesWritten.Add(float64(userBytes))
 		// one store per batch keeps readers' copy of this line valid between batches
 		db.committedSeq.Store(lastSeq)
 		db.lastCommittedLSN = lsn
@@ -410,6 +440,7 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	metrics.DbCommitEncodeDuration.Observe(appendStart.Sub(encodeStart).Seconds())
 	metrics.DbCommitAppendDuration.Observe(memStart.Sub(appendStart).Seconds())
 	metrics.DbCommitMemSetDuration.Observe(commitEnd.Sub(memStart).Seconds())
+	db.lsm.publishMemtableMetrics()
 }
 
 func (db *QuxDB) setMemtable(qkey quxKey, val []byte, lastSeq uint64, lastLSN wal.LSN) error {
@@ -463,6 +494,7 @@ func (db *QuxDB) flushMemtables() {
 
 		newSSTs := make([]*sst.Metadata, 0, len(mtsToFlush))
 		for _, mt := range mtsToFlush {
+			flushStart := time.Now()
 			b, err := sst.NewBuilder(sst.BuilderOpts{
 				Dir:       db.dataDir,
 				ID:        db.lsm.nextTableID(),
@@ -494,6 +526,8 @@ func (db *QuxDB) flushMemtables() {
 			if err != nil {
 				panic(err)
 			}
+			metrics.DbFlushDuration.Observe(time.Since(flushStart).Seconds())
+			metrics.DbFlushBytesWritten.Add(float64(sstMeta.SizeBytes))
 			fmt.Printf("db: new sst level=%d path=%s\n", sstMeta.Level, sstMeta.Path)
 			newSSTs = append(newSSTs, sstMeta)
 		}

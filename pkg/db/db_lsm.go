@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
 	"github.com/yashgorana/quxdb/pkg/memtable"
+	"github.com/yashgorana/quxdb/pkg/metrics"
 	"github.com/yashgorana/quxdb/pkg/sst"
 	"github.com/yashgorana/quxdb/pkg/vset"
 	"github.com/yashgorana/quxdb/pkg/wal"
@@ -44,7 +46,28 @@ func newLsmState(dataDir string) (*lsmState, error) {
 		tables:    registry.View(tables),
 		memtables: []*quxMemtable{newQuxMemtable()},
 	})
+	publishLevelMetrics(version)
 	return state, nil
+}
+
+// publishMemtableMetrics sets the memtable gauges from the current view.
+func (s *lsmState) publishMemtableMetrics() {
+	memtables := s.current.Load().memtables
+	var size int
+	for _, mt := range memtables {
+		size += mt.SizeBytes()
+	}
+	metrics.DbMemtableBytes.Set(float64(size))
+	metrics.DbImmutableMemtables.Set(float64(len(memtables) - 1))
+}
+
+func publishLevelMetrics(version *vset.Version) {
+	for level := range vset.MaxLevels {
+		tables := version.Level(level)
+		label := strconv.Itoa(level)
+		metrics.SstTables.WithLabelValues(label).Set(float64(len(tables)))
+		metrics.SstBytes.WithLabelValues(label).Set(float64(tablesSize(tables)))
+	}
 }
 
 func (s *lsmState) acquire() *lsmView {
@@ -139,6 +162,7 @@ func (s *lsmState) moveTables(tables []*sst.Metadata, level uint8) error {
 		tables:    current.tables,
 		memtables: current.memtables,
 	})
+	publishLevelMetrics(s.versions.CurrentVersion())
 	return nil
 }
 
@@ -181,6 +205,10 @@ func (s *lsmState) applyEdit(
 	})
 	current.tables.Release()
 	s.registry.Retire(toRemove)
+	publishLevelMetrics(version)
+	if flushed > 0 {
+		s.publishMemtableMetrics()
+	}
 	return nil
 }
 

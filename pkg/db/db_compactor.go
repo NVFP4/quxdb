@@ -7,8 +7,10 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/yashgorana/quxdb/pkg/core"
+	"github.com/yashgorana/quxdb/pkg/metrics"
 	"github.com/yashgorana/quxdb/pkg/sst"
 	"github.com/yashgorana/quxdb/pkg/vset"
 )
@@ -68,6 +70,7 @@ func (c *lsmCompactor) compactionLoop() {
 	defer c.workers.Done()
 	for range c.notify {
 		if err := c.compact(); err != nil {
+			metrics.DbCompactionErrors.Inc()
 			fmt.Printf("db: compaction error %v\n", err)
 		}
 		c.onCompacted()
@@ -159,6 +162,7 @@ func leastOverlapping(tables, next []*sst.Metadata) *sst.Metadata {
 
 func (c *lsmCompactor) execute(plan *compactionPlan) error {
 	defer plan.view.release()
+	start := time.Now()
 
 	// moves rewrite nothing, but the last level still merges to drop garbage
 	targetLevel := plan.sourceLevel + 1
@@ -166,6 +170,7 @@ func (c *lsmCompactor) execute(plan *compactionPlan) error {
 		if err := c.state.moveTables(plan.inputs, uint8(targetLevel)); err != nil {
 			return err
 		}
+		metrics.DbCompactionMove.Observe(time.Since(start).Seconds())
 		fmt.Printf("db: moved L%d -> L%d tables=%d\n", plan.sourceLevel, targetLevel, len(plan.inputs))
 		return nil
 	}
@@ -177,6 +182,9 @@ func (c *lsmCompactor) execute(plan *compactionPlan) error {
 	if err := c.state.replaceSSTs(plan.inputs, toAdd); err != nil {
 		return err
 	}
+	metrics.DbCompactionMerge.Observe(time.Since(start).Seconds())
+	metrics.DbCompactionBytesRead.Add(float64(tablesSize(plan.inputs)))
+	metrics.DbCompactionBytesWritten.Add(float64(tablesSize(toAdd)))
 
 	fmt.Printf("db: compacted L%d -> L%d inputs=%d outputs=%d\n",
 		plan.sourceLevel, plan.sourceLevel+1, len(plan.inputs), len(toAdd))
