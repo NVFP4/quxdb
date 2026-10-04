@@ -30,17 +30,19 @@ type compactionPlan struct {
 }
 
 type lsmCompactor struct {
-	dataDir string
-	state   *lsmState
-	notify  chan struct{}
-	workers sync.WaitGroup
+	dataDir     string
+	state       *lsmState
+	notify      chan struct{}
+	workers     sync.WaitGroup
+	onCompacted func() // runs after each compaction pass
 }
 
-func newLsmCompactor(dataDir string, state *lsmState) *lsmCompactor {
+func newLsmCompactor(dataDir string, state *lsmState, onCompacted func()) *lsmCompactor {
 	return &lsmCompactor{
-		dataDir: dataDir,
-		state:   state,
-		notify:  make(chan struct{}, 1),
+		dataDir:     dataDir,
+		state:       state,
+		notify:      make(chan struct{}, 1),
+		onCompacted: onCompacted,
 	}
 }
 
@@ -68,6 +70,7 @@ func (c *lsmCompactor) compactionLoop() {
 		if err := c.compact(); err != nil {
 			fmt.Printf("db: compaction error %v\n", err)
 		}
+		c.onCompacted()
 	}
 }
 

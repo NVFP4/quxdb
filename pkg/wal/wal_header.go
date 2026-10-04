@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	walVersion       = 1
+	walVersion       = 2
 	walHeaderMagic32 = 'Q'<<24 | 'W'<<16 | 'A'<<8 | 'L'
 
 	walHeaderLen       = 8*2 + 4*3 + 2*2

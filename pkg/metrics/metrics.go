@@ -53,15 +53,6 @@ var (
 		NativeHistogramMinResetDuration: time.Hour,
 	})
 
-	DbCommitSyncDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name: "quxdb_commit_sync_duration_seconds",
-		Help: "",
-
-		NativeHistogramBucketFactor:     1.1,
-		NativeHistogramMaxBucketNumber:  100,
-		NativeHistogramMinResetDuration: time.Hour,
-	})
-
 	DbCommitMemSetDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "quxdb_commit_memset_duration_seconds",
 		Help: "",
@@ -88,6 +79,35 @@ var (
 		NativeHistogramMaxBucketNumber:  100,
 		NativeHistogramMinResetDuration: time.Hour,
 	})
+
+	DbReadOnly = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "quxdb_read_only",
+		Help: "1 once a wal failure has stopped writes, 0 otherwise",
+	})
+
+	// WAL Metrics
+	WalWriteDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "quxdb_wal_write_duration_seconds",
+		Help: "Duration of one pwritev of a wal record",
+
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: time.Hour,
+	})
+
+	WalSyncDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "quxdb_wal_sync_duration_seconds",
+		Help: "Duration of the fdatasync ending a synced append",
+
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: time.Hour,
+	})
+
+	WalBytesWritten = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "quxdb_wal_bytes_written_total",
+		Help: "Bytes written to wal segments, framing included",
+	})
 )
 
 func init() {
@@ -96,8 +116,11 @@ func init() {
 	prometheus.MustRegister(DbCommitDuration)
 	prometheus.MustRegister(DbCommitEncodeDuration)
 	prometheus.MustRegister(DbCommitAppendDuration)
-	prometheus.MustRegister(DbCommitSyncDuration)
 	prometheus.MustRegister(DbCommitMemSetDuration)
 	prometheus.MustRegister(DbSetQueueWaitDuration)
 	prometheus.MustRegister(DbSetTotalDuration)
+	prometheus.MustRegister(DbReadOnly)
+	prometheus.MustRegister(WalWriteDuration)
+	prometheus.MustRegister(WalSyncDuration)
+	prometheus.MustRegister(WalBytesWritten)
 }

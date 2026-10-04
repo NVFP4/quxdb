@@ -12,7 +12,7 @@ import (
 
 const MaxLevels = 5
 
-// Checkpoint marks the wal position covered by tables.
+// Checkpoint marks the wal position covered by tables, seqs up to LastSeq may sit in the wal Record after LastLSN.
 type Checkpoint struct {
 	LastSeq uint64 `json:"seq"`
 	LastLSN uint64 `json:"lsn"`
@@ -205,7 +205,7 @@ func applyRecordLocked(ver *Version, rec catalogRecord) error {
 			return ErrRecordCorrupt
 		}
 		checkpoint := *rec.Checkpoint
-		if (checkpoint.LastSeq == 0) != (checkpoint.LastLSN == 0) ||
+		if (checkpoint.LastSeq == 0 && checkpoint.LastLSN != 0) ||
 			checkpoint.LastSeq < ver.checkpoint.LastSeq ||
 			(checkpoint.LastSeq == ver.checkpoint.LastSeq && checkpoint.LastLSN != ver.checkpoint.LastLSN) {
 			return ErrRecordCorrupt

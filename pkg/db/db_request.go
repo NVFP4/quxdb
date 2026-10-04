@@ -3,7 +3,8 @@ package db
 import "time"
 
 type writeReq struct {
-	kv         quxKV
+	qkey       quxKey
+	val        []byte
 	res        writeResult
 	enqueuedAt time.Time
 	done       chan struct{}

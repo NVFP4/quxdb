@@ -13,7 +13,7 @@ import (
 
 const maxBodyBytes = 1 << 20 // 1MiB
 
-func hPutKey(db *db.QuxDB) http.HandlerFunc {
+func hPutKey(store *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key, err := url.PathUnescape(chi.URLParam(r, "key"))
 		if err != nil {
@@ -43,7 +43,11 @@ func hPutKey(db *db.QuxDB) http.HandlerFunc {
 		}
 
 		// write to store
-		err = db.Set([]byte(key), body)
+		err = store.Set([]byte(key), body)
+		if errors.Is(err, db.ErrReadOnly) {
+			http.Error(w, fmt.Sprintf("failed to set value: %v", err), http.StatusServiceUnavailable)
+			return
+		}
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to set value: %v", err), http.StatusInternalServerError)
 			return

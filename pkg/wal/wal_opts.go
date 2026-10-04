@@ -2,6 +2,7 @@ package wal
 
 import "fmt"
 
+// Option configures a WAL.
 type Option func(*walOptions)
 
 type walOptions struct {
@@ -12,7 +13,7 @@ func defaultWALOptions() walOptions {
 	return walOptions{segmentSize: walSegmentDefaultSize}
 }
 
-// WithSegmentSize configures the physical size of WAL segments.
+// WithSegmentSize sets the size of each WAL file.
 func WithSegmentSize(size uint64) Option {
 	return func(o *walOptions) {
 		o.segmentSize = size

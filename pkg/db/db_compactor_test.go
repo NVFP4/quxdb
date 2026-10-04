@@ -194,7 +194,7 @@ func newTestCompactor(t *testing.T) (*lsmState, *lsmCompactor) {
 	state, err := newLsmState(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, state.close()) })
-	return state, newLsmCompactor(dir, state)
+	return state, newLsmCompactor(dir, state, func() {})
 }
 
 // builds a table from entries and publishes it at level.

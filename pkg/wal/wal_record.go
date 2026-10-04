@@ -18,18 +18,25 @@ Field		Bytes	Description
 ------------------------------------------------------------------
 magic		4		QREC
 recLen		4		Total encoded record size, including padding
-recType		2		Record type
 recFlags	2		Record flags
 lsn			8		Log sequence number
 dataLen		4		Data size in bytes
 headerCRC	4		CRC32C of all preceding fields
 ------------------------------------------------------------------
 
+WAL RECORD FLAGS (recFlags)
+------------------------------------------------------------------
+Bits				Description
+------------------------------------------------------------------
+0-13				Reserved
+14-15				Record type: 0 full, 1 start, 2 middle, 3 end
+------------------------------------------------------------------
+
 WAL RECORD
 ------------------------------------------------------------------
 Field		Bytes	Description
 ------------------------------------------------------------------
-header		28		WAL Record header
+header		26		WAL Record header
 data		var		Record data bytes
 crc			4		CRC32C of all preceding fields
 padding		var		Zero padding to 8-byte alignment
@@ -40,15 +47,19 @@ All fixed-size int fields are stored in LE byte-order, except for `magic`.
 */
 
 const (
-	walRecordHeaderLen = 4 + 4 + 2 + 2 + 8 + 4 + 4
+	walRecordHeaderLen = 4 + 4 + 2 + 8 + 4 + 4
 	walRecordMetaLen   = 4 // record crc
-	walMaxDataSize     = 4 << 20
 
 	walRecordMagic32 uint32 = 'Q'<<24 | 'R'<<16 | 'E'<<8 | 'C'
 )
 
+// partial record position, stored in recFlags bits 14-15
 const (
-	walRecTypeFull = 1 << iota // full key-value
+	walRecFull          uint16 = 0 << 14
+	walRecPartialMask   uint16 = 3 << 14
+	walRecPartialStart  uint16 = 1 << 14
+	walRecPartialMiddle uint16 = 2 << 14
+	walRecPartialEnd    uint16 = 3 << 14
 )
 
 var (
@@ -59,8 +70,7 @@ var (
 	ErrRecordChecksumMismatch = errors.New("record checksum mismatch")
 )
 
-// IsCorruption reports whether err indicates damaged WAL record data.
-func IsCorruption(err error) bool {
+func isCorruptionError(err error) bool {
 	return errors.Is(err, ErrRecordInvalidFormat) ||
 		errors.Is(err, ErrRecordInvalidSize) ||
 		errors.Is(err, ErrRecordInvalidLSN) ||
@@ -72,9 +82,22 @@ type walRecordHeader struct {
 	lsn       uint64
 	headerCRC uint32
 	recLen    uint32
-	recType   uint16
 	recFlags  uint16
 	dataLen   uint32
+}
+
+func (h *walRecordHeader) partial() uint16 {
+	return h.recFlags & walRecPartialMask
+}
+
+func (h *walRecordHeader) starts() bool {
+	p := h.partial()
+	return p == walRecFull || p == walRecPartialStart
+}
+
+func (h *walRecordHeader) ends() bool {
+	p := h.partial()
+	return p == walRecFull || p == walRecPartialEnd
 }
 
 type walRecord struct {
@@ -91,9 +114,6 @@ func encodeRecordHeader(dst []byte, h *walRecordHeader) (int, error) {
 
 	binary.LittleEndian.PutUint32(dst[off:], h.recLen)
 	off += 4
-
-	binary.LittleEndian.PutUint16(dst[off:], h.recType)
-	off += 2
 
 	binary.LittleEndian.PutUint16(dst[off:], h.recFlags)
 	off += 2
@@ -120,7 +140,6 @@ func decodeRecordHeader(src []byte) (walRecordHeader, int, error) {
 	decoder := codec.NewDecoder(src)
 	magic := decoder.Uint32BE("record.magic")
 	h.recLen = decoder.Uint32("record.length")
-	h.recType = decoder.Uint16("record.type")
 	h.recFlags = decoder.Uint16("record.flags")
 	h.lsn = decoder.Uint64("record.lsn")
 	h.dataLen = decoder.Uint32("record.dataLength")
@@ -130,57 +149,23 @@ func decodeRecordHeader(src []byte) (walRecordHeader, int, error) {
 	if err := decoder.Err(); err != nil {
 		return h, 0, err
 	}
+	if magic == 0 {
+		return h, 0, io.EOF
+	}
 	if magic != walRecordMagic32 {
 		return h, 0, ErrRecordInvalidFormat
 	}
 	if h.recLen < walRecordHeaderLen+walRecordMetaLen || h.recLen%8 != 0 {
 		return h, 0, ErrRecordTorn
 	}
-	if err := validateDataWithinRecordBounds(int(h.dataLen), h.recLen); err != nil {
-		return h, 0, err
+	if encodedRecordSize(int(h.dataLen)) != int(h.recLen) {
+		return h, 0, ErrRecordInvalidSize
 	}
 	if h.headerCRC != crc32.Checksum(src[:crcOff], crc32Table) {
 		return h, 0, ErrRecordChecksumMismatch
 	}
 
 	return h, decoder.Offset(), nil
-}
-
-func newRecord(lsn LSN, flags uint16, data []byte) walRecord {
-	return walRecord{
-		walRecordHeader: walRecordHeader{
-			lsn:      uint64(lsn),
-			recLen:   uint32(encodedRecordLen(data)),
-			recType:  walRecTypeFull,
-			recFlags: flags,
-			dataLen:  uint32(len(data)),
-		},
-		data: data,
-	}
-}
-
-func encodeRecord(dst []byte, rec *walRecord) (int, error) {
-	off, err := encodeRecordHeader(dst, &rec.walRecordHeader)
-	if err != nil {
-		return 0, err
-	}
-
-	dataLen := len(rec.data)
-	if dataLen != int(rec.dataLen) {
-		return 0, ErrRecordInvalidSize
-	}
-
-	copy(dst[off:off+dataLen], rec.data)
-	off += dataLen
-
-	rec.crc = crc32.Checksum(dst[:off], crc32Table)
-	binary.LittleEndian.PutUint32(dst[off:], rec.crc)
-	off += 4
-
-	// zero pad the rest
-	clear(dst[off:rec.recLen])
-
-	return int(rec.recLen), nil
 }
 
 func decodeRecord(src []byte) (walRecord, int, error) {
@@ -281,24 +266,6 @@ func readRecordBytes(src []byte, off uint64) (walRecord, error) {
 	}
 
 	return rec, nil
-}
-
-func validateDataWithinRecordBounds(dataLen int, recLen uint32) error {
-	if dataLen > walMaxDataSize || encodedRecordSize(dataLen) != int(recLen) {
-		return ErrRecordInvalidSize
-	}
-	return nil
-}
-
-func validateDataLen(data []byte) error {
-	if len(data) > walMaxDataSize {
-		return ErrRecordInvalidSize
-	}
-	return nil
-}
-
-func encodedRecordLen(data []byte) int {
-	return encodedRecordSize(len(data))
 }
 
 func encodedRecordSize(size int) int {

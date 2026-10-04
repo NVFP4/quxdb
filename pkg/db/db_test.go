@@ -1,12 +1,14 @@
 package db
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -259,6 +261,52 @@ func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 	}
 }
 
+func TestRecoverySkipsKVsFlushedByMidBatchRollover(t *testing.T) {
+	dir := t.TempDir()
+	db, err := New(dir)
+	require.NoError(t, err)
+	require.NoError(t, db.Start(t.Context()))
+
+	// one ~70MiB batch spans two wal segments and rolls the 16MiB memtable over mid-batch
+	const n = 4300
+	value := bytes.Repeat([]byte{'v'}, 16<<10)
+	batch := make([]*writeReq, n)
+	for i := range batch {
+		batch[i] = newWriteReq()
+		batch[i].qkey, batch[i].val = newQuxKey(fmt.Appendf(nil, "key-%04d", i), 0, quxOpSet), value
+	}
+	db.commitBatch(batch)
+	for _, req := range batch {
+		require.NoError(t, req.res.err)
+	}
+	require.Eventually(t, func() bool {
+		return db.lsm.currentVersion().Checkpoint().LastSeq > 0
+	}, 10*time.Second, 10*time.Millisecond)
+	require.NoError(t, db.Stop(t.Context()))
+
+	reopened, err := New(dir)
+	require.NoError(t, err)
+	checkpoint := reopened.lsm.currentVersion().Checkpoint()
+	require.Less(t, checkpoint.LastSeq, uint64(n))
+	require.NoError(t, reopened.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, reopened.Stop(t.Context())) })
+
+	view := reopened.lsm.acquire()
+	replayed := 0
+	for _, mt := range view.memtables {
+		replayed += mt.Len()
+	}
+	view.release()
+	assert.Equal(t, n-int(checkpoint.LastSeq), replayed)
+	assert.Equal(t, uint64(n), reopened.committedSeq.Load())
+	for i := range n {
+		got, found, err := reopened.Get(fmt.Appendf(nil, "key-%04d", i))
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, value, got)
+	}
+}
+
 func TestCorruptBlockSurfacesAsReadError(t *testing.T) {
 	dir := t.TempDir()
 	db, err := New(dir)
@@ -296,6 +344,41 @@ func TestCorruptBlockSurfacesAsReadError(t *testing.T) {
 	for range it.All() {
 	}
 	require.ErrorIs(t, it.Err(), sst.ErrChecksumMismatch)
+}
+
+func TestFailedStartReleasesLockAndCanRetry(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "wal"), 0o755))
+	broken := filepath.Join(dir, "wal", "broken.quxwal")
+	require.NoError(t, os.WriteFile(broken, bytes.Repeat([]byte{0xab}, 64), 0o644))
+
+	db, err := New(dir)
+	require.NoError(t, err)
+	require.Error(t, db.Start(t.Context()))
+
+	probe := flock.New(filepath.Join(dir, "quxdb.lock"))
+	locked, err := probe.TryLock()
+	require.NoError(t, err)
+	require.True(t, locked, "failed start kept the lock")
+	require.NoError(t, probe.Unlock())
+
+	require.NoError(t, os.Remove(broken))
+	require.NoError(t, db.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, db.Stop(t.Context())) })
+	require.NoError(t, db.Set([]byte("key"), []byte("value")))
+}
+
+func TestStartRejectsLockedDir(t *testing.T) {
+	dir := t.TempDir()
+	first, err := New(dir)
+	require.NoError(t, err)
+	require.NoError(t, first.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, first.Stop(t.Context())) })
+
+	second, err := New(dir)
+	require.NoError(t, err)
+	require.ErrorContains(t, second.Start(t.Context()), "locked by another process")
+	require.NoError(t, first.Set([]byte("key"), []byte("value")))
 }
 
 func newTestQuxDB(t *testing.T) *QuxDB {

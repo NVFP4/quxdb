@@ -15,7 +15,6 @@ import (
 
 	"github.com/gofrs/flock"
 
-	"github.com/yashgorana/quxdb/pkg/bufpool"
 	"github.com/yashgorana/quxdb/pkg/core"
 	"github.com/yashgorana/quxdb/pkg/memtable"
 	"github.com/yashgorana/quxdb/pkg/metrics"
@@ -27,10 +26,14 @@ import (
 const (
 	memTableType = memtable.BTree
 	maxBatch     = 128
-	fullSync     = true
 
 	cachedImmutables = 1 // immutable memtables kept in memory to serve reads before flushing
+
+	// truncating on mid-log wal corruption drops acknowledged writes after the damage
+	walCorruptionPolicy = wal.StopOnCorruption
 )
+
+var ErrReadOnly = errors.New("db: read-only after a wal failure")
 
 type QuxDB struct {
 	dataDir string
@@ -41,7 +44,7 @@ type QuxDB struct {
 	workers sync.WaitGroup
 
 	wal    *wal.WAL
-	walBuf [][]byte
+	walEnc batchEncoder
 
 	imtNotify chan struct{}
 
@@ -51,6 +54,7 @@ type QuxDB struct {
 	committedSeq     atomic.Uint64
 	writeSeq         quxSeq
 	lastCommittedLSN wal.LSN
+	readOnly         atomic.Pointer[error] // set once by the first wal failure
 }
 
 func New(dataDir string) (*QuxDB, error) {
@@ -78,11 +82,15 @@ func New(dataDir string) (*QuxDB, error) {
 		flock:     flock.New(filepath.Join(dataDir, "quxdb.lock")),
 		imtNotify: make(chan struct{}, 1),
 		reqChan:   make(chan *writeReq, maxBatch*4), // particular reason why this is 4x
-		walBuf:    make([][]byte, 0, maxBatch),
 		lsm:       lsm,
 	}
 
-	db.compactor = newLsmCompactor(dataDir, lsm)
+	// compaction passes are a convenient time to prune the wal
+	db.compactor = newLsmCompactor(dataDir, lsm, func() {
+		if err := db.wal.Prune(); err != nil {
+			fmt.Printf("db: wal prune error %v\n", err)
+		}
+	})
 
 	db.reqPool.New = func() any {
 		return newWriteReq()
@@ -92,9 +100,12 @@ func New(dataDir string) (*QuxDB, error) {
 }
 
 func (db *QuxDB) Start(ctx context.Context) error {
-	_, err := db.flock.TryLock()
+	locked, err := db.flock.TryLock()
 	if err != nil {
 		return err
+	}
+	if !locked {
+		return fmt.Errorf("db: %s is locked by another process", db.dataDir)
 	}
 
 	checkpoint := db.lsm.currentVersion().Checkpoint()
@@ -102,40 +113,32 @@ func (db *QuxDB) Start(ctx context.Context) error {
 	lastLSN := wal.LSN(checkpoint.LastLSN)
 	db.committedSeq.Store(lastSeq)
 
-	fmt.Println("db: open wal")
-	if err := db.wal.Open(); err != nil {
-		return err
-	}
-
-	fmt.Printf("db: wal replay from %d\n", lastLSN)
-	var kv quxKV
-	lsn, err := db.wal.ReplayAfter(lastLSN, func(r wal.Record) error {
-		kv.Decode(r.Data)
-		if err := db.setMemtable(kv, lastSeq, lastLSN); err != nil {
-			return err
+	fmt.Printf("db: wal recover after %d\n", lastLSN)
+	checkpointSeq := lastSeq
+	err = db.wal.Recover(lastLSN, func(r wal.Record) error {
+		for qkey, val := range decodeBatch(r.Data) {
+			// flushed before a mid-batch memtable rollover
+			if qkey.Seq() <= checkpointSeq {
+				continue
+			}
+			if err := db.setMemtable(qkey, val, lastSeq, lastLSN); err != nil {
+				return err
+			}
+			lastSeq = qkey.Seq()
 		}
-		lastSeq = kv.qkey.Seq()
 		lastLSN = r.LSN
 		db.committedSeq.Store(lastSeq)
 		return nil
-	})
+	}, walCorruptionPolicy)
 	if err != nil {
-		if !wal.IsCorruption(err) {
-			return err
-		}
-		fmt.Printf("db: error %v - truncating to lsn=%d\n", err, lsn)
-		if truncateErr := db.wal.TruncateFrom(lsn); truncateErr != nil {
-			return errors.Join(err, truncateErr)
-		}
+		// the caller may retry or inspect the data dir
+		return errors.Join(err, db.wal.Close(), db.flock.Unlock())
 	}
-	fmt.Println("db: wal replay completed")
+	fmt.Println("db: wal recover completed")
 
 	db.writeSeq = quxSeq(lastSeq)
 	db.lastCommittedLSN = lastLSN
-
-	if err := db.wal.PruneBefore(wal.LSN(checkpoint.LastLSN)); err != nil {
-		return err
-	}
+	db.wal.RetainFrom(wal.LSN(checkpoint.LastLSN))
 
 	db.compactor.Start()
 	db.compactor.Notify()
@@ -154,7 +157,6 @@ func (db *QuxDB) Stop(ctx context.Context) error {
 	close(db.reqChan)
 	db.workers.Wait()
 	db.compactor.Stop()
-	clear(db.walBuf)
 
 	return errors.Join(
 		db.wal.Close(),
@@ -165,9 +167,20 @@ func (db *QuxDB) Stop(ctx context.Context) error {
 }
 
 func (db *QuxDB) Set(key []byte, value []byte) error {
+	if err := db.Err(); err != nil {
+		return err
+	}
 	req := db.enqueueWrite(key, value, quxOpSet)
 	res := db.awaitResult(req)
 	return res.err
+}
+
+// Err returns the error that made the db read-only, or nil.
+func (db *QuxDB) Err() error {
+	if err := db.readOnly.Load(); err != nil {
+		return *err
+	}
+	return nil
 }
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
@@ -213,6 +226,9 @@ func resolve(key, ikey, val []byte, found bool) (value []byte, exists, done bool
 }
 
 func (db *QuxDB) Delete(key []byte) error {
+	if err := db.Err(); err != nil {
+		return err
+	}
 	req := db.enqueueWrite(key, nil, quxOpDelete)
 	res := db.awaitResult(req)
 	return res.err
@@ -281,8 +297,8 @@ func (it *Iterator) All() iter.Seq2[[]byte, []byte] {
 
 func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) *writeReq {
 	w := db.reqPool.Get().(*writeReq)
-	w.kv.qkey = newQuxKey(key, 0, op) // heap alloc
-	w.kv.val = val
+	w.qkey = newQuxKey(key, 0, op) // heap alloc
+	w.val = val
 	w.res = writeResult{}
 	w.enqueuedAt = time.Now()
 
@@ -294,7 +310,7 @@ func (db *QuxDB) awaitResult(req *writeReq) writeResult {
 	<-req.done
 	res := req.res
 
-	req.kv = quxKV{}
+	req.qkey, req.val = nil, nil
 	req.res = writeResult{}
 	db.reqPool.Put(req)
 
@@ -340,80 +356,45 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	metrics.DbCommitBacklogSize.Observe(float64(len(db.reqChan)))
 	metrics.DbCommitBatchSize.Observe(float64(len(batch)))
 
-	lens := make([]int, len(batch))
-
 	commitStart := time.Now()
 	for _, req := range batch {
 		db.writeSeq++
-		req.kv.qkey.SetSeq(db.writeSeq)
+		req.qkey.SetSeq(db.writeSeq)
 	}
 
-	totalBytes := 0
-	for i, req := range batch {
-		n := req.kv.EncodedLen()
-		lens[i] = n
-		totalBytes += n
-	}
-
-	// serialize all records one big buffer
-	batchBuff := bufpool.Get(uint(totalBytes))
-	defer batchBuff.Release()
-
-	// create batch from slices of the big buff
-	bufOff := 0
-	for i, req := range batch {
-		n := lens[i]
-		end := bufOff + n
-		req.kv.Encode(batchBuff.B[bufOff:end])
-
-		db.walBuf = append(db.walBuf, batchBuff.B[bufOff:end])
-		bufOff = end
-	}
+	encodeStart := time.Now()
+	parts := db.walEnc.Encode(batch)
 
 	appendStart := time.Now()
-	results, err := db.wal.AppendBatch(db.walBuf)
-
-	syncStart := time.Now()
-	if err == nil && fullSync {
-		err = db.wal.Sync()
+	lsn, err := db.wal.Append(parts, wal.DurabilitySynced)
+	db.walEnc.Reset()
+	if errors.Is(err, wal.ErrWALFailed) {
+		err = db.enterReadOnly(err)
 	}
 
 	memStart := time.Now()
 	if err == nil {
 		lastSeq := db.committedSeq.Load()
-		lastLSN := db.lastCommittedLSN
-		for i, req := range batch {
-			if results[i].Err != nil {
-				continue
-			}
-			if err := db.setMemtable(req.kv, lastSeq, lastLSN); err != nil {
+		for _, req := range batch {
+			// a rollover here checkpoints the previous wal Record's lsn
+			if err := db.setMemtable(req.qkey, req.val, lastSeq, db.lastCommittedLSN); err != nil {
 				panic(fmt.Sprintf("unknown error %v", err))
 			}
-			lastSeq = req.kv.qkey.Seq()
-			lastLSN = results[i].LSN
+			lastSeq = req.qkey.Seq()
 		}
 		// one store per batch keeps readers' copy of this line valid between batches
 		db.committedSeq.Store(lastSeq)
-		db.lastCommittedLSN = lastLSN
+		db.lastCommittedLSN = lsn
 	}
 
 	commitEnd := time.Now()
 	commitDur := commitEnd.Sub(commitStart)
 
-	for i, req := range batch {
-		lsn := uint64(0)
-		reqErr := err
-		if reqErr == nil {
-			reqErr = results[i].Err
-		}
-		if reqErr == nil {
-			lsn = uint64(results[i].LSN)
-		}
-
+	for _, req := range batch {
 		// unblock waiters
 		req.res = writeResult{
-			lsn:       lsn,
-			err:       reqErr,
+			lsn:       uint64(lsn),
+			err:       err,
 			queueWait: commitStart.Sub(req.enqueuedAt),
 			commitDur: commitDur,
 			totalDur:  commitEnd.Sub(req.enqueuedAt),
@@ -425,24 +406,15 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 		req.done <- struct{}{}
 	}
 
-	memDur := commitEnd.Sub(memStart)
-	syncDur := memStart.Sub(syncStart)
-	appendDur := syncStart.Sub(appendStart)
-	encodeDur := appendStart.Sub(commitStart)
-
 	metrics.DbCommitDuration.Observe(commitDur.Seconds())
-	metrics.DbCommitEncodeDuration.Observe(encodeDur.Seconds())
-	metrics.DbCommitAppendDuration.Observe(appendDur.Seconds())
-	metrics.DbCommitSyncDuration.Observe(syncDur.Seconds())
-	metrics.DbCommitMemSetDuration.Observe(memDur.Seconds())
-
-	clear(db.walBuf)
-	db.walBuf = db.walBuf[:0]
+	metrics.DbCommitEncodeDuration.Observe(appendStart.Sub(encodeStart).Seconds())
+	metrics.DbCommitAppendDuration.Observe(memStart.Sub(appendStart).Seconds())
+	metrics.DbCommitMemSetDuration.Observe(commitEnd.Sub(memStart).Seconds())
 }
 
-func (db *QuxDB) setMemtable(kv quxKV, lastSeq uint64, lastLSN wal.LSN) error {
+func (db *QuxDB) setMemtable(qkey quxKey, val []byte, lastSeq uint64, lastLSN wal.LSN) error {
 retry:
-	if err := db.lsm.activeMemtable().Set(kv.qkey, kv.val); err != nil {
+	if err := db.lsm.activeMemtable().Set(qkey, val); err != nil {
 		if errors.Is(err, memtable.ErrMemtableFull) {
 			db.rolloverMemtable(lastSeq, lastLSN)
 			goto retry
@@ -450,6 +422,16 @@ retry:
 		return err
 	}
 	return nil
+}
+
+// enterReadOnly stops accepting writes after a wal failure and returns the error writes get from now on.
+func (db *QuxDB) enterReadOnly(cause error) error {
+	err := fmt.Errorf("%w: %w", ErrReadOnly, cause)
+	if db.readOnly.CompareAndSwap(nil, &err) {
+		fmt.Printf("db: entering read-only mode: %v\n", cause)
+		metrics.DbReadOnly.Set(1)
+	}
+	return db.Err()
 }
 
 func (db *QuxDB) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) {
@@ -519,6 +501,8 @@ func (db *QuxDB) flushMemtables() {
 		if err := db.lsm.replaceMemtablesWithSSTs(mtsToFlush, newSSTs); err != nil {
 			panic(err)
 		}
+		// the catalog checkpoint is durable here
+		db.wal.RetainFrom(wal.LSN(db.lsm.currentVersion().Checkpoint().LastLSN))
 		fmt.Printf("db: memtable flush flushed=%d queued=%d\n",
 			len(mtsToFlush), db.lsm.immutableMemtableCount())
 

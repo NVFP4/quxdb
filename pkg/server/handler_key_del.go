@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -9,7 +10,7 @@ import (
 	"github.com/yashgorana/quxdb/pkg/db"
 )
 
-func hDeleteKey(db *db.QuxDB) http.HandlerFunc {
+func hDeleteKey(store *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key, err := url.PathUnescape(chi.URLParam(r, "key"))
 		if err != nil {
@@ -21,7 +22,12 @@ func hDeleteKey(db *db.QuxDB) http.HandlerFunc {
 			return
 		}
 
-		if err := db.Delete([]byte(key)); err != nil {
+		err = store.Delete([]byte(key))
+		if errors.Is(err, db.ErrReadOnly) {
+			http.Error(w, fmt.Sprintf("failed to delete key: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to delete key: %v", err), http.StatusInternalServerError)
 			return
 		}
