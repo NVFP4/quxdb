@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/yashgorana/quxdb/pkg/fs"
@@ -56,7 +57,7 @@ func (bb *blockBuilder) Add(key, val []byte) (*blockState, error) {
 	var lastBlock *blockState
 
 	n := bb.canFit(key, val)
-	if n < 0 {
+	if n < 0 && bb.hasKeys() {
 		// cannot fit, flush the current block
 		b, err := bb.writeBlock(false)
 		if err != nil {
@@ -151,9 +152,10 @@ func (bb *blockBuilder) writeBlock(isLastBlock bool) (*blockState, error) {
 	bb.blockState.fileSpan.Size = len(bb.writeBuf) // final size of the block
 
 	if !isLastBlock {
-		// align up to nearest 8 byte boundary
+		// pad to the next page boundary
 		pre := len(bb.writeBuf)
-		bb.writeBuf = bb.writeBuf[:alignUpPage(len(bb.writeBuf))]
+		end := alignUpPage(pre)
+		bb.writeBuf = slices.Grow(bb.writeBuf, end-pre)[:end]
 		// zero out the padding!
 		clear(bb.writeBuf[pre:])
 	} else {
