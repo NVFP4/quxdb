@@ -60,6 +60,12 @@ func corruptRecordLengthCases() []corruptRecordLengthCase {
 			dataLen: 9,
 			want:    ErrRecordInvalidSize,
 		},
+		{
+			name:    "huge data length",
+			recLen:  uint32(encodedRecordSize(0)),
+			dataLen: 1 << 30,
+			want:    ErrRecordInvalidSize,
+		},
 	}
 }
 
@@ -943,52 +949,72 @@ func TestWALReadRejectsStoredLSNMismatch(t *testing.T) {
 	require.ErrorIs(t, err, ErrRecordInvalidLSN)
 }
 
-func TestReadRecordRejectsHugeDataLength(t *testing.T) {
-	buf := make([]byte, encodedRecordLen(nil))
-	h := walRecordHeader{
-		lsn:     uint64(testLSN(0, walHeaderLenPadded)),
-		recLen:  uint32(len(buf)),
-		dataLen: 1 << 30,
-	}
-	_, err := encodeRecordHeader(buf, &h)
+func TestWALReadRejectsBadHeaderCRC(t *testing.T) {
+	w := openTestWAL(t, t.TempDir())
+	lsn := appendOne(t, w, "record")
+
+	buf := encodeTestRecordAt(lsn, []byte("record"))
+	buf[16]++ // corrupt header while leaving hcrc unchanged
+	_, err := w.segments.active.file.WriteAt(buf, int64(testLSNOffset(lsn)))
 	require.NoError(t, err)
 
-	_, _, err = readRecord(bytes.NewReader(buf), 0)
-	require.ErrorIs(t, err, ErrRecordInvalidSize)
-}
-
-func TestReadRecordHeaderRejectsBadCRC(t *testing.T) {
-	buf := encodeTestRecordAt(testLSN(0, walHeaderLenPadded), []byte("record"))
-	buf[16]++ // corrupt header while leaving hcrc unchanged
-
-	_, _, err := readRecordHeader(bytes.NewReader(buf), 0)
+	_, _, err = readAt(w, lsn)
 	require.ErrorIs(t, err, ErrRecordChecksumMismatch)
 }
 
-func TestReadRecordHeaderRejectsBadMagic(t *testing.T) {
-	buf := encodeTestRecordAt(testLSN(0, walHeaderLenPadded), []byte("record"))
-	copy(buf[:4], "NOPE")
-
-	_, _, err := readRecordHeader(bytes.NewReader(buf), 0)
-	require.ErrorIs(t, err, ErrRecordInvalidFormat)
-}
-
-func TestReadRecordHeaderRejectsBadLengths(t *testing.T) {
-	for _, tt := range corruptRecordLengthCases() {
+func TestWALReadRejectsRecordPastCursor(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		keep uint64
+	}{
+		{name: "torn header", keep: walRecordHeaderLen - 1},
+		{name: "short record", keep: uint64(encodedRecordLen([]byte("payload"))) - 8},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			buf := make([]byte, walRecordHeaderLen)
-			h := walRecordHeader{
-				lsn:     uint64(testLSN(0, walHeaderLenPadded)),
-				recLen:  tt.recLen,
-				dataLen: tt.dataLen,
-			}
-			_, err := encodeRecordHeader(buf, &h)
-			require.NoError(t, err)
+			w := openTestWAL(t, t.TempDir())
+			lsn := appendOne(t, w, "payload")
+			w.segments.active.cursor = testLSNOffset(lsn) + tt.keep
 
-			_, _, err = readRecordHeader(bytes.NewReader(buf), 0)
-			require.ErrorIs(t, err, tt.want)
+			_, _, err := readAt(w, lsn)
+			require.ErrorIs(t, err, ErrRecordTorn)
 		})
 	}
+}
+
+func TestWALReplayReadsActiveSegmentAcrossWindows(t *testing.T) {
+	dir := t.TempDir()
+	size := WithSegmentSize(1 << 20)
+	w := openTestWAL(t, dir, size)
+
+	var want []testRecord
+	for i := range 2000 {
+		data := fmt.Sprintf("record-%04d-%s", i, strings.Repeat("x", i%97))
+		lsn, err := w.Append(parts(data), DurabilityWritten)
+		require.NoError(t, err)
+		want = append(want, testRecord{lsn, data})
+	}
+	big := string(patterned(3 * walReadAhead)) // larger than one read-ahead
+	want = append(want, testRecord{appendOne(t, w, big), big})
+	require.NoError(t, w.Close())
+
+	reopened, got := recoverTestWAL(t, dir, 0, size)
+	require.Len(t, reopened.segments.segments, 1)
+	assert.Equal(t, want, got)
+	assert.Nil(t, reopened.segments.active.rbuf)
+}
+
+func TestWALReadAfterTruncateSeesRewrittenTail(t *testing.T) {
+	w := openTestWAL(t, t.TempDir())
+	one, two := appendTwo(t, w, []byte("one"), []byte("two"))
+	_, _, err := readAt(w, one) // reads ahead over two
+	require.NoError(t, err)
+
+	require.NoError(t, w.segments.truncateTail(two))
+	require.Equal(t, two, appendOne(t, w, "six"))
+
+	data, _, err := readAt(w, two)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("six"), data)
 }
 
 func TestReadRecordBytesRejectsTornInput(t *testing.T) {
@@ -998,13 +1024,6 @@ func TestReadRecordBytesRejectsTornInput(t *testing.T) {
 	require.ErrorIs(t, err, ErrRecordTorn)
 
 	_, err = readRecordBytes(buf[:walRecordHeaderLen+1], 0)
-	require.ErrorIs(t, err, ErrRecordTorn)
-}
-
-func TestReadRecordRejectsTruncatedInput(t *testing.T) {
-	buf := encodeTestRecordAt(testLSN(0, walHeaderLenPadded), []byte("record"))
-
-	_, _, err := readRecord(bytes.NewReader(buf[:walRecordHeaderLen+1]), 0)
 	require.ErrorIs(t, err, ErrRecordTorn)
 }
 

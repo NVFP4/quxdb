@@ -3,7 +3,6 @@ package wal
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"hash/crc32"
 	"io"
 
@@ -193,56 +192,6 @@ func decodeRecord(src []byte) (walRecord, int, error) {
 	}
 
 	return rec, int(rec.recLen), nil
-}
-
-func readRecordHeader(r io.ReaderAt, off uint64) (walRecord, int, error) {
-	var rec walRecord
-	var buf [walRecordHeaderLen]byte
-
-	n, err := r.ReadAt(buf[:], int64(off))
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return rec, 0, ErrRecordTorn
-		}
-		return rec, 0, fmt.Errorf("header %w", err)
-	}
-	if n != walRecordHeaderLen {
-		return rec, 0, ErrRecordTorn
-	}
-
-	h, _, err := decodeRecordHeader(buf[:])
-	if err != nil {
-		return rec, 0, err
-	}
-	rec.walRecordHeader = h
-
-	return rec, n, nil
-}
-
-func readRecord(r io.ReaderAt, off uint64) (walRecord, int, error) {
-	h, _, err := readRecordHeader(r, off)
-	if err != nil {
-		return walRecord{}, 0, err
-	}
-
-	buf := make([]byte, h.recLen)
-	n, err := r.ReadAt(buf, int64(off))
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return walRecord{}, 0, ErrRecordTorn
-		}
-		return walRecord{}, 0, err
-	}
-	if n != len(buf) {
-		return walRecord{}, 0, ErrRecordTorn
-	}
-
-	rec, n, err := decodeRecord(buf)
-	if err != nil {
-		return walRecord{}, 0, err
-	}
-
-	return rec, n, nil
 }
 
 func readRecordBytes(src []byte, off uint64) (walRecord, error) {

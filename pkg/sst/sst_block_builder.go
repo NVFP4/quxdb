@@ -212,7 +212,6 @@ func (bb *blockBuilder) reset() {
 	bb.blockState.reset()
 	bb.indexState.reset()
 	bb.blockData.clear()
-	clear(bb.writeBuf)
 	bb.writeBuf = bb.writeBuf[:0]
 }
 

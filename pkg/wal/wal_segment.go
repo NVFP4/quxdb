@@ -22,6 +22,7 @@ const (
 	walSegmentDefaultSize = 64 << 20 // 64MiB
 	walSegmentFlags       = 0
 	walEndMarkerLen       = 8 // zeros after the last record, read as end of segment
+	walReadAhead          = 64 << 10
 )
 
 var (
@@ -54,6 +55,10 @@ type walSegment struct {
 
 	cursor   uint64
 	startLSN LSN
+
+	// read-ahead of the read-write file during replay, walRecord data aliases it
+	rbuf    []byte
+	rbufOff uint64
 
 	walHeader
 }
@@ -332,7 +337,7 @@ func (s *walSegment) read(lsn LSN) (rec walRecord, next LSN, err error) {
 		if s.file == nil {
 			return walRecord{}, 0, fmt.Errorf("wal: active segment id=%d has no file descriptor", s.segId)
 		}
-		return s.readFromReader(s.file, lsn)
+		return s.readFromFile(lsn)
 	case segmentModeReadOnly:
 		mmap, err := s.getMmap()
 		if err != nil {
@@ -344,17 +349,56 @@ func (s *walSegment) read(lsn LSN) (rec walRecord, next LSN, err error) {
 	}
 }
 
-func (s *walSegment) readFromReader(r io.ReaderAt, lsn LSN) (walRecord, LSN, error) {
+func (s *walSegment) readFromFile(lsn LSN) (walRecord, LSN, error) {
 	offset, err := s.offsetFromLSN(lsn)
 	if err != nil {
 		return walRecord{}, 0, err
 	}
 
-	rec, _, err := readRecord(r, offset)
+	src, err := s.window(offset, walRecordHeaderLen)
+	if err != nil {
+		return walRecord{}, 0, err
+	}
+	h, _, err := decodeRecordHeader(src)
+	if err != nil {
+		return walRecord{}, 0, err
+	}
+	if src, err = s.window(offset, int(h.recLen)); err != nil {
+		return walRecord{}, 0, err
+	}
+	rec, _, err := decodeRecord(src)
 	if err != nil {
 		return walRecord{}, 0, err
 	}
 	return s.finishRead(rec, lsn, offset)
+}
+
+// window returns the n bytes at off, preading at least walReadAhead bytes up to the cursor into rbuf on a miss.
+func (s *walSegment) window(off uint64, n int) ([]byte, error) {
+	if off >= s.rbufOff && off+uint64(n) <= s.rbufOff+uint64(len(s.rbuf)) {
+		return s.rbuf[off-s.rbufOff:][:n], nil
+	}
+	size := min(uint64(max(n, walReadAhead)), s.cursor-off)
+	if size < uint64(n) {
+		return nil, ErrRecordTorn
+	}
+	if uint64(cap(s.rbuf)) < size {
+		s.rbuf = make([]byte, size)
+	}
+	m, err := s.file.ReadAt(s.rbuf[:size], int64(off))
+	s.rbuf, s.rbufOff = s.rbuf[:m], off
+	if m < n {
+		if errors.Is(err, io.EOF) {
+			return nil, ErrRecordTorn
+		}
+		return nil, err
+	}
+	return s.rbuf[:n], nil
+}
+
+// dropWindow releases rbuf, needed when replay ends or the bytes under it are rewritten.
+func (s *walSegment) dropWindow() {
+	s.rbuf, s.rbufOff = nil, 0
 }
 
 func (s *walSegment) readFromBytes(src []byte, lsn LSN) (walRecord, LSN, error) {
@@ -451,6 +495,7 @@ func (s *walSegment) seal() error {
 	if err := s.closeFile(); err != nil {
 		return err
 	}
+	s.dropWindow()
 	s.mode = segmentModeReadOnly
 	return nil
 }
@@ -478,6 +523,7 @@ func (s *walSegment) truncate(lsn LSN) error {
 	if err := fs.SyncData(s.file); err != nil {
 		return err
 	}
+	s.dropWindow()
 	s.cursor = offset
 	return nil
 }

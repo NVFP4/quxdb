@@ -2,6 +2,8 @@ package sst
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -55,6 +57,58 @@ func TestBuilderOversizedFirstRecord(t *testing.T) {
 	assert.Equal(t, []byte("two"), tableValue(t, view.Table(meta.ID), []byte("b")))
 	view.Release()
 	require.NoError(t, registry.Close())
+}
+
+func TestBuilderReusedBufferWritesNoStaleBytes(t *testing.T) {
+	dir := t.TempDir()
+	builder, err := NewBuilder(BuilderOpts{Dir: dir, ID: 1, SizeBytes: 4 << 20})
+	require.NoError(t, err)
+
+	// shrinking non-zero values leave stale bytes behind in the reused block buffer
+	var keys, vals [][]byte
+	for i := range 400 {
+		keys = append(keys, fmt.Appendf(nil, "key-%04d", i))
+		vals = append(vals, bytes.Repeat([]byte{byte(i%255) + 1}, 8<<10-i*20))
+		require.NoError(t, builder.Add(Record{OrderedKey: keys[i], FilterKey: keys[i], Value: vals[i]}))
+	}
+	meta, err := builder.Finalize()
+	require.NoError(t, err)
+
+	registry := NewRegistry()
+	view := requireView(t, registry, []*Metadata{meta})
+	table := view.Table(meta.ID)
+	cursor := table.Cursor(nil, nil)
+	for i := range keys {
+		key, val, ok := cursor.Next()
+		require.True(t, ok)
+		require.Equal(t, keys[i], key)
+		require.Equal(t, vals[i], val)
+
+		_, val, ok, err = table.Seek(keys[i])
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, vals[i], val)
+	}
+	_, _, ok := cursor.Next()
+	require.False(t, ok)
+	require.NoError(t, cursor.Err())
+	view.Release()
+	require.NoError(t, registry.Close())
+
+	// blocks are page aligned with zero padding, the last block is followed by the sst header
+	data, err := os.ReadFile(tableFile(meta, ".qdat"))
+	require.NoError(t, err)
+	blocks := 0
+	for off := 0; ; blocks++ {
+		end := off + int(binary.LittleEndian.Uint32(data[off+4:]))
+		if end+sstHeaderLen == len(data) {
+			break
+		}
+		next := alignUpPage(end)
+		require.Equal(t, make([]byte, next-end), data[end:next], "padding after block at %d", off)
+		off = next
+	}
+	require.Greater(t, blocks, 10)
 }
 
 func buildTable(t *testing.T, dir string, id uint64) *Metadata {

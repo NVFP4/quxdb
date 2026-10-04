@@ -60,6 +60,7 @@ func (r *walReader) read(lsn LSN, buf []byte) (data, asm []byte, next LSN, err e
 // replayAfter feeds callback each Record after last and returns the log end or the failing Record's lsn.
 func (r *walReader) replayAfter(last LSN, callback func(Record) error) (LSN, error) {
 	segments := r.segments.segments
+	defer r.segments.active.dropWindow()
 
 	lsn := segments[0].startLSN
 	if last != 0 {
