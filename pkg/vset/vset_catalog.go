@@ -17,7 +17,7 @@ const (
 	catFilename       = "QUXCATALOG"
 	catalogBufferSize = 4 << 10
 	// dead records that trigger a catalog snapshot
-	snapshotThreshold = 1024
+	maxStaleRecords = 1024
 )
 
 var (

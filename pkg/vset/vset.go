@@ -70,7 +70,7 @@ func New(dir string) (*VersionSet, error) {
 		latest:  ver,
 	}
 	vs.lastTableID.Store(lastTableID)
-	vs.snapshotLocked()
+	vs.pruneRecordsLocked()
 	return vs, nil
 }
 
@@ -145,14 +145,14 @@ func (vs *VersionSet) Apply(changes []Change) error {
 			vs.raiseTableID(rec.Table.ID)
 		}
 	}
-	vs.snapshotLocked()
+	vs.pruneRecordsLocked()
 	return nil
 }
 
 // snapshots the catalog once dead records reach the threshold.
-func (vs *VersionSet) snapshotLocked() {
+func (vs *VersionSet) pruneRecordsLocked() {
 	live := vs.latest.Len() + 1
-	if vs.catalog.records-live < snapshotThreshold {
+	if vs.catalog.records-live < maxStaleRecords {
 		return
 	}
 

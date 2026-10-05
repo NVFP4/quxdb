@@ -335,11 +335,11 @@ func TestSnapshotPreservesLiveStateAcrossReopen(t *testing.T) {
 		{Op: OpCheckpoint, Checkpoint: checkpoint},
 	}))
 	before := catalogLines(t, dir)
-	for id := uint64(1000); id < 1000+snapshotThreshold/2; id++ {
+	for id := uint64(1000); id < 1000+maxStaleRecords/2; id++ {
 		require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(id, 0)}}))
 		require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: &sst.Metadata{ID: id}}}))
 	}
-	assert.Greater(t, before+snapshotThreshold, catalogLines(t, dir), "catalog was rewritten")
+	assert.Greater(t, before+maxStaleRecords, catalogLines(t, dir), "catalog was rewritten")
 
 	require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(70, 1)}}))
 	require.NoError(t, vs.Close())
@@ -352,7 +352,7 @@ func TestSnapshotPreservesLiveStateAcrossReopen(t *testing.T) {
 	assertLevelIDs(t, version.Level(1), 3, 70)
 	assertLevelIDs(t, version.Level(2), 9)
 	assert.Equal(t, checkpoint, version.Checkpoint())
-	assert.Greater(t, reopened.NextTableID(), uint64(1000+snapshotThreshold/2-1))
+	assert.Greater(t, reopened.NextTableID(), uint64(1000+maxStaleRecords/2-1))
 }
 
 func TestStaleSnapshotTmpIsDiscardedOnOpen(t *testing.T) {
@@ -370,7 +370,7 @@ func TestStaleSnapshotTmpIsDiscardedOnOpen(t *testing.T) {
 func TestOversizedCatalogIsSnapshottedOnOpen(t *testing.T) {
 	dir := t.TempDir()
 	records := [][]byte{mustEncodeRecord(t, addRecord(testTable(1, 0)))}
-	for id := uint64(2); id < 2+snapshotThreshold; id++ {
+	for id := uint64(2); id < 2+maxStaleRecords; id++ {
 		records = append(records,
 			mustEncodeRecord(t, addRecord(testTable(id, 1))),
 			mustEncodeRecord(t, catalogRecord{Op: OpDelete, Table: &sst.Metadata{ID: id}}),
@@ -383,7 +383,7 @@ func TestOversizedCatalogIsSnapshottedOnOpen(t *testing.T) {
 	t.Cleanup(func() { _ = vs.Close() })
 	assert.Equal(t, 2, catalogLines(t, dir))
 	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
-	assert.Equal(t, uint64(2+snapshotThreshold), vs.NextTableID())
+	assert.Equal(t, uint64(2+maxStaleRecords), vs.NextTableID())
 }
 
 func catalogLines(t *testing.T, dir string) int {
