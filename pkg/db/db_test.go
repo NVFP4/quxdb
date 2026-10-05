@@ -401,3 +401,45 @@ func collectRange(t *testing.T, db *QuxDB, start, end []byte) []string {
 	require.NoError(t, it.Err())
 	return items
 }
+
+func BenchmarkDBSet(b *testing.B) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	os.Stdout = devNull
+	defer func() {
+		os.Stdout = oldStdout
+		devNull.Close()
+	}()
+
+	for _, size := range []int{128, 4 << 10, 16 << 10, 128 << 10, 256 << 10, 512 << 10, 1 << 20} {
+		b.Run(fmt.Sprintf("value=%d", size), func(b *testing.B) {
+			db, err := New(b.TempDir())
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := db.Start(b.Context()); err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() {
+				if err := db.Stop(b.Context()); err != nil {
+					b.Error(err)
+				}
+			})
+			key := []byte("benchmark-key")
+			value := make([]byte, size)
+			if err := db.Set(key, value); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(key) + len(value)))
+			for b.Loop() {
+				if err := db.Set(key, value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
