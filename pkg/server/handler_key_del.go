@@ -23,8 +23,12 @@ func hDeleteKey(store *db.QuxDB) http.HandlerFunc {
 		}
 
 		err = store.Delete([]byte(key))
-		if errors.Is(err, db.ErrReadOnly) {
+		if errors.Is(err, db.ErrDbReadOnly) {
 			http.Error(w, fmt.Sprintf("failed to delete key: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+		if errors.Is(err, db.ErrKeyTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestURITooLong)
 			return
 		}
 		if err != nil {

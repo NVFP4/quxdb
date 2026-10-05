@@ -25,13 +25,13 @@ func TestWALFailureMakesDBReadOnly(t *testing.T) {
 	failActiveSegmentWrites(t, dir)
 
 	err = db.Set([]byte("after"), []byte("v"))
-	require.ErrorIs(t, err, ErrReadOnly)
+	require.ErrorIs(t, err, ErrDbReadOnly)
 	require.ErrorIs(t, err, wal.ErrWALFailed)
-	require.ErrorIs(t, db.Err(), ErrReadOnly)
+	require.ErrorIs(t, db.Err(), ErrDbReadOnly)
 
 	// later writes fail without reaching the wal, reads keep working
-	require.ErrorIs(t, db.Set([]byte("later"), []byte("v")), ErrReadOnly)
-	require.ErrorIs(t, db.Delete([]byte("before")), ErrReadOnly)
+	require.ErrorIs(t, db.Set([]byte("later"), []byte("v")), ErrDbReadOnly)
+	require.ErrorIs(t, db.Delete([]byte("before")), ErrDbReadOnly)
 	got, found, err := db.Get([]byte("before"))
 	require.NoError(t, err)
 	assert.True(t, found)

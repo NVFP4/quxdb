@@ -3,8 +3,7 @@ package db
 import "time"
 
 type writeReq struct {
-	qkey       quxKey
-	keyBuf     []byte // reused across pooled requests, qkey aliases it
+	qkey       quxKey // buffer reused across pooled requests
 	val        []byte
 	res        writeResult
 	enqueuedAt time.Time

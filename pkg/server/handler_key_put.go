@@ -11,8 +11,6 @@ import (
 	"github.com/yashgorana/quxdb/pkg/db"
 )
 
-const maxBodyBytes = 1 << 20 // 1MiB
-
 func hPutKey(store *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key, err := url.PathUnescape(chi.URLParam(r, "key"))
@@ -25,7 +23,7 @@ func hPutKey(store *db.QuxDB) http.HandlerFunc {
 			return
 		}
 
-		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		r.Body = http.MaxBytesReader(w, r.Body, db.MaxValueSize)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -44,8 +42,12 @@ func hPutKey(store *db.QuxDB) http.HandlerFunc {
 
 		// write to store
 		err = store.Set([]byte(key), body)
-		if errors.Is(err, db.ErrReadOnly) {
+		if errors.Is(err, db.ErrDbReadOnly) {
 			http.Error(w, fmt.Sprintf("failed to set value: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+		if errors.Is(err, db.ErrKeyTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestURITooLong)
 			return
 		}
 		if err != nil {

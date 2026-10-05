@@ -43,6 +43,25 @@ func TestQuxDB(t *testing.T) {
 	assert.Nil(t, val)
 }
 
+func TestWriteSizeLimits(t *testing.T) {
+	db := newTestQuxDB(t)
+
+	maxKey := bytes.Repeat([]byte{'k'}, MaxKeySize)
+	require.NoError(t, db.Set(maxKey, bytes.Repeat([]byte{'v'}, MaxValueSize)))
+	_, found, err := db.Get(maxKey)
+	require.NoError(t, err)
+	assert.True(t, found)
+
+	longKey := append(maxKey, 'k')
+	assert.ErrorIs(t, db.Set(longKey, []byte("v")), ErrKeyTooLarge)
+	assert.ErrorIs(t, db.Delete(longKey), ErrKeyTooLarge)
+	assert.ErrorIs(t, db.Set([]byte("key"), make([]byte, MaxValueSize+1)), ErrValueTooLarge)
+
+	_, found, err = db.Get(longKey)
+	require.NoError(t, err)
+	assert.False(t, found)
+}
+
 func TestPointTombstoneShadowsOlderMemtable(t *testing.T) {
 	db := newTestQuxDB(t)
 

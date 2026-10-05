@@ -33,20 +33,25 @@ const (
 	walCorruptionPolicy = wal.StopOnCorruption
 )
 
-// larger buffers are dropped rather than pooled
-const maxPooledKeyCap = 4 << 10
+const (
+	MaxKeySize   = 4 << 10 // largest user key Set or Delete accepts
+	MaxValueSize = 4 << 20 // largest value Set accepts
+)
 
-var seekKeyPool = sync.Pool{New: func() any { return new([]byte) }}
-
-var ErrReadOnly = errors.New("db: read-only after a wal failure")
+var (
+	ErrDbReadOnly    = errors.New("db: read-only after a wal failure")
+	ErrKeyTooLarge   = fmt.Errorf("db: key exceeds %d bytes", MaxKeySize)
+	ErrValueTooLarge = fmt.Errorf("db: value exceeds %d bytes", MaxValueSize)
+)
 
 type QuxDB struct {
 	dataDir string
 	flock   *flock.Flock
 
-	reqPool sync.Pool
-	reqChan chan *writeReq
-	workers sync.WaitGroup
+	reqPool     sync.Pool
+	seekKeyPool sync.Pool
+	reqChan     chan *writeReq
+	workers     sync.WaitGroup
 
 	wal    *wal.WAL
 	walEnc batchEncoder
@@ -99,6 +104,10 @@ func New(dataDir string) (*QuxDB, error) {
 
 	db.reqPool.New = func() any {
 		return newWriteReq()
+	}
+
+	db.seekKeyPool.New = func() any {
+		return new([]byte)
 	}
 
 	return db, nil
@@ -175,9 +184,11 @@ func (db *QuxDB) Set(key []byte, value []byte) error {
 	if err := db.Err(); err != nil {
 		return err
 	}
-	req := db.enqueueWrite(key, value, quxOpSet)
-	res := db.awaitResult(req)
-	return res.err
+	req, err := db.enqueueWrite(key, value, quxOpSet)
+	if err != nil {
+		return err
+	}
+	return db.awaitResult(req).err
 }
 
 // Err returns the error that made the db read-only, or nil.
@@ -189,6 +200,11 @@ func (db *QuxDB) Err() error {
 }
 
 func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
+	// longer keys are never written
+	if len(key) > MaxKeySize {
+		return nil, false, nil
+	}
+
 	start := time.Now()
 	view := db.lsm.acquire()
 	defer view.release()
@@ -196,13 +212,11 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
 	readSeq := db.committedSeq.Load()
 
 	// seek start, the newest version of key at or below readSeq
-	bp := seekKeyPool.Get().(*[]byte)
+	bp := db.seekKeyPool.Get().(*[]byte)
 	lookupKey := appendQuxKey((*bp)[:0], key, readSeq, quxOp(0xFF))
 	defer func() {
-		if cap(lookupKey) <= maxPooledKeyCap {
-			*bp = lookupKey
-			seekKeyPool.Put(bp)
-		}
+		*bp = lookupKey
+		db.seekKeyPool.Put(bp)
 	}()
 
 	for _, mt := range view.memtables {
@@ -269,9 +283,11 @@ func (db *QuxDB) Delete(key []byte) error {
 	if err := db.Err(); err != nil {
 		return err
 	}
-	req := db.enqueueWrite(key, nil, quxOpDelete)
-	res := db.awaitResult(req)
-	return res.err
+	req, err := db.enqueueWrite(key, nil, quxOpDelete)
+	if err != nil {
+		return err
+	}
+	return db.awaitResult(req).err
 }
 
 // Iterator scans a key range, check Err after ranging over All.
@@ -335,26 +351,28 @@ func (it *Iterator) All() iter.Seq2[[]byte, []byte] {
 	}
 }
 
-func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) *writeReq {
+func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) (*writeReq, error) {
+	if len(key) > MaxKeySize {
+		return nil, ErrKeyTooLarge
+	}
+	if len(val) > MaxValueSize {
+		return nil, ErrValueTooLarge
+	}
 	w := db.reqPool.Get().(*writeReq)
-	w.qkey = appendQuxKey(w.keyBuf[:0], key, 0, op)
-	w.keyBuf = w.qkey
+	w.qkey = appendQuxKey(w.qkey[:0], key, 0, op)
 	w.val = val
 	w.res = writeResult{}
 	w.enqueuedAt = time.Now()
 
 	db.reqChan <- w
-	return w
+	return w, nil
 }
 
 func (db *QuxDB) awaitResult(req *writeReq) writeResult {
 	<-req.done
 	res := req.res
 
-	req.qkey, req.val = nil, nil
-	if cap(req.keyBuf) > maxPooledKeyCap {
-		req.keyBuf = nil
-	}
+	req.val = nil
 	req.res = writeResult{}
 	db.reqPool.Put(req)
 
@@ -474,7 +492,7 @@ retry:
 
 // enterReadOnly stops accepting writes after a wal failure and returns the error writes get from now on.
 func (db *QuxDB) enterReadOnly(cause error) error {
-	err := fmt.Errorf("%w: %w", ErrReadOnly, cause)
+	err := fmt.Errorf("%w: %w", ErrDbReadOnly, cause)
 	if db.readOnly.CompareAndSwap(nil, &err) {
 		fmt.Printf("db: entering read-only mode: %v\n", cause)
 		metrics.DbReadOnly.Set(1)
