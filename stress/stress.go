@@ -30,6 +30,7 @@ const (
 var (
 	errFailureThreshold = errors.New("failure threshold reached")
 	errScheduleRange    = errors.New("request schedule exceeds the supported time range")
+	errDurationElapsed  = errors.New("load duration elapsed")
 )
 
 type runConfig struct {
@@ -186,13 +187,16 @@ func (r *runner) start(parent context.Context) error {
 
 	logRunConfig(r.cfg, r.verifyValue)
 	jobs := make(chan scheduledJob, r.cfg.queue)
+	// canceled when the measured phase ends, dropping queued and in-flight requests
+	workCtx, stopWork := context.WithCancel(runCtx)
+	defer stopWork()
 	var workers sync.WaitGroup
 	var workerReady sync.WaitGroup
 	workerReady.Add(r.cfg.workers)
 	for workerID := range r.cfg.workers {
 		workers.Go(func() {
 			workerReady.Done()
-			r.worker(runCtx, workerID, jobs, failures)
+			r.worker(workCtx, workerID, jobs, failures)
 		})
 	}
 	workerReady.Wait()
@@ -229,13 +233,19 @@ func (r *runner) start(parent context.Context) error {
 	)
 	if r.cfg.requests > 0 {
 		activePhase, scheduleErr = r.scheduleFixed(runCtx, jobs, activeStart, r.cfg.requests, true)
+		if scheduleErr == nil {
+			activePhase.tracker.Wait(runCtx)
+		}
 	} else {
-		activePhase, scheduleErr = r.scheduleDuration(runCtx, jobs, activeStart, r.cfg.duration, true)
-	}
-	if scheduleErr == nil {
-		activePhase.tracker.Wait(runCtx)
+		loadCtx, stopLoad := context.WithDeadlineCause(runCtx, activeStart.Add(r.cfg.duration), errDurationElapsed)
+		activePhase, scheduleErr = r.scheduleDuration(loadCtx, jobs, activeStart, r.cfg.duration, true)
+		stopLoad()
+		if errors.Is(scheduleErr, errDurationElapsed) {
+			scheduleErr = nil
+		}
 	}
 
+	stopWork()
 	close(jobs)
 	workers.Wait()
 	completionEnd := time.Now()

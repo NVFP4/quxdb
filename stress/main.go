@@ -114,7 +114,7 @@ func main() {
 
 func addCommonFlags(cmd *cobra.Command, cfg *runConfig) {
 	flags := cmd.PersistentFlags()
-	flags.DurationVarP(&cfg.duration, "duration", "d", cfg.duration, "how long to generate load (example: 10s, 2m)")
+	flags.DurationVarP(&cfg.duration, "duration", "d", cfg.duration, "how long to generate load, then cancel queued and in-flight requests (example: 10s, 2m)")
 	flags.Uint64VarP(&cfg.requests, "requests", "n", cfg.requests, "number of PUT requests to schedule (scan: GET requests)")
 	flags.Float64VarP(&cfg.rate, "rate", "r", cfg.rate, "target total request rate in requests/second (required)")
 	flags.IntVarP(&cfg.workers, "workers", "w", cfg.workers, "maximum concurrent HTTP requests")
