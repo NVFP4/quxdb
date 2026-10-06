@@ -62,7 +62,7 @@ func (d *Decoder) Uint32At(field string, offset int) uint32 {
 		return 0
 	}
 
-	if offset+4 > len(d.data) {
+	if offset < 0 || offset > len(d.data)-4 {
 		d.err = fmt.Errorf(
 			"decode %q at offset %d: need 4 bytes, have %d",
 			field,
@@ -141,7 +141,7 @@ func (d *Decoder) take(field string, n int) []byte {
 		return nil
 	}
 
-	if d.off+n > len(d.data) {
+	if n > len(d.data)-d.off {
 		d.err = fmt.Errorf(
 			"decode %q at offset %d: need %d bytes, have %d",
 			field,

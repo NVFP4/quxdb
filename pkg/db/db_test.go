@@ -406,6 +406,7 @@ func newTestQuxDB(t *testing.T) *QuxDB {
 	db, err := New(t.TempDir())
 	require.NoError(t, err)
 	require.NoError(t, db.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, db.Stop(t.Context())) })
 
 	return db
 }
