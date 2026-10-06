@@ -3,8 +3,11 @@ package db
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -425,16 +428,7 @@ func collectRange(t *testing.T, db *QuxDB, lower, upper []byte) []string {
 }
 
 func BenchmarkDBSet(b *testing.B) {
-	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		b.Fatal(err)
-	}
-	oldStdout := os.Stdout
-	os.Stdout = devNull
-	defer func() {
-		os.Stdout = oldStdout
-		devNull.Close()
-	}()
+	silenceStdout(b)
 
 	for _, size := range []int{128, 4 << 10, 16 << 10, 128 << 10, 256 << 10, 512 << 10, 1 << 20} {
 		b.Run(fmt.Sprintf("value=%d", size), func(b *testing.B) {
@@ -464,4 +458,149 @@ func BenchmarkDBSet(b *testing.B) {
 			}
 		})
 	}
+}
+
+const (
+	benchKeys     = 50_000
+	benchValueLen = 128
+)
+
+// BenchmarkDBReadWrite runs parallel reads while writers update random keys, over memtables and an sst.
+func BenchmarkDBReadWrite(b *testing.B) {
+	silenceStdout(b)
+	keys := make([][]byte, benchKeys)
+	for i := range keys {
+		keys[i] = fmt.Appendf(nil, "user-key-%08d", i)
+	}
+	db := newBenchDB(b, keys)
+
+	for _, writers := range []int{0, 8} {
+		b.Run(fmt.Sprintf("Get/writers=%d", writers), func(b *testing.B) {
+			benchReadWrite(b, db, keys, writers, func(r *rand.Rand) {
+				if _, _, err := db.Get(keys[r.IntN(len(keys))]); err != nil {
+					b.Error(err)
+				}
+			})
+		})
+		b.Run(fmt.Sprintf("Scan50/writers=%d", writers), func(b *testing.B) {
+			benchReadWrite(b, db, keys, writers, func(r *rand.Rand) {
+				n := 0
+				for _, err := range db.Scan(keys[r.IntN(len(keys))], nil) {
+					if err != nil {
+						b.Error(err)
+					}
+					if n++; n == 50 {
+						break
+					}
+				}
+			})
+		})
+	}
+}
+
+// reports reads/s across b.N parallel reads and the writes/s the writers kept up meanwhile
+func benchReadWrite(b *testing.B, db *QuxDB, keys [][]byte, writers int, read func(r *rand.Rand)) {
+	var stop atomic.Bool
+	var writes atomic.Int64
+	var wg sync.WaitGroup
+	val := make([]byte, benchValueLen)
+	for w := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := rand.New(rand.NewPCG(uint64(w), 1))
+			for !stop.Load() {
+				if err := db.Set(keys[r.IntN(len(keys))], val); err != nil {
+					b.Error(err)
+					return
+				}
+				writes.Add(1)
+			}
+		}()
+	}
+
+	var seed atomic.Uint64
+	b.ResetTimer()
+	start := time.Now()
+	b.RunParallel(func(pb *testing.PB) {
+		r := rand.New(rand.NewPCG(seed.Add(1), 2))
+		for pb.Next() {
+			read(r)
+		}
+	})
+	elapsed := time.Since(start)
+	b.StopTimer()
+	stop.Store(true)
+	wg.Wait()
+
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "reads/s")
+	b.ReportMetric(float64(writes.Load())/elapsed.Seconds(), "writes/s")
+}
+
+// loads half the keys into an sst and the rest into memtables, in shuffled order
+func newBenchDB(b *testing.B, keys [][]byte) *QuxDB {
+	db, err := New(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := db.Start(b.Context()); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		if err := db.Stop(b.Context()); err != nil {
+			b.Error(err)
+		}
+	})
+
+	order := rand.New(rand.NewPCG(1, 2)).Perm(len(keys))
+	val := make([]byte, benchValueLen)
+	// concurrent sets share wal syncs, so the load stays fast
+	load := func(order []int) {
+		var wg sync.WaitGroup
+		for w := range 32 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := w; i < len(order); i += 32 {
+					if err := db.Set(keys[order[i]], val); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	load(order[:len(order)/2])
+	flushed := db.committedSeq.Load()
+	db.rolloverMemtable(flushed, db.lastCommittedLSN)
+	for i := range cachedImmutables {
+		if err := db.Set(fmt.Appendf(nil, "pad-%d", i), val); err != nil {
+			b.Fatal(err)
+		}
+		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
+	}
+	for deadline := time.Now().Add(10 * time.Second); quxSeq(db.lsm.currentVersion().Checkpoint().LastSeq) < flushed; {
+		if time.Now().After(deadline) {
+			b.Fatal("memtable flush timed out")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	load(order[len(order)/2:])
+	return db
+}
+
+// silenceStdout drops the db's progress prints for the benchmark's duration
+func silenceStdout(b *testing.B) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	os.Stdout = devNull
+	b.Cleanup(func() {
+		os.Stdout = oldStdout
+		devNull.Close()
+	})
 }

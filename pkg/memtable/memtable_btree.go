@@ -3,7 +3,9 @@ package memtable
 import (
 	"encoding/binary"
 	"math/bits"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/yashgorana/quxdb/pkg/core"
@@ -39,33 +41,35 @@ func (r btreeNodeRef) index() uint32 {
 	return uint32(r) &^ btreeLeafBit
 }
 
-// btreeKVEntry is a record offset in data, a record is a 2-byte keyLen, key, varint valLen, value.
+// btreeKVEntry is a record offset in data.
 type btreeKVEntry uint32
 
+// readers take no lock: one writer at a time makes a node's version odd while it moves items,
+// and readers retry when a version changed under them. appends and value updates keep versions.
 type btreeLeafNode struct {
-	n        uint16
-	nextLeaf uint32
-
-	items [btreeLeafMaxItems]btreeKVEntry
+	version  atomic.Uint32
+	n        atomic.Uint32
+	nextLeaf atomic.Uint32
+	items    [btreeLeafMaxItems]atomic.Uint32 // btreeKVEntry
 }
 
 type btreeInternalNode struct {
-	n uint16
-
+	version atomic.Uint32
+	n       atomic.Uint32
 	// keys[i] is the max key under children[i]
-	keys     [btreeInternalMaxItems]btreeKVEntry
-	children [btreeInternalMaxItems + 1]btreeNodeRef
+	keys     [btreeInternalMaxItems]atomic.Uint32     // btreeKVEntry
+	children [btreeInternalMaxItems + 1]atomic.Uint32 // btreeNodeRef
 }
 
 type btreeMemtable struct {
-	mu            sync.RWMutex
+	mu            sync.Mutex // serializes writers and guards the counters below
 	cmp           Comparator
 	capacityBytes int
-	root          btreeNodeRef
+	root          atomic.Uint32 // btreeNodeRef, 0 until the first Set
 	firstLeaf     uint32
 	lastLeaf      uint32
 
-	// index 0 is nil in both node arrays
+	// fixed-length directories, a chunk is set before any node in it is published, index 0 is nil
 	leafChunks     []*[btreeLeafChunkSize]btreeLeafNode
 	leafCount      uint32
 	internalChunks []*[btreeInternalChunkSize]btreeInternalNode
@@ -89,16 +93,16 @@ func newBTreeMemtable(opts ...Option) Memtable {
 }
 
 func (m *btreeMemtable) initLocked() {
-	if m.root != 0 {
+	if m.root.Load() != 0 {
 		return
 	}
 
-	m.leafChunks = make([]*[btreeLeafChunkSize]btreeLeafNode, 0, 1)
-	m.leafChunks = append(m.leafChunks, new([btreeLeafChunkSize]btreeLeafNode))
-	m.internalChunks = nil
+	// every chunk past the first leaf chunk is charged against capacity
+	m.leafChunks = make([]*[btreeLeafChunkSize]btreeLeafNode, m.capacityBytes/btreeLeafChunkBytes+2)
+	m.leafChunks[0] = new([btreeLeafChunkSize]btreeLeafNode)
+	m.internalChunks = make([]*[btreeInternalChunkSize]btreeInternalNode, m.capacityBytes/btreeInternalChunkBytes+2)
 	m.leafCount = 2     // leaf 0 is nil, leaf 1 is the root
 	m.internalCount = 1 // internal 0 is nil, its chunk allocates on demand
-	m.root = makeLeafRef(1)
 	m.firstLeaf = 1
 	m.lastLeaf = 1
 	m.data = make([]byte, m.capacityBytes)
@@ -106,50 +110,110 @@ func (m *btreeMemtable) initLocked() {
 	m.indexBytes = 0
 	m.sizeBytes = 0
 	m.count = 0
+	m.root.Store(uint32(makeLeafRef(1)))
 }
 
 func (m *btreeMemtable) Get(key []byte) ([]byte, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.root == 0 {
+	if m.root.Load() == 0 {
 		return nil, false
 	}
-
-	leafIdx := m.findLeafLocked(key)
-	leaf := m.leaf(leafIdx)
-
-	pos := m.lowerBoundLeaf(leaf, key)
-	if pos < int(leaf.n) && m.cmp(m.entryKey(leaf.items[pos]), key) == 0 {
-		return m.value(leaf.items[pos]), true
+	for {
+		leafIdx, v := m.descend(key)
+		leaf := m.leaf(leafIdx)
+		pos := m.lowerBoundLeaf(leaf, key)
+		hit := false
+		var e btreeKVEntry
+		if pos < int(leaf.n.Load()) {
+			e = btreeKVEntry(leaf.items[pos].Load())
+			hit = m.cmp(m.entryKey(e), key) == 0
+		}
+		if leaf.version.Load() != v {
+			continue
+		}
+		if hit {
+			return m.value(e), true
+		}
+		return nil, false
 	}
-
-	return nil, false
 }
 
 func (m *btreeMemtable) Seek(key []byte) ([]byte, []byte, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.root == 0 {
+	if m.root.Load() == 0 {
 		return nil, nil, false
 	}
-
-	leafIdx := m.findLeafLocked(key)
-	leaf := m.leaf(leafIdx)
-	pos := m.lowerBoundLeaf(leaf, key)
-
-	for leafIdx != 0 {
-		leaf = m.leaf(leafIdx)
-
-		if pos < int(leaf.n) {
-			e := leaf.items[pos]
+	for {
+		leafIdx, v := m.descend(key)
+		if e, found, ok := m.seekFrom(leafIdx, v, m.lowerBoundLeaf(m.leaf(leafIdx), key)); ok {
+			if !found {
+				return nil, nil, false
+			}
 			return m.entryKey(e), m.value(e), true
 		}
-
-		leafIdx = leaf.nextLeaf
-		pos = 0
 	}
+}
 
-	return nil, nil, false
+// seekFrom returns the first entry at or after pos, walking right, ok is false when a leaf changed
+func (m *btreeMemtable) seekFrom(leafIdx, v uint32, pos int) (e btreeKVEntry, found, ok bool) {
+	for {
+		leaf := m.leaf(leafIdx)
+		if pos < int(leaf.n.Load()) {
+			e = btreeKVEntry(leaf.items[pos].Load())
+			return e, true, leaf.version.Load() == v
+		}
+		next := leaf.nextLeaf.Load()
+		if leaf.version.Load() != v {
+			return 0, false, false
+		}
+		if next == 0 {
+			return 0, false, true
+		}
+		leafIdx, v, pos = next, stableVersion(&m.leaf(next).version), 0
+	}
+}
+
+// descend returns key's leaf and the leaf version it was found under
+func (m *btreeMemtable) descend(key []byte) (leafIdx, version uint32) {
+	for {
+		if leafIdx, version, ok := m.tryDescend(key); ok {
+			return leafIdx, version
+		}
+	}
+}
+
+// each child is entered only after its parent's version is rechecked, so a split under the reader forces a retry
+func (m *btreeMemtable) tryDescend(key []byte) (uint32, uint32, bool) {
+	ref := btreeNodeRef(m.root.Load())
+	v := stableVersion(m.versionOf(ref))
+	if btreeNodeRef(m.root.Load()) != ref {
+		return 0, 0, false
+	}
+	for !ref.isLeaf() {
+		node := m.internal(ref.index())
+		child := btreeNodeRef(node.children[m.childIndex(node, key)].Load())
+		cv := stableVersion(m.versionOf(child))
+		if node.version.Load() != v {
+			return 0, 0, false
+		}
+		ref, v = child, cv
+	}
+	return ref.index(), v, true
+}
+
+func (m *btreeMemtable) versionOf(ref btreeNodeRef) *atomic.Uint32 {
+	if ref.isLeaf() {
+		return &m.leaf(ref.index()).version
+	}
+	return &m.internal(ref.index()).version
+}
+
+// stableVersion waits out a writer moving the node's items
+func stableVersion(v *atomic.Uint32) uint32 {
+	for {
+		if x := v.Load(); x&1 == 0 {
+			return x
+		}
+		runtime.Gosched()
+	}
 }
 
 func (m *btreeMemtable) Set(key, value []byte) error {
@@ -159,7 +223,7 @@ func (m *btreeMemtable) Set(key, value []byte) error {
 		return ErrKeyTooLarge
 	}
 	need := btreeRecordLen(len(key), len(value))
-	if m.root == 0 && need > m.capacityBytes {
+	if m.root.Load() == 0 && need > m.capacityBytes {
 		return ErrMemtableFull
 	}
 	m.initLocked()
@@ -171,25 +235,22 @@ func (m *btreeMemtable) Set(key, value []byte) error {
 	appendRight := false
 
 	// ascending keys append to the last leaf
-	if m.count > 0 && m.lastLeaf != 0 {
+	if m.count > 0 {
 		leaf := m.leaf(m.lastLeaf)
-
-		if leaf.n > 0 {
-			last := leaf.items[leaf.n-1]
-			c := m.cmp(key, m.entryKey(last))
-
+		n := leaf.n.Load()
+		if n > 0 {
+			c := m.cmp(key, m.entryKey(btreeKVEntry(leaf.items[n-1].Load())))
 			if c == 0 {
-				m.updateValueLocked(m.lastLeaf, int(leaf.n)-1, key, value)
+				m.updateValueLocked(m.lastLeaf, int(n)-1, key, value)
 				return nil
 			}
 
 			if c > 0 {
 				appendRight = true
-				if leaf.n < btreeLeafMaxItems {
-					e := m.appendEntryLocked(key, value)
-					leaf = m.leaf(m.lastLeaf)
-					leaf.items[leaf.n] = e
-					leaf.n++
+				if n < btreeLeafMaxItems {
+					// existing items stay put, so readers need no version change
+					leaf.items[n].Store(uint32(m.appendEntryLocked(key, value)))
+					leaf.n.Store(n + 1)
 					m.count++
 					return nil
 				}
@@ -198,8 +259,9 @@ func (m *btreeMemtable) Set(key, value []byte) error {
 	}
 
 	// look for an update only before a split, so updates never grow the tree
-	if m.isFull(m.root) {
-		if m.updateExistingInSubtreeLocked(m.root, key, value) {
+	root := btreeNodeRef(m.root.Load())
+	if m.isFull(root) {
+		if m.updateExistingInSubtreeLocked(root, key, value) {
 			return nil
 		}
 		if err := m.splitRootLocked(appendRight, need); err != nil {
@@ -207,8 +269,7 @@ func (m *btreeMemtable) Set(key, value []byte) error {
 		}
 	}
 
-	nodeRef := m.root
-
+	nodeRef := btreeNodeRef(m.root.Load())
 	for {
 		if nodeRef.isLeaf() {
 			m.insertIntoLeaf(nodeRef.index(), key, value)
@@ -218,7 +279,7 @@ func (m *btreeMemtable) Set(key, value []byte) error {
 		nodeIdx := nodeRef.index()
 		node := m.internal(nodeIdx)
 		childPos := m.childIndex(node, key)
-		childRef := node.children[childPos]
+		childRef := btreeNodeRef(node.children[childPos].Load())
 
 		if m.isFull(childRef) {
 			if m.updateExistingInSubtreeLocked(childRef, key, value) {
@@ -228,13 +289,10 @@ func (m *btreeMemtable) Set(key, value []byte) error {
 				return err
 			}
 
-			node = m.internal(nodeIdx)
-
-			if m.cmp(key, m.entryKey(node.keys[childPos])) > 0 {
+			if m.cmp(key, m.entryKey(btreeKVEntry(node.keys[childPos].Load()))) > 0 {
 				childPos++
 			}
-
-			childRef = node.children[childPos]
+			childRef = btreeNodeRef(node.children[childPos].Load())
 		}
 
 		nodeRef = childRef
@@ -242,15 +300,15 @@ func (m *btreeMemtable) Set(key, value []byte) error {
 }
 
 func (m *btreeMemtable) SizeBytes() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	return m.sizeBytes
 }
 
 func (m *btreeMemtable) Len() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	return m.count
 }
@@ -259,7 +317,7 @@ func (m *btreeMemtable) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.root = 0
+	m.root.Store(0)
 	m.firstLeaf = 0
 	m.lastLeaf = 0
 	m.leafCount = 0
@@ -275,27 +333,39 @@ func (m *btreeMemtable) Clear() {
 
 // fills batch from the first entry >= start, nil start is the first entry
 func (m *btreeMemtable) fillFirstBatch(start []byte, batch *[btreeLeafMaxItems]btreeKVEntry) (nextLeaf uint32, n int) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.root == 0 {
+	if m.root.Load() == 0 {
 		return 0, 0
 	}
-	if start == nil {
-		return m.copyLeafLocked(m.firstLeaf, 0, batch)
+	for {
+		leafIdx, v, pos := m.firstLeaf, stableVersion(&m.leaf(m.firstLeaf).version), 0
+		if start != nil {
+			leafIdx, v = m.descend(start)
+			pos = m.lowerBoundLeaf(m.leaf(leafIdx), start)
+		}
+		if nextLeaf, n, ok := m.copyLeaf(leafIdx, v, pos, batch); ok {
+			return nextLeaf, n
+		}
 	}
-	leafIdx := m.findLeafLocked(start)
-	return m.copyLeafLocked(leafIdx, m.lowerBoundLeaf(m.leaf(leafIdx), start), batch)
 }
 
 func (m *btreeMemtable) fillNextBatch(leafIdx uint32, batch *[btreeLeafMaxItems]btreeKVEntry) (nextLeaf uint32, n int) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.copyLeafLocked(leafIdx, 0, batch)
+	for {
+		v := stableVersion(&m.leaf(leafIdx).version)
+		if nextLeaf, n, ok := m.copyLeaf(leafIdx, v, 0, batch); ok {
+			return nextLeaf, n
+		}
+	}
 }
 
-func (m *btreeMemtable) copyLeafLocked(leafIdx uint32, pos int, batch *[btreeLeafMaxItems]btreeKVEntry) (nextLeaf uint32, n int) {
+// copyLeaf copies items from pos, ok is false when the leaf changed during the copy
+func (m *btreeMemtable) copyLeaf(leafIdx, v uint32, pos int, batch *[btreeLeafMaxItems]btreeKVEntry) (nextLeaf uint32, n int, ok bool) {
 	leaf := m.leaf(leafIdx)
-	return leaf.nextLeaf, copy(batch[:], leaf.items[pos:int(leaf.n)])
+	for i := pos; i < int(leaf.n.Load()); i++ {
+		batch[n] = btreeKVEntry(leaf.items[i].Load())
+		n++
+	}
+	nextLeaf = leaf.nextLeaf.Load()
+	return nextLeaf, n, leaf.version.Load() == v
 }
 
 func (m *btreeMemtable) updateExistingInSubtreeLocked(
@@ -304,13 +374,13 @@ func (m *btreeMemtable) updateExistingInSubtreeLocked(
 ) bool {
 	for !nodeRef.isLeaf() {
 		node := m.internal(nodeRef.index())
-		nodeRef = node.children[m.childIndex(node, key)]
+		nodeRef = btreeNodeRef(node.children[m.childIndex(node, key)].Load())
 	}
 
 	leafIdx := nodeRef.index()
 	leaf := m.leaf(leafIdx)
 	pos := m.lowerBoundLeaf(leaf, key)
-	if pos >= int(leaf.n) || m.cmp(m.entryKey(leaf.items[pos]), key) != 0 {
+	if pos >= int(leaf.n.Load()) || m.cmp(m.entryKey(btreeKVEntry(leaf.items[pos].Load())), key) != 0 {
 		return false
 	}
 
@@ -318,13 +388,11 @@ func (m *btreeMemtable) updateExistingInSubtreeLocked(
 	return true
 }
 
-// records are immutable, updates append a new one
+// records are immutable, updates append a new one and swap the item in one store
 func (m *btreeMemtable) updateValueLocked(leafIdx uint32, pos int, key, value []byte) {
-	leaf := m.leaf(leafIdx)
-	oldLen := len(m.value(leaf.items[pos]))
-	e := m.appendEntryLocked(key, value)
-	leaf = m.leaf(leafIdx)
-	leaf.items[pos] = e
+	item := &m.leaf(leafIdx).items[pos]
+	oldLen := len(m.value(btreeKVEntry(item.Load())))
+	item.Store(uint32(m.appendEntryLocked(key, value)))
 	// appendEntryLocked counted the new pair, drop the replaced one
 	m.sizeBytes -= len(key) + oldLen
 }
@@ -332,24 +400,31 @@ func (m *btreeMemtable) updateValueLocked(leafIdx uint32, pos int, key, value []
 func (m *btreeMemtable) insertIntoLeaf(leafIdx uint32, key, value []byte) {
 	leaf := m.leaf(leafIdx)
 	pos := m.lowerBoundLeaf(leaf, key)
+	n := int(leaf.n.Load())
 
-	if pos < int(leaf.n) && m.cmp(m.entryKey(leaf.items[pos]), key) == 0 {
+	if pos < n && m.cmp(m.entryKey(btreeKVEntry(leaf.items[pos].Load())), key) == 0 {
 		m.updateValueLocked(leafIdx, pos, key, value)
 		return
 	}
 
 	e := m.appendEntryLocked(key, value)
-	leaf = m.leaf(leafIdx)
-
-	copy(leaf.items[pos+1:int(leaf.n)+1], leaf.items[pos:int(leaf.n)])
-	leaf.items[pos] = e
-	leaf.n++
+	beginWrite(&leaf.version)
+	for i := n; i > pos; i-- {
+		leaf.items[i].Store(leaf.items[i-1].Load())
+	}
+	leaf.items[pos].Store(uint32(e))
+	leaf.n.Store(uint32(n + 1))
+	endWrite(&leaf.version)
 	m.count++
 }
 
+// beginWrite and endWrite bracket item moves, an odd version tells readers to wait and retry
+func beginWrite(v *atomic.Uint32) { v.Add(1) }
+func endWrite(v *atomic.Uint32)   { v.Add(1) }
+
 // new node chunks must leave reserve bytes for the pending record
 func (m *btreeMemtable) splitRootLocked(appendRight bool, reserve int) error {
-	oldRoot := m.root
+	oldRoot := btreeNodeRef(m.root.Load())
 	leafNodes := uint32(0)
 	internalNodes := uint32(1) // the new root
 	if oldRoot.isLeaf() {
@@ -385,15 +460,19 @@ func (m *btreeMemtable) splitRootLocked(appendRight bool, reserve int) error {
 		rightRef = makeInternalRef(rightIdx)
 	}
 
-	m.internal(newRoot).children[0] = oldRoot
+	// the old root stays odd until the new root is published, so readers that entered it retry
+	old := m.versionOf(oldRoot)
+	beginWrite(old)
+	m.internal(newRoot).children[0].Store(uint32(oldRoot))
 	m.splitChildWithRight(newRoot, 0, rightRef, appendRight)
-	m.root = makeInternalRef(newRoot)
+	m.root.Store(uint32(makeInternalRef(newRoot)))
+	endWrite(old)
 	return nil
 }
 
 func (m *btreeMemtable) splitChild(parentIdx uint32, childPos int, appendRight bool, reserve int) error {
 	parent := m.internal(parentIdx)
-	childRef := parent.children[childPos]
+	childRef := btreeNodeRef(parent.children[childPos].Load())
 
 	var rightRef btreeNodeRef
 	if childRef.isLeaf() {
@@ -410,10 +489,16 @@ func (m *btreeMemtable) splitChild(parentIdx uint32, childPos int, appendRight b
 		rightRef = makeInternalRef(rightIdx)
 	}
 
+	child := m.versionOf(childRef)
+	beginWrite(&parent.version)
+	beginWrite(child)
 	m.splitChildWithRight(parentIdx, childPos, rightRef, appendRight)
+	endWrite(child)
+	endWrite(&parent.version)
 	return nil
 }
 
+// fills the unpublished right node first, callers keep the parent and child versions odd
 func (m *btreeMemtable) splitChildWithRight(
 	parentIdx uint32,
 	childPos int,
@@ -421,79 +506,68 @@ func (m *btreeMemtable) splitChildWithRight(
 	appendRight bool,
 ) {
 	parent := m.internal(parentIdx)
-	childRef := parent.children[childPos]
-	var leftMax btreeKVEntry
+	childRef := btreeNodeRef(parent.children[childPos].Load())
+	var leftMax uint32
 
 	if childRef.isLeaf() {
 		childIdx := childRef.index()
 		rightIdx := rightRef.index()
 		child := m.leaf(childIdx)
 		right := m.leaf(rightIdx)
-		n := int(child.n)
+		n := int(child.n.Load())
 		mid := (n + 1) / 2
 		if appendRight && childIdx == m.lastLeaf {
 			// ascending inserts won't revisit this leaf, keep it full
 			mid = n
 		}
 
-		right.n = uint16(n - mid)
-		copy(right.items[:int(right.n)], child.items[mid:n])
-		right.nextLeaf = child.nextLeaf
-		child.nextLeaf = rightIdx
+		for i := mid; i < n; i++ {
+			right.items[i-mid].Store(child.items[i].Load())
+		}
+		right.n.Store(uint32(n - mid))
+		right.nextLeaf.Store(child.nextLeaf.Load())
+		child.nextLeaf.Store(rightIdx)
 		if m.lastLeaf == childIdx {
 			m.lastLeaf = rightIdx
 		}
-		child.n = uint16(mid)
+		child.n.Store(uint32(mid))
 
-		leftMax = child.items[mid-1]
+		leftMax = child.items[mid-1].Load()
 	} else {
-		childIdx := childRef.index()
-		rightIdx := rightRef.index()
-		child := m.internal(childIdx)
-		right := m.internal(rightIdx)
-		n := int(child.n)
-		totalChildren := n + 1
-		midChild := totalChildren / 2
+		child := m.internal(childRef.index())
+		right := m.internal(rightRef.index())
+		n := int(child.n.Load())
+		midChild := (n + 1) / 2
 
-		leftMax = child.keys[midChild-1]
-		right.n = uint16(n - midChild)
-		copy(right.keys[:int(right.n)], child.keys[midChild:n])
-		copy(right.children[:int(right.n)+1], child.children[midChild:n+1])
-		child.n = uint16(midChild - 1)
-	}
-
-	parent = m.internal(parentIdx)
-	pN := int(parent.n)
-
-	copy(parent.keys[childPos+1:pN+1], parent.keys[childPos:pN])
-	copy(parent.children[childPos+2:pN+2], parent.children[childPos+1:pN+1])
-
-	parent.keys[childPos] = leftMax
-	parent.children[childPos+1] = rightRef
-	parent.n++
-}
-
-func (m *btreeMemtable) findLeafLocked(key []byte) uint32 {
-	nodeRef := m.root
-
-	for {
-		if nodeRef.isLeaf() {
-			return nodeRef.index()
+		leftMax = child.keys[midChild-1].Load()
+		for i := midChild; i < n; i++ {
+			right.keys[i-midChild].Store(child.keys[i].Load())
 		}
-
-		node := m.internal(nodeRef.index())
-		nodeRef = node.children[m.childIndex(node, key)]
+		for i := midChild; i <= n; i++ {
+			right.children[i-midChild].Store(child.children[i].Load())
+		}
+		right.n.Store(uint32(n - midChild))
+		child.n.Store(uint32(midChild - 1))
 	}
+
+	pN := int(parent.n.Load())
+	for i := pN; i > childPos; i-- {
+		parent.keys[i].Store(parent.keys[i-1].Load())
+		parent.children[i+1].Store(parent.children[i].Load())
+	}
+	parent.keys[childPos].Store(leftMax)
+	parent.children[childPos+1].Store(uint32(rightRef))
+	parent.n.Store(uint32(pN + 1))
 }
 
 func (m *btreeMemtable) childIndex(node *btreeInternalNode, key []byte) int {
-	lo, hi := 0, int(node.n)
+	lo, hi := 0, int(node.n.Load())
 
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
 
 		// children[mid] holds keys <= keys[mid]
-		if m.cmp(key, m.entryKey(node.keys[mid])) <= 0 {
+		if m.cmp(key, m.entryKey(btreeKVEntry(node.keys[mid].Load()))) <= 0 {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -504,12 +578,12 @@ func (m *btreeMemtable) childIndex(node *btreeInternalNode, key []byte) int {
 }
 
 func (m *btreeMemtable) lowerBoundLeaf(node *btreeLeafNode, key []byte) int {
-	lo, hi := 0, int(node.n)
+	lo, hi := 0, int(node.n.Load())
 
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
 
-		if m.cmp(m.entryKey(node.items[mid]), key) >= 0 {
+		if m.cmp(m.entryKey(btreeKVEntry(node.items[mid].Load())), key) >= 0 {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -521,10 +595,10 @@ func (m *btreeMemtable) lowerBoundLeaf(node *btreeLeafNode, key []byte) int {
 
 func (m *btreeMemtable) isFull(ref btreeNodeRef) bool {
 	if ref.isLeaf() {
-		return m.leaf(ref.index()).n == btreeLeafMaxItems
+		return m.leaf(ref.index()).n.Load() == btreeLeafMaxItems
 	}
 
-	return m.internal(ref.index()).n == btreeInternalMaxItems
+	return m.internal(ref.index()).n.Load() == btreeInternalMaxItems
 }
 
 func canAllocateNodes(count, n uint32) bool {
@@ -538,11 +612,14 @@ func (m *btreeMemtable) allocLeaf(reserve int) (uint32, error) {
 
 	idx := m.leafCount
 	chunkIdx := int(idx / btreeLeafChunkSize)
-	if chunkIdx == len(m.leafChunks) {
+	if chunkIdx >= len(m.leafChunks) {
+		return 0, ErrMemtableFull
+	}
+	if m.leafChunks[chunkIdx] == nil {
 		if btreeLeafChunkBytes > m.remaining()-reserve {
 			return 0, ErrMemtableFull
 		}
-		m.leafChunks = append(m.leafChunks, new([btreeLeafChunkSize]btreeLeafNode))
+		m.leafChunks[chunkIdx] = new([btreeLeafChunkSize]btreeLeafNode)
 		m.indexBytes += btreeLeafChunkBytes
 	}
 	m.leafCount++
@@ -557,11 +634,14 @@ func (m *btreeMemtable) allocInternal(reserve int) (uint32, error) {
 
 	idx := m.internalCount
 	chunkIdx := int(idx / btreeInternalChunkSize)
-	if chunkIdx == len(m.internalChunks) {
+	if chunkIdx >= len(m.internalChunks) {
+		return 0, ErrMemtableFull
+	}
+	if m.internalChunks[chunkIdx] == nil {
 		if btreeInternalChunkBytes > m.remaining()-reserve {
 			return 0, ErrMemtableFull
 		}
-		m.internalChunks = append(m.internalChunks, new([btreeInternalChunkSize]btreeInternalNode))
+		m.internalChunks[chunkIdx] = new([btreeInternalChunkSize]btreeInternalNode)
 		m.indexBytes += btreeInternalChunkBytes
 	}
 	m.internalCount++
@@ -572,13 +652,17 @@ func (m *btreeMemtable) allocInternal(reserve int) (uint32, error) {
 // bytes of the node chunks that allocating these nodes would add
 func (m *btreeMemtable) newChunkBytes(leafNodes, internalNodes uint32) int {
 	var n int
-	if leafNodes > 0 && int((m.leafCount+leafNodes-1)/btreeLeafChunkSize) >= len(m.leafChunks) {
+	if leafNodes > 0 && needsChunk(m.leafChunks, int((m.leafCount+leafNodes-1)/btreeLeafChunkSize)) {
 		n += btreeLeafChunkBytes
 	}
-	if internalNodes > 0 && int((m.internalCount+internalNodes-1)/btreeInternalChunkSize) >= len(m.internalChunks) {
+	if internalNodes > 0 && needsChunk(m.internalChunks, int((m.internalCount+internalNodes-1)/btreeInternalChunkSize)) {
 		n += btreeInternalChunkBytes
 	}
 	return n
+}
+
+func needsChunk[C any](dir []*C, i int) bool {
+	return i >= len(dir) || dir[i] == nil
 }
 
 // capacity left for data and node chunks
@@ -594,7 +678,7 @@ func (m *btreeMemtable) internal(i uint32) *btreeInternalNode {
 	return &m.internalChunks[i/btreeInternalChunkSize][i%btreeInternalChunkSize]
 }
 
-// appendEntryLocked requires Set to have preflighted the record's capacity.
+// appendEntryLocked writes a record: a 2-byte keyLen, key, varint valLen, value.
 func (m *btreeMemtable) appendEntryLocked(key, value []byte) btreeKVEntry {
 	off := m.dataLen
 	b := binary.LittleEndian.AppendUint16(m.data[off:off], uint16(len(key)))
@@ -603,17 +687,12 @@ func (m *btreeMemtable) appendEntryLocked(key, value []byte) btreeKVEntry {
 	b = append(b, value...)
 	m.dataLen = off + len(b)
 	m.sizeBytes += len(key) + len(value)
-
 	return btreeKVEntry(off)
 }
 
 // btreeRecordLen returns the data bytes one record takes.
 func btreeRecordLen(keyLen, valueLen int) int {
-	return 2 + keyLen + uvarintLen(valueLen) + valueLen
-}
-
-func uvarintLen(n int) int {
-	return (bits.Len64(uint64(n)|1) + 6) / 7
+	return 2 + keyLen + (bits.Len64(uint64(valueLen)|1)+6)/7 + valueLen
 }
 
 func (m *btreeMemtable) entryKey(e btreeKVEntry) []byte {

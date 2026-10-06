@@ -12,7 +12,7 @@ import (
 
 const (
 	// room for the largest key set plus index overhead
-	benchMemtableCapacity = 16 << 20
+	benchMemtableCapacity = 32 << 20
 	benchRandSeed         = 7129
 	benchKeyLen           = 16
 	benchValueLen         = 128

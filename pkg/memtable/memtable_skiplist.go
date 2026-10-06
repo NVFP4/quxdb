@@ -1,151 +1,130 @@
 package memtable
 
 import (
-	"slices"
+	"encoding/binary"
+	"math/bits"
+	"math/rand/v2"
 	"sync"
-	_ "unsafe"
+	"sync/atomic"
 
 	"github.com/yashgorana/quxdb/pkg/core"
 )
 
 const (
-	// With p=1/2, height 24 covers roughly 16 million entries at the top
-	// level, well above what a typical key/value data arena should hold.
-	slMaxHeight = 24
+	// each extra level is taken with probability 1/2^slLevelBits
+	slLevelBits = 2
+	// 12 levels at p=1/4 cover ~16M nodes
+	slMaxHeight = 12
+
+	slSlotChunkSize = 4096
+	slMaxKeyLen     = 1<<16 - 1 // records store the key length in two bytes
+
+	// record offset, level 0 link and the average extra links, rounded up
+	slNodeBytes = 8 + (4+(1<<slLevelBits)-2)/((1<<slLevelBits)-1)
 )
 
-type slNode struct {
-	keyOff   uint32
-	keyLen   uint32
-	valOff   uint32
-	valLen   uint32
-	next     uint32
-	towerOff uint32
-	height   uint8
-}
-
+// one writer at a time, readers take no lock: nodes never move and are published with atomic stores.
+// node x is slots [x, x+height], the record offset then one link per level.
 type slArena struct {
-	nodes []slNode
-	links []uint32
-	data  []byte
+	buf     []byte // records, fixed length
+	dataLen int
+
+	// fixed-length directory, a chunk is set before any node in it is published
+	slots     []*[slSlotChunkSize]atomic.Uint32
+	slotCount uint32
+
+	head   uint32
+	height atomic.Int32
 }
 
-func newArena(dataCap int) *slArena {
+func newArena(capacity int) *slArena {
+	maxNodes := capacity/slNodeBytes + 2
 	a := &slArena{
-		nodes: make([]slNode, 0, 2),
-		links: make([]uint32, 0, slMaxHeight-1),
-		data:  make([]byte, 0, dataCap),
+		buf: make([]byte, capacity),
+		// 4 slots per node is well above the 2.33 average
+		slots: make([]*[slSlotChunkSize]atomic.Uint32, (4*maxNodes+slMaxHeight)/slSlotChunkSize+2),
 	}
-
-	// node index 0 is reserved as nil.
-	a.nodes = append(a.nodes, slNode{})
-
+	a.slotCount = 1 // slot 0 is the nil node
+	a.head, _ = a.allocNode(slMaxHeight)
+	a.height.Store(1)
 	return a
 }
 
-func (a *slArena) newNode(key, val []byte, height int) uint32 {
-	keyOff := uint32(len(a.data))
-	a.data = append(a.data, key...)
-
-	valOff := uint32(len(a.data))
-	a.data = append(a.data, val...)
-
-	n := slNode{
-		keyOff: keyOff,
-		keyLen: uint32(len(key)),
-		valOff: valOff,
-		valLen: uint32(len(val)),
-		height: uint8(height),
+// allocNode fails only when the slot directory runs out, a node never spans chunks
+func (a *slArena) allocNode(height int) (uint32, bool) {
+	size := uint32(height + 1)
+	x := a.slotCount
+	if x%slSlotChunkSize+size > slSlotChunkSize {
+		x += slSlotChunkSize - x%slSlotChunkSize
 	}
-	if height > 1 {
-		n.towerOff = a.allocLinks(height - 1)
+	chunk := int(x / slSlotChunkSize)
+	if chunk >= len(a.slots) {
+		return 0, false
 	}
-
-	a.nodes = append(a.nodes, n)
-	return uint32(len(a.nodes) - 1)
+	if a.slots[chunk] == nil {
+		a.slots[chunk] = new([slSlotChunkSize]atomic.Uint32)
+	}
+	a.slotCount = x + size
+	return x, true
 }
 
-func (a *slArena) newHead() uint32 {
-	n := slNode{
-		height:   slMaxHeight,
-		towerOff: a.allocLinks(slMaxHeight - 1),
-	}
-	a.nodes = append(a.nodes, n)
-	return uint32(len(a.nodes) - 1)
+func (a *slArena) slot(i uint32) *atomic.Uint32 {
+	return &a.slots[i/slSlotChunkSize][i%slSlotChunkSize]
 }
 
-func (a *slArena) allocLinks(n int) uint32 {
-	off := uint32(len(a.links))
-	a.links = slices.Grow(a.links, n)[:len(a.links)+n]
-	return off
+func (a *slArena) next(x uint32, level int) uint32 {
+	return a.slot(x + 1 + uint32(level)).Load()
+}
+
+func (a *slArena) setNext(x uint32, level int, next uint32) {
+	a.slot(x + 1 + uint32(level)).Store(next)
+}
+
+// appendRecord writes a 2-byte keyLen, key, varint valLen, value, Set checks room first
+func (a *slArena) appendRecord(key, val []byte) uint32 {
+	off := a.dataLen
+	b := binary.LittleEndian.AppendUint16(a.buf[off:off], uint16(len(key)))
+	b = append(b, key...)
+	b = binary.AppendUvarint(b, uint64(len(val)))
+	b = append(b, val...)
+	a.dataLen = off + len(b)
+	return uint32(off)
 }
 
 func (a *slArena) key(i uint32) []byte {
-	n := &a.nodes[i]
-	start := int(n.keyOff)
-	end := start + int(n.keyLen)
-	return a.data[start:end:end]
+	b := a.buf[a.slot(i).Load():]
+	end := 2 + int(binary.LittleEndian.Uint16(b))
+	return b[2:end:end]
 }
 
+// value inlines lengths of one or two bytes, values under 16 KiB
 func (a *slArena) value(i uint32) []byte {
-	n := &a.nodes[i]
-	start := int(n.valOff)
-	end := start + int(n.valLen)
-	return a.data[start:end:end]
-}
-
-func (a *slArena) setValue(i uint32, val []byte) error {
-	n := &a.nodes[i]
-	if len(val) <= int(n.valLen) {
-		start := int(n.valOff)
-		copy(a.data[start:start+len(val)], val)
-		n.valLen = uint32(len(val))
-		return nil
+	b := a.buf[a.slot(i).Load():]
+	off := 2 + int(binary.LittleEndian.Uint16(b))
+	vl, n := int(b[off]), 1
+	if vl >= 0x80 {
+		if c := int(b[off+1]); c < 0x80 {
+			vl, n = vl&0x7f|c<<7, 2
+		} else {
+			u, w := binary.Uvarint(b[off:])
+			vl, n = int(u), w
+		}
 	}
-
-	if len(a.data)+len(val) > cap(a.data) {
-		return ErrMemtableFull
-	}
-
-	valOff := uint32(len(a.data))
-	a.data = append(a.data, val...)
-
-	n.valOff = valOff
-	n.valLen = uint32(len(val))
-	return nil
-}
-
-func (a *slArena) next(i uint32, level int) uint32 {
-	if level == 0 {
-		return a.nodes[i].next
-	}
-	n := &a.nodes[i]
-	return a.links[int(n.towerOff)+level-1]
-}
-
-func (a *slArena) setNext(i uint32, level int, next uint32) {
-	if level == 0 {
-		a.nodes[i].next = next
-		return
-	}
-	n := &a.nodes[i]
-	a.links[int(n.towerOff)+level-1] = next
+	off += n
+	return b[off : off+vl : off+vl]
 }
 
 type slMemtable struct {
-	mu            sync.RWMutex
-	arena         *slArena
+	mu            sync.Mutex // serializes writers and guards the counters below
+	arena         atomic.Pointer[slArena]
 	cmp           Comparator
 	capacityBytes int
-	head          uint32
-	tail          [slMaxHeight]uint32
-	height        int
-	len           int
-	sizeBytes     int
-}
 
-//go:linkname fastrand runtime.fastrand
-func fastrand() uint32
+	tail       [slMaxHeight]uint32 // last node per level, for ascending inserts
+	len        int
+	indexBytes int // nodes and links past the head, counted against capacity
+	sizeBytes  int
+}
 
 func newSkiplistMemtable(opts ...Option) *slMemtable {
 	cfg := makeOptions(opts...)
@@ -157,75 +136,128 @@ func newSkiplistMemtable(opts ...Option) *slMemtable {
 	return m
 }
 
-func (m *slMemtable) initLocked() {
-	if m.arena != nil {
-		return
-	}
-
+func (m *slMemtable) initLocked() *slArena {
 	a := newArena(m.capacityBytes)
-	m.arena = a
-	m.head = a.newHead()
-	m.height = 1
-	m.len = 0
-	m.sizeBytes = 0
-	for i := range slMaxHeight {
-		m.tail[i] = m.head
+	for i := range m.tail {
+		m.tail[i] = a.head
 	}
+	m.len = 0
+	m.indexBytes = 0
+	m.sizeBytes = 0
+	m.arena.Store(a)
+	return a
 }
 
 func (m *slMemtable) Get(key []byte) ([]byte, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.arena == nil {
+	a := m.arena.Load()
+	if a == nil {
 		return nil, false
 	}
 
-	x := m.findGreaterOrEqual(key, nil)
-	if x == 0 || m.cmp(m.arena.key(x), key) != 0 {
+	x := m.findGreaterOrEqual(a, key, nil)
+	if x == 0 || m.cmp(a.key(x), key) != 0 {
 		return nil, false
 	}
-
-	// This aliases arena memory. Caller must not mutate it.
-	return m.arena.value(x), true
+	return a.value(x), true
 }
 
 func (m *slMemtable) Seek(key []byte) ([]byte, []byte, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.arena == nil {
+	a := m.arena.Load()
+	if a == nil {
 		return nil, nil, false
 	}
 
-	x := m.findGreaterOrEqual(key, nil)
+	x := m.findGreaterOrEqual(a, key, nil)
 	if x == 0 {
 		return nil, nil, false
 	}
-
-	return m.arena.key(x), m.arena.value(x), true
+	return a.key(x), a.value(x), true
 }
 
 func (m *slMemtable) Set(key, val []byte) error {
+	if len(key) > slMaxKeyLen {
+		return ErrKeyTooLarge
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.arena == nil && (len(key) > m.capacityBytes || len(val) > m.capacityBytes-len(key)) {
+
+	a := m.arena.Load()
+	if a == nil {
+		if slPairBytes(len(key), len(val)) > m.capacityBytes {
+			return ErrMemtableFull
+		}
+		a = m.initLocked()
+	}
+
+	var prev [slMaxHeight]uint32
+	if m.len > 0 && m.cmp(a.key(m.tail[0]), key) < 0 {
+		prev = m.tail
+	} else {
+		x := m.findGreaterOrEqual(a, key, &prev)
+		if x != 0 && m.cmp(a.key(x), key) == 0 {
+			return m.updateLocked(a, x, key, val)
+		}
+	}
+
+	if slPairBytes(len(key), len(val)) > m.remaining(a) {
 		return ErrMemtableFull
 	}
-	m.initLocked()
+	return m.insertLocked(a, key, val, &prev)
+}
 
-	return m.setLocked(key, val)
+// updates append a new record and repoint the node, held values stay intact
+func (m *slMemtable) updateLocked(a *slArena, x uint32, key, val []byte) error {
+	if slRecordLen(len(key), len(val)) > m.remaining(a) {
+		return ErrMemtableFull
+	}
+	oldLen := len(a.value(x))
+	a.slot(x).Store(a.appendRecord(key, val))
+	m.sizeBytes += len(val) - oldLen
+	return nil
+}
+
+// prev holds the predecessor at every level, the new node is linked bottom-up after its own links are set
+func (m *slMemtable) insertLocked(a *slArena, key, val []byte, prev *[slMaxHeight]uint32) error {
+	h := randomHeight()
+	height := int(a.height.Load())
+	for i := height; i < h; i++ {
+		prev[i] = a.head
+	}
+
+	x, ok := a.allocNode(h)
+	if !ok {
+		return ErrMemtableFull
+	}
+	a.slot(x).Store(a.appendRecord(key, val))
+
+	for i := range h {
+		a.setNext(x, i, a.next(prev[i], i))
+	}
+	for i := range h {
+		a.setNext(prev[i], i, x)
+		if a.next(x, i) == 0 {
+			m.tail[i] = x
+		}
+	}
+	if h > height {
+		a.height.Store(int32(h))
+	}
+
+	m.len++
+	m.indexBytes += slNodeBytes
+	m.sizeBytes += len(key) + len(val)
+	return nil
 }
 
 func (m *slMemtable) SizeBytes() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.sizeBytes
 }
 
 func (m *slMemtable) Len() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.len
 }
 
@@ -233,126 +265,62 @@ func (m *slMemtable) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.arena = nil
-	m.head = 0
+	m.arena.Store(nil)
 	m.tail = [slMaxHeight]uint32{}
-	m.height = 0
 	m.len = 0
+	m.indexBytes = 0
 	m.sizeBytes = 0
 }
 
-func (m *slMemtable) setLocked(key, val []byte) error {
-	if m.len > 0 && m.cmp(m.arena.key(m.tail[0]), key) < 0 {
-		if len(m.arena.data)+len(key)+len(val) > cap(m.arena.data) {
-			return ErrMemtableFull
-		}
-		m.append(key, val)
-		return nil
-	}
-
-	var prev [slMaxHeight]uint32
-	x := m.findGreaterOrEqual(key, &prev)
-	if x != 0 && m.cmp(m.arena.key(x), key) == 0 {
-		oldLen := int(m.arena.nodes[x].valLen)
-		if err := m.arena.setValue(x, val); err != nil {
-			return err
-		}
-		m.sizeBytes += len(val) - oldLen
-		return nil
-	}
-
-	if len(m.arena.data)+len(key)+len(val) > cap(m.arena.data) {
-		return ErrMemtableFull
-	}
-
-	m.insertAfter(key, val, &prev)
-	return nil
+// slRecordLen returns the data bytes one record takes.
+func slRecordLen(keyLen, valueLen int) int {
+	return 2 + keyLen + (bits.Len64(uint64(valueLen)|1)+6)/7 + valueLen
 }
 
-func (m *slMemtable) append(key, val []byte) {
-	h := m.randomHeight()
-	if h > m.height {
-		m.height = h
-	}
-
-	n := m.arena.newNode(key, val, h)
-
-	for i := range h {
-		m.arena.setNext(m.tail[i], i, n)
-		m.tail[i] = n
-	}
-
-	m.len++
-	m.sizeBytes += len(key) + len(val)
+// slPairBytes returns the capacity one key-value pair takes.
+func slPairBytes(keyLen, valueLen int) int {
+	return slRecordLen(keyLen, valueLen) + slNodeBytes
 }
 
-func (m *slMemtable) insertAfter(key, val []byte, prev *[slMaxHeight]uint32) {
-	h := m.randomHeight()
-
-	if h > m.height {
-		for i := m.height; i < h; i++ {
-			prev[i] = m.head
-		}
-		m.height = h
-	}
-
-	n := m.arena.newNode(key, val, h)
-
-	for i := range h {
-		next := m.arena.next(prev[i], i)
-		m.arena.setNext(n, i, next)
-		m.arena.setNext(prev[i], i, n)
-		if next == 0 {
-			m.tail[i] = n
-		}
-	}
-
-	m.len++
-	m.sizeBytes += len(key) + len(val)
+// capacity left for records and nodes
+func (m *slMemtable) remaining(a *slArena) int {
+	return m.capacityBytes - a.dataLen - m.indexBytes
 }
 
-func (m *slMemtable) randomHeight() int {
-	x := fastrand()
-	h := 1
-	// p==0.5
-	for h < slMaxHeight && x&1 == 0 {
-		h++
-		x >>= 1
-	}
-	return h
+// each trailing pair of zero bits adds a level
+func randomHeight() int {
+	return min(bits.TrailingZeros32(rand.Uint32())/slLevelBits+1, slMaxHeight)
 }
 
-func (m *slMemtable) findGreaterOrEqual(key []byte, prev *[slMaxHeight]uint32) uint32 {
-	x := m.head
-	cmp := m.cmp
-
-	for level := m.height - 1; level >= 0; level-- {
+// a node already found >= key is not compared again on lower levels, and it is the result:
+// reloading x's successor could return a smaller key a writer just inserted
+func (m *slMemtable) findGreaterOrEqual(a *slArena, key []byte, prev *[slMaxHeight]uint32) uint32 {
+	x := a.head
+	var found uint32
+	for level := int(a.height.Load()) - 1; level >= 0; level-- {
 		for {
-			next := m.arena.next(x, level)
-			if next == 0 {
+			next := a.next(x, level)
+			if next == 0 || next == found {
 				break
 			}
-
-			if cmp(m.arena.key(next), key) < 0 {
-				x = next
-				continue
+			if m.cmp(a.key(next), key) >= 0 {
+				found = next
+				break
 			}
-
-			break
+			x = next
 		}
-
 		if prev != nil {
 			prev[level] = x
 		}
 	}
-
-	return m.arena.next(x, 0)
+	return found
 }
 
 var _ Memtable = (*slMemtable)(nil)
 
 type slIterator struct {
-	m    *slMemtable
+	a    *slArena
+	cmp  Comparator
 	end  []byte
 	next uint32 // node to return next, 0 once exhausted
 }
@@ -361,17 +329,14 @@ func (c *slIterator) Next() (key, value []byte, ok bool) {
 	if c.next == 0 {
 		return nil, nil, false
 	}
-	c.m.mu.RLock()
-	defer c.m.mu.RUnlock()
 
-	key = c.m.arena.key(c.next)
-	if c.end != nil && c.m.cmp(key, c.end) > 0 {
+	key = c.a.key(c.next)
+	if c.end != nil && c.cmp(key, c.end) > 0 {
 		c.next = 0
 		return nil, nil, false
 	}
-
-	value = c.m.arena.value(c.next)
-	c.next = c.m.arena.next(c.next, 0)
+	value = c.a.value(c.next)
+	c.next = c.a.next(c.next, 0)
 	return key, value, true
 }
 
@@ -380,16 +345,14 @@ func (c *slIterator) Err() error {
 }
 
 func (m *slMemtable) Iterator(start, end []byte) core.Iterator {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	c := &slIterator{m: m, end: end}
+	a := m.arena.Load()
+	c := &slIterator{a: a, cmp: m.cmp, end: end}
 	switch {
-	case m.arena == nil:
+	case a == nil:
 	case start == nil:
-		c.next = m.arena.next(m.head, 0)
+		c.next = a.next(a.head, 0)
 	default:
-		c.next = m.findGreaterOrEqual(start, nil)
+		c.next = m.findGreaterOrEqual(a, start, nil)
 	}
 	return c
 }

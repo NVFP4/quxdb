@@ -19,11 +19,28 @@ type memtableTestImpl struct {
 	new  func(...Option) Memtable
 	// capacity one key-value pair takes
 	recordBytes func(keyLen, valueLen int) int
+	maxKeyLen   int
 }
 
 var memtableTestImpls = []memtableTestImpl{
-	{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }, func(k, v int) int { return k + v }},
-	{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }, btreeRecordLen},
+	{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }, slPairBytes, slMaxKeyLen},
+	{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }, btreeRecordLen, btreeMaxKeyLen},
+}
+
+func TestKeyLengthLimit(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new(WithCapacityBytes(1 << 20))
+			longest := bytes.Repeat([]byte{'k'}, impl.maxKeyLen)
+			require.NoError(t, m.Set(longest, []byte("v")))
+			got, ok := m.Get(longest)
+			require.True(t, ok)
+			assert.Equal(t, []byte("v"), got)
+
+			require.ErrorIs(t, m.Set(append(longest, 'k'), nil), ErrKeyTooLarge)
+			assert.Equal(t, 1, m.Len())
+		})
+	}
 }
 
 func testIteratorValue(version int) []byte {
@@ -78,6 +95,26 @@ func TestGetSet(t *testing.T) {
 			require.True(t, ok)
 			assert.Empty(t, value)
 			assert.Equal(t, 2, m.Len())
+		})
+	}
+}
+
+func TestUpdateKeepsBorrowedValues(t *testing.T) {
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new()
+			require.NoError(t, m.Set([]byte("key"), []byte("original")))
+			borrowed, ok := m.Get([]byte("key"))
+			require.True(t, ok)
+
+			// same-size and shorter updates must not overwrite held bytes
+			require.NoError(t, m.Set([]byte("key"), []byte("replaced")))
+			require.NoError(t, m.Set([]byte("key"), []byte("x")))
+
+			assert.Equal(t, []byte("original"), borrowed)
+			got, ok := m.Get([]byte("key"))
+			require.True(t, ok)
+			assert.Equal(t, []byte("x"), got)
 		})
 	}
 }
@@ -368,7 +405,7 @@ func TestIteratorConcurrency(t *testing.T) {
 					defer wg.Done()
 					<-start
 
-					// Growing updates preserve old borrowed values while new keys reshape the index.
+					// growing updates keep old borrowed values while new keys split nodes
 					for version := 1; version <= versionCount; version++ {
 						value := testIteratorValue(version)
 						for user := writerID; user < userCount; user += writerCount {
@@ -790,6 +827,58 @@ func TestConcurrencyOverwrite(t *testing.T) {
 				require.True(t, ok)
 				assert.Len(t, value, len("value-00-00000000"))
 			}
+		})
+	}
+}
+
+func TestReadsDuringSplits(t *testing.T) {
+	const (
+		keptCount   = 2_000
+		newCount    = 20_000
+		readerCount = 8
+	)
+
+	for _, impl := range memtableTestImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			m := impl.new(WithCapacityBytes(32 << 20))
+			kept := make([][]byte, keptCount)
+			for i := range kept {
+				kept[i] = fmt.Appendf(nil, "key-%08d", i*16)
+				require.NoError(t, m.Set(kept[i], kept[i]))
+			}
+
+			var done atomic.Bool
+			var wg sync.WaitGroup
+			wg.Add(1 + readerCount)
+			go func() {
+				defer wg.Done()
+				defer done.Store(true)
+				// random keys between kept ones split leaves and internal nodes everywhere
+				for _, i := range rand.New(rand.NewSource(7)).Perm(newCount) {
+					if err := m.Set(fmt.Appendf(nil, "key-%08d", i*8+3), nil); err != nil {
+						t.Errorf("Set: %v", err)
+						return
+					}
+				}
+			}()
+
+			for r := range readerCount {
+				go func() {
+					defer wg.Done()
+					for i := r; !done.Load(); i++ {
+						key := kept[i%keptCount]
+						if v, ok := m.Get(key); !ok || !bytes.Equal(v, key) {
+							t.Errorf("Get(%s) = %q, %v", key, v, ok)
+							return
+						}
+						if k, v, ok := m.Seek(key); !ok || !bytes.Equal(k, key) || !bytes.Equal(v, key) {
+							t.Errorf("Seek(%s) = %s, %q, %v", key, k, v, ok)
+							return
+						}
+					}
+				}()
+			}
+			wg.Wait()
 		})
 	}
 }

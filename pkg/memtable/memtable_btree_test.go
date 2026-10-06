@@ -18,15 +18,15 @@ func TestBTreeUpdate(t *testing.T) {
 			require.NoError(t, m.Set(fmt.Appendf(nil, "key-%03d", i), []byte("v")))
 		}
 
-		root := m.root
+		root := m.root.Load()
 		leafCount := m.leafCount
 		internalCount := m.internalCount
 		require.NoError(t, m.Set([]byte("key-010"), []byte("updated")))
 
-		assert.Equal(t, root, m.root)
+		assert.Equal(t, root, m.root.Load())
 		assert.Equal(t, leafCount, m.leafCount)
 		assert.Equal(t, internalCount, m.internalCount)
-		assert.Empty(t, m.internalChunks)
+		assert.Nil(t, m.internalChunks[0])
 		value, ok := m.Get([]byte("key-010"))
 		require.True(t, ok)
 		assert.Equal(t, []byte("updated"), value)
@@ -71,18 +71,6 @@ func TestBTreeUpdateAppendOnly(t *testing.T) {
 	assert.Equal(t, updated, got)
 }
 
-func TestBTreeKeyLengthLimit(t *testing.T) {
-	m := newBTreeMemtable(WithCapacityBytes(1 << 20))
-	longest := bytes.Repeat([]byte{'k'}, btreeMaxKeyLen)
-	require.NoError(t, m.Set(longest, []byte("v")))
-	got, ok := m.Get(longest)
-	require.True(t, ok)
-	assert.Equal(t, []byte("v"), got)
-
-	require.ErrorIs(t, m.Set(append(longest, 'k'), nil), ErrKeyTooLarge)
-	assert.Equal(t, 1, m.Len())
-}
-
 func TestBTreeCapacityCountsNodeChunks(t *testing.T) {
 	const capacity = 1 << 20
 	for _, order := range []string{"ascending", "random"} {
@@ -101,7 +89,17 @@ func TestBTreeCapacityCountsNodeChunks(t *testing.T) {
 				}
 			}
 
-			allocated := (len(m.leafChunks)-1)*btreeLeafChunkBytes + len(m.internalChunks)*btreeInternalChunkBytes
+			allocated := -btreeLeafChunkBytes // the first leaf chunk is free
+			for _, c := range m.leafChunks {
+				if c != nil {
+					allocated += btreeLeafChunkBytes
+				}
+			}
+			for _, c := range m.internalChunks {
+				if c != nil {
+					allocated += btreeInternalChunkBytes
+				}
+			}
 			require.Positive(t, allocated)
 			assert.Equal(t, allocated, m.indexBytes)
 			assert.LessOrEqual(t, m.dataLen+m.indexBytes, capacity)
@@ -120,10 +118,10 @@ func TestBTreeAscending(t *testing.T) {
 	assert.Equal(t, uint32(expectedLeaves+1), m.leafCount)
 
 	leafCount := 0
-	for leafIdx := m.firstLeaf; leafIdx != 0; leafIdx = m.leaf(leafIdx).nextLeaf {
+	for leafIdx := m.firstLeaf; leafIdx != 0; leafIdx = m.leaf(leafIdx).nextLeaf.Load() {
 		leafCount++
 		if leafIdx != m.lastLeaf {
-			assert.Equal(t, uint16(btreeLeafMaxItems), m.leaf(leafIdx).n)
+			assert.Equal(t, uint32(btreeLeafMaxItems), m.leaf(leafIdx).n.Load())
 		}
 	}
 	assert.Equal(t, expectedLeaves, leafCount)
@@ -227,7 +225,7 @@ func TestBTreeClear(t *testing.T) {
 	assert.Nil(t, m.data)
 	assert.Nil(t, m.leafChunks)
 	assert.Nil(t, m.internalChunks)
-	assert.Zero(t, m.root)
+	assert.Zero(t, m.root.Load())
 	assert.Zero(t, m.firstLeaf)
 	assert.Zero(t, m.lastLeaf)
 	assert.Zero(t, m.leafCount)

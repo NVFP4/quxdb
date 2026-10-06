@@ -15,8 +15,23 @@ func TestSkiplistClear(t *testing.T) {
 	}
 
 	m.Clear()
-	assert.Nil(t, m.arena)
-	assert.Zero(t, m.head)
-	assert.Zero(t, m.height)
+	assert.Nil(t, m.arena.Load())
 	assert.Equal(t, [slMaxHeight]uint32{}, m.tail)
+}
+
+func TestSkiplistCapacityCountsNodes(t *testing.T) {
+	const capacity = 1 << 20
+	m := newSkiplistMemtable(WithCapacityBytes(capacity))
+	for i := 0; ; i++ {
+		// small pairs make nodes a large share of the memory
+		if err := m.Set(fmt.Appendf(nil, "k%07d", i), []byte("v")); err != nil {
+			require.ErrorIs(t, err, ErrMemtableFull)
+			break
+		}
+	}
+
+	assert.Equal(t, m.len*slNodeBytes, m.indexBytes)
+	a := m.arena.Load()
+	assert.LessOrEqual(t, a.dataLen+m.indexBytes, capacity)
+	assert.Greater(t, a.dataLen+m.indexBytes, capacity-slPairBytes(8, 1))
 }

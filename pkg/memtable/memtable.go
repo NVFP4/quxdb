@@ -18,7 +18,7 @@ const (
 var (
 	// ErrMemtableFull reports a write that doesn't fit in the capacity.
 	ErrMemtableFull = errors.New("memtable full")
-	// ErrKeyTooLarge reports a key longer than the btree stores.
+	// ErrKeyTooLarge reports a key longer than a memtable stores.
 	ErrKeyTooLarge = errors.New("memtable: key exceeds 65535 bytes")
 )
 
