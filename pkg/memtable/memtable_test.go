@@ -17,11 +17,13 @@ import (
 type memtableTestImpl struct {
 	name string
 	new  func(...Option) Memtable
+	// capacity one key-value pair takes
+	recordBytes func(keyLen, valueLen int) int
 }
 
 var memtableTestImpls = []memtableTestImpl{
-	{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }},
-	{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
+	{"Skiplist", func(opts ...Option) Memtable { return newSkiplistMemtable(opts...) }, func(k, v int) int { return k + v }},
+	{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }, btreeRecordLen},
 }
 
 func testIteratorValue(version int) []byte {
@@ -128,7 +130,7 @@ func TestCapacity(t *testing.T) {
 			})
 
 			t.Run("Zero", func(t *testing.T) {
-				m := impl.new(WithCapacityBytes(0))
+				m := impl.new(WithCapacityBytes(impl.recordBytes(0, 0)))
 				require.NoError(t, m.Set(nil, nil))
 				require.ErrorIs(t, m.Set([]byte("a"), nil), ErrMemtableFull)
 				assert.Equal(t, 1, m.Len())
@@ -140,13 +142,12 @@ func TestCapacity(t *testing.T) {
 			t.Run("Exact", func(t *testing.T) {
 				key := []byte("key")
 				value := []byte("value")
-				capacity := len(key) + len(value)
-				m := impl.new(WithCapacityBytes(capacity))
+				m := impl.new(WithCapacityBytes(impl.recordBytes(len(key), len(value))))
 
 				require.NoError(t, m.Set(key, value))
 				require.ErrorIs(t, m.Set([]byte("x"), nil), ErrMemtableFull)
 				assert.Equal(t, 1, m.Len())
-				assert.Equal(t, capacity, m.SizeBytes())
+				assert.Equal(t, len(key)+len(value), m.SizeBytes())
 				got, ok := m.Get(key)
 				require.True(t, ok)
 				assert.Equal(t, value, got)
@@ -155,7 +156,7 @@ func TestCapacity(t *testing.T) {
 			t.Run("Overflow", func(t *testing.T) {
 				key := []byte("key")
 				value := []byte("value")
-				m := impl.new(WithCapacityBytes(len(key) + len(value) - 1))
+				m := impl.new(WithCapacityBytes(impl.recordBytes(len(key), len(value)) - 1))
 
 				require.ErrorIs(t, m.Set(key, value), ErrMemtableFull)
 				assert.Zero(t, m.Len())
@@ -167,7 +168,7 @@ func TestCapacity(t *testing.T) {
 			t.Run("UpdateOverflow", func(t *testing.T) {
 				key := []byte("key")
 				value := []byte("value")
-				m := impl.new(WithCapacityBytes(len(key) + len(value)))
+				m := impl.new(WithCapacityBytes(impl.recordBytes(len(key), len(value))))
 				require.NoError(t, m.Set(key, value))
 
 				require.ErrorIs(t, m.Set(key, []byte("larger-value")), ErrMemtableFull)
@@ -181,7 +182,7 @@ func TestCapacity(t *testing.T) {
 			t.Run("AfterClear", func(t *testing.T) {
 				key := []byte("key")
 				value := []byte("value")
-				m := impl.new(WithCapacityBytes(len(key) + len(value)))
+				m := impl.new(WithCapacityBytes(impl.recordBytes(len(key), len(value))))
 				require.NoError(t, m.Set(key, value))
 				m.Clear()
 				require.NoError(t, m.Set(key, value))

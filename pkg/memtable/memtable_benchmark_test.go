@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	// test against a fixed-sized memtable
+	// room for the largest key set plus index overhead
 	benchMemtableCapacity = 16 << 20
 	benchRandSeed         = 7129
 	benchKeyLen           = 16
@@ -83,42 +83,6 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 						reportPerKey(b, benchSize)
 					})
-
-					// b.Run("Set/OverwriteSeq", func(b *testing.B) {
-					// 	b.ReportAllocs()
-					// 	for b.Loop() {
-					// 		b.StopTimer()
-					// 		runtime.GC()
-					// 		m := impl.Factory()
-					// 		benchFill(b, m, keys, val)
-					// 		b.StartTimer()
-
-					// 		for i := range keys {
-					// 			if err := m.Set(keys[i], val); err != nil {
-					// 				b.Fatal(err)
-					// 			}
-					// 		}
-					// 	}
-					// 	reportPerKey(b, benchSize)
-					// })
-
-					// b.Run("Set/OverwriteRand", func(b *testing.B) {
-					// 	b.ReportAllocs()
-					// 	for b.Loop() {
-					// 		b.StopTimer()
-					// 		runtime.GC()
-					// 		m := impl.Factory()
-					// 		benchFill(b, m, keys, val)
-					// 		b.StartTimer()
-
-					// 		for i := range perm {
-					// 			if err := m.Set(keys[perm[i]], val); err != nil {
-					// 				b.Fatal(err)
-					// 			}
-					// 		}
-					// 	}
-					// 	reportPerKey(b, benchSize)
-					// })
 
 					b.Run("Get/Seq", func(b *testing.B) {
 						m := impl.Factory()
@@ -329,7 +293,7 @@ func BenchmarkMemtable(b *testing.B) {
 	}
 }
 
-// runs b.N reads across readers while one writer appends new keys, and reports the writer's throughput
+// runs b.N reads across readers against one appending writer, reporting writes/s
 func benchConcurrentRW(b *testing.B, factory func(...Option) Memtable, keys [][]byte, val []byte, read func(m Memtable, i int)) {
 	benchSize := len(keys)
 	for _, readers := range benchReaders {
@@ -369,14 +333,12 @@ func benchConcurrentRW(b *testing.B, factory func(...Option) Memtable, keys [][]
 			wg.Add(readers)
 
 			for r := range readers {
-				// Statically divide b.N so there is no atomic counter
-				// in the read hot path.
+				// a fixed share of b.N per reader, no shared counter
 				n := b.N / readers
 				if r < b.N%readers {
 					n++
 				}
 
-				// Spread readers across the keyspace.
 				offset := r * benchSize / readers
 
 				go func(n, offset int) {
@@ -401,7 +363,6 @@ func benchConcurrentRW(b *testing.B, factory func(...Option) Memtable, keys [][]
 
 			wg.Wait()
 
-			// Stop the measured read phase here.
 			b.StopTimer()
 			elapsed := time.Since(started)
 

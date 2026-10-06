@@ -7,6 +7,7 @@ import (
 	"github.com/yashgorana/quxdb/pkg/core"
 )
 
+// MemTableType selects a memtable implementation.
 type MemTableType int
 
 const (
@@ -14,42 +15,35 @@ const (
 	BTree
 )
 
-var ErrMemtableFull = errors.New("memtable full")
+var (
+	// ErrMemtableFull reports a write that doesn't fit in the capacity.
+	ErrMemtableFull = errors.New("memtable full")
+	// ErrKeyTooLarge reports a key longer than the btree stores.
+	ErrKeyTooLarge = errors.New("memtable: key exceeds 65535 bytes")
+)
 
-// Memtable implementations are safe for concurrent method calls. Borrowed
-// results and individual Iterator values retain the narrower ownership and
-// concurrency rules documented below.
+// Memtable is a sorted in-memory key-value store, safe for concurrent calls.
 type Memtable interface {
-	// Get the value for the key from the memtable.
-	// The result is a borrowed, immutable view with capacity equal to its
-	// length. Clone it before mutation or retaining it across writes.
+	// Get returns key's value, borrowed and stable until Clear.
 	Get(key []byte) (value []byte, ok bool)
 
-	// Seek returns the first key-value pair whose key is >= key.
-	// Results are borrowed, immutable views with capacity equal to their
-	// length. Clone them before mutation or retaining them across writes.
+	// Seek returns the first pair with a key >= key, borrowed and stable until Clear.
 	Seek(key []byte) (foundKey []byte, value []byte, ok bool)
 
-	// Set the key-value pair in the memtable
+	// Set inserts key or replaces its value.
 	Set(key, value []byte) error
 
-	// SizeBytes returns the live size of the key-value pairs in the memtable.
-	// It excludes tree/skiplist metadata and obsolete arena bytes from updates.
+	// SizeBytes returns the live key and value bytes, without index overhead or replaced values.
 	SizeBytes() int
 
-	// Returns the number of key-value pairs in the memtable
+	// Len returns the number of keys.
 	Len() int
 
-	// Clear removes all entries and drops references to data and structural
-	// allocations. The memtable remains reusable and allocates lazily on the
-	// next Set. Clear invalidates borrowed views and iterators, so callers must stop
-	// using them before calling Clear. Reclamation is scheduled by the Go
-	// runtime rather than forced synchronously.
+	// Clear drops every entry and invalidates borrowed views and iterators.
 	Clear()
 
-	// Iterator returns a weakly consistent iterator over the inclusive [start, end]
-	// range. A nil bound is unbounded. end is borrowed and must remain immutable
-	// until the iterator is exhausted.
+	// Iterator returns an iterator over [start, end] that may see later writes, nil bounds are open.
+	// end is borrowed until the iterator is exhausted.
 	Iterator(start, end []byte) core.Iterator
 }
 
@@ -68,28 +62,26 @@ func (t MemTableType) String() string {
 
 // ----------------------------------------------------------------------------
 
+// Option configures a memtable.
 type Option func(*Options)
 
-// Comparator defines the total order used by a memtable. It must be
-// deterministic, transitive, antisymmetric, safe for concurrent calls, and
-// must neither mutate its arguments nor call back into the memtable.
+// Comparator orders keys like bytes.Compare, it must be consistent, concurrency safe and read-only.
 type Comparator func(a, b []byte) int
 
+// Options holds memtable settings.
 type Options struct {
 	Comparator    Comparator
 	CapacityBytes int
 }
 
-// WithComparator sets the memtable ordering. Passing nil causes construction
-// to panic.
+// WithComparator sets the key order, nil panics.
 func WithComparator(cmp Comparator) Option {
 	return func(opts *Options) {
 		opts.Comparator = cmp
 	}
 }
 
-// WithCapacityBytes sets the maximum number of key and value bytes retained
-// by the memtable. Passing a negative capacity causes construction to panic.
+// WithCapacityBytes caps retained bytes, keys and values plus index overhead, negative panics.
 func WithCapacityBytes(capacity int) Option {
 	return func(opts *Options) {
 		opts.CapacityBytes = capacity

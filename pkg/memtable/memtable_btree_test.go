@@ -3,6 +3,7 @@ package memtable
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -54,18 +55,58 @@ func TestBTreeUpdateAppendOnly(t *testing.T) {
 	value := []byte("value")
 	updated := []byte("new")
 	m := newBTreeMemtable(
-		WithCapacityBytes(len(key) + len(value) + len(updated)),
+		WithCapacityBytes(btreeRecordLen(len(key), len(value)) + btreeRecordLen(len(key), len(updated))),
 	).(*btreeMemtable)
 
 	require.NoError(t, m.Set(key, value))
 	dataLen := m.dataLen
+	// updates append a full record, the old one stays readable
 	require.NoError(t, m.Set(key, updated))
-	assert.Equal(t, dataLen+len(updated), m.dataLen)
+	assert.Equal(t, dataLen+btreeRecordLen(len(key), len(updated)), m.dataLen)
+	assert.Equal(t, len(key)+len(updated), m.SizeBytes())
 
 	require.ErrorIs(t, m.Set(key, []byte("x")), ErrMemtableFull)
 	got, ok := m.Get(key)
 	require.True(t, ok)
 	assert.Equal(t, updated, got)
+}
+
+func TestBTreeKeyLengthLimit(t *testing.T) {
+	m := newBTreeMemtable(WithCapacityBytes(1 << 20))
+	longest := bytes.Repeat([]byte{'k'}, btreeMaxKeyLen)
+	require.NoError(t, m.Set(longest, []byte("v")))
+	got, ok := m.Get(longest)
+	require.True(t, ok)
+	assert.Equal(t, []byte("v"), got)
+
+	require.ErrorIs(t, m.Set(append(longest, 'k'), nil), ErrKeyTooLarge)
+	assert.Equal(t, 1, m.Len())
+}
+
+func TestBTreeCapacityCountsNodeChunks(t *testing.T) {
+	const capacity = 1 << 20
+	for _, order := range []string{"ascending", "random"} {
+		t.Run(order, func(t *testing.T) {
+			m := newBTreeMemtable(WithCapacityBytes(capacity)).(*btreeMemtable)
+			ids := rand.New(rand.NewPCG(1, 2)).Perm(1 << 20)
+			for i := 0; ; i++ {
+				id := i
+				if order == "random" {
+					id = ids[i]
+				}
+				// small pairs make the tree a large share of the memory
+				if err := m.Set(fmt.Appendf(nil, "k%07d", id), []byte("v")); err != nil {
+					require.ErrorIs(t, err, ErrMemtableFull)
+					break
+				}
+			}
+
+			allocated := (len(m.leafChunks)-1)*btreeLeafChunkBytes + len(m.internalChunks)*btreeInternalChunkBytes
+			require.Positive(t, allocated)
+			assert.Equal(t, allocated, m.indexBytes)
+			assert.LessOrEqual(t, m.dataLen+m.indexBytes, capacity)
+		})
+	}
 }
 
 func TestBTreeAscending(t *testing.T) {
