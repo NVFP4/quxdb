@@ -286,35 +286,29 @@ func (m *btreeMemtable) Clear() {
 	m.data = nil
 }
 
-func (m *btreeMemtable) fillIteratorBatch(
-	start []byte,
-	leafIdx uint32,
-	batch *[btreeLeafMaxItems]btreeKVEntry,
-) (nextLeaf uint32, n int) {
+// fills batch from the first entry >= start, nil start is the first entry
+func (m *btreeMemtable) fillFirstBatch(start []byte, batch *[btreeLeafMaxItems]btreeKVEntry) (nextLeaf uint32, n int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.root == 0 {
 		return 0, 0
 	}
-
-	pos := 0
-	if leafIdx == 0 {
-		if start != nil {
-			leafIdx = m.findLeafLocked(start)
-			pos = m.lowerBoundLeaf(m.leaf(leafIdx), start)
-		} else {
-			leafIdx = m.firstLeaf
-		}
+	if start == nil {
+		return m.copyLeafLocked(m.firstLeaf, 0, batch)
 	}
+	leafIdx := m.findLeafLocked(start)
+	return m.copyLeafLocked(leafIdx, m.lowerBoundLeaf(m.leaf(leafIdx), start), batch)
+}
 
-	if leafIdx == 0 {
-		return 0, 0
-	}
+func (m *btreeMemtable) fillNextBatch(leafIdx uint32, batch *[btreeLeafMaxItems]btreeKVEntry) (nextLeaf uint32, n int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.copyLeafLocked(leafIdx, 0, batch)
+}
 
+func (m *btreeMemtable) copyLeafLocked(leafIdx uint32, pos int, batch *[btreeLeafMaxItems]btreeKVEntry) (nextLeaf uint32, n int) {
 	leaf := m.leaf(leafIdx)
-	n = copy(batch[:], leaf.items[pos:int(leaf.n)])
-
-	return leaf.nextLeaf, n
+	return leaf.nextLeaf, copy(batch[:], leaf.items[pos:int(leaf.n)])
 }
 
 func (m *btreeMemtable) updateExistingInSubtreeLocked(
@@ -661,22 +655,18 @@ func (m *btreeMemtable) value(e btreeKVEntry) []byte {
 // ----------------------------------------------------------------------------
 
 type btreeIterator struct {
-	m         *btreeMemtable
-	start     []byte
-	end       []byte
-	leafIdx   uint32
-	batch     [btreeLeafMaxItems]btreeKVEntry
-	n         int
-	i         int
-	exhausted bool
+	m       *btreeMemtable
+	end     []byte
+	leafIdx uint32 // next leaf to copy, 0 once the leaves run out
+	batch   [btreeLeafMaxItems]btreeKVEntry
+	n       int
+	i       int
 }
 
 func (m *btreeMemtable) Iterator(start, end []byte) core.Iterator {
-	return &btreeIterator{
-		m:     m,
-		start: start[:len(start):len(start)],
-		end:   end[:len(end):len(end)],
-	}
+	c := &btreeIterator{m: m, end: end}
+	c.leafIdx, c.n = m.fillFirstBatch(start, &c.batch)
+	return c
 }
 
 func (c *btreeIterator) Err() error {
@@ -684,39 +674,22 @@ func (c *btreeIterator) Err() error {
 }
 
 func (c *btreeIterator) Next() (key, value []byte, ok bool) {
-	for {
-		if c.i < c.n {
-			e := c.batch[c.i]
-			c.i++
-			k := c.m.entryKey(e)
-			if c.end != nil && c.m.cmp(k, c.end) > 0 {
-				c.exhausted = true
-				c.n = 0
-				return nil, nil, false
-			}
-			return k, c.m.value(e), true
-		}
-
-		if c.exhausted {
+	for c.i == c.n {
+		if c.leafIdx == 0 {
 			return nil, nil, false
 		}
-
-		nextLeaf, n := c.m.fillIteratorBatch(c.start, c.leafIdx, &c.batch)
-		c.leafIdx = nextLeaf
-		c.n = n
+		c.leafIdx, c.n = c.m.fillNextBatch(c.leafIdx, &c.batch)
 		c.i = 0
-
-		if n == 0 {
-			if nextLeaf == 0 {
-				c.exhausted = true
-				return nil, nil, false
-			}
-			continue
-		}
-		if nextLeaf == 0 {
-			c.exhausted = true
-		}
 	}
+
+	e := c.batch[c.i]
+	c.i++
+	k := c.m.entryKey(e)
+	if c.end != nil && c.m.cmp(k, c.end) > 0 {
+		c.leafIdx, c.n, c.i = 0, 0, 0
+		return nil, nil, false
+	}
+	return k, c.m.value(e), true
 }
 
 var _ core.Iterator = (*btreeIterator)(nil)

@@ -39,7 +39,6 @@ All fixed-size int fields are stored in LE byte-order, except for `magic`
 */
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/yashgorana/quxdb/pkg/core"
@@ -59,34 +58,12 @@ type Block struct {
 	rawIndex []byte // encoded block index (mmap ref)
 }
 
-func (b *Block) Seek(target []byte) (key []byte, value []byte, ok bool, err error) {
-	off, found, err := searchBlockIndex(b.rawIndex, target)
-	if err != nil || !found {
-		return nil, nil, false, err
-	}
-	return b.scan(target, off, uint32(blockHeaderLen+b.recLen))
-}
-
-func (b *Block) scan(target []byte, start uint32, limit uint32) ([]byte, []byte, bool, error) {
-	for offset := start; offset < limit; {
-		rec, err := b.recordAt(offset)
-		if err != nil {
-			return nil, nil, false, fmt.Errorf("block record at %d: %w", offset, err)
-		}
-
-		if bytes.Compare(rec.key, target) >= 0 {
-			return rec.key, rec.value, true, nil
-		}
-
-		offset += uint32(rec.size)
-	}
-
-	return nil, nil, false, nil
-}
-
-func (b *Block) recordAt(offset uint32) (recordView, error) {
-	off := int(offset)
-	return decodeBlockRecord(b.data[off:])
+// Seek returns the first entry at or after target within the block.
+func (b *Block) Seek(target []byte) (key, value []byte, ok bool, err error) {
+	var it blockIterator
+	it.reset(b, target, nil)
+	key, value, ok = it.Next()
+	return key, value, ok, it.Err()
 }
 
 func (b *Block) Iterator(start, end []byte) core.Iterator {

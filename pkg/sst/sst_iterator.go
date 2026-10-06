@@ -1,8 +1,6 @@
 package sst
 
 import (
-	"bytes"
-
 	"github.com/yashgorana/quxdb/pkg/core"
 )
 
@@ -11,51 +9,33 @@ type sstIterator struct {
 	index  *SparseIndex
 
 	// block ordinals, endBlock is exclusive
-	firstBlock int
-	nextBlock  int
-	endBlock   int
-
-	startKey []byte
-	endKey   []byte
+	nextBlock int
+	endBlock  int
+	endKey    []byte
 
 	cur  blockIterator
 	done bool
 	err  error
 }
 
-func newSSTIterator(
-	blocks *MappedBlockData,
-	index *SparseIndex,
-	startKey, endKey []byte,
-) *sstIterator {
-	numBlocks := index.Len()
+func newSSTIterator(blocks *MappedBlockData, index *SparseIndex, startKey, endKey []byte) *sstIterator {
+	c := &sstIterator{}
+	c.init(blocks, index, startKey, endKey)
+	return c
+}
 
-	firstBlock := 0
+// positions on the first block holding startKey, nil startKey is the first block
+func (c *sstIterator) init(blocks *MappedBlockData, index *SparseIndex, startKey, endKey []byte) {
+	*c = sstIterator{blocks: blocks, index: index, endBlock: index.Len(), endKey: endKey}
 	if startKey != nil {
-		firstBlock = index.SearchSpanIndex(startKey)
+		c.nextBlock = index.SearchSpanIndex(startKey)
 	}
-
-	endBlock := numBlocks
 	if endKey != nil {
-		lastBlock := index.SearchSpanIndex(endKey)
-		if lastBlock < numBlocks {
-			endBlock = lastBlock + 1
+		if last := index.SearchSpanIndex(endKey); last < c.endBlock {
+			c.endBlock = last + 1
 		}
 	}
-
-	empty := firstBlock >= endBlock ||
-		startKey != nil && endKey != nil && bytes.Compare(startKey, endKey) > 0
-
-	return &sstIterator{
-		blocks:     blocks,
-		index:      index,
-		firstBlock: firstBlock,
-		nextBlock:  firstBlock,
-		endBlock:   endBlock,
-		startKey:   startKey,
-		endKey:     endKey,
-		done:       empty,
-	}
+	c.advanceBlock(startKey)
 }
 
 func (c *sstIterator) Next() (key, value []byte, ok bool) {
@@ -70,9 +50,7 @@ func (c *sstIterator) Next() (key, value []byte, ok bool) {
 			break
 		}
 
-		if !c.advanceBlock() {
-			break
-		}
+		c.advanceBlock(nil)
 	}
 
 	return nil, nil, false
@@ -82,10 +60,11 @@ func (c *sstIterator) Err() error {
 	return c.err
 }
 
-func (c *sstIterator) advanceBlock() bool {
+// loads the next block, startKey only bounds the first one
+func (c *sstIterator) advanceBlock(startKey []byte) {
 	if c.nextBlock >= c.endBlock {
 		c.done = true
-		return false
+		return
 	}
 
 	blockIdx := c.nextBlock
@@ -95,27 +74,22 @@ func (c *sstIterator) advanceBlock() bool {
 	if !ok {
 		c.err = ErrCorrupt
 		c.done = true
-		return false
+		return
 	}
 
 	block, err := c.blocks.BlockAt(span)
 	if err != nil {
 		c.err = err
 		c.done = true
-		return false
+		return
 	}
 
-	// only the first and last blocks need key bounds
-	var lowerKey, upperKey []byte
-	if blockIdx == c.firstBlock {
-		lowerKey = c.startKey
-	}
+	// only the last block needs the upper bound
+	var endKey []byte
 	if blockIdx+1 == c.endBlock {
-		upperKey = c.endKey
+		endKey = c.endKey
 	}
-
-	c.cur.reset(&block, lowerKey, upperKey)
-	return true
+	c.cur.reset(&block, startKey, endKey)
 }
 
 var _ core.Iterator = (*sstIterator)(nil)

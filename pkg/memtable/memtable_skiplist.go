@@ -352,39 +352,21 @@ func (m *slMemtable) findGreaterOrEqual(key []byte, prev *[slMaxHeight]uint32) u
 var _ Memtable = (*slMemtable)(nil)
 
 type slIterator struct {
-	m         *slMemtable
-	start     []byte
-	end       []byte
-	next      uint32
-	started   bool
-	exhausted bool
+	m    *slMemtable
+	end  []byte
+	next uint32 // node to return next, 0 once exhausted
 }
 
 func (c *slIterator) Next() (key, value []byte, ok bool) {
+	if c.next == 0 {
+		return nil, nil, false
+	}
 	c.m.mu.RLock()
 	defer c.m.mu.RUnlock()
 
-	if c.exhausted || c.m.arena == nil {
-		c.exhausted = true
-		return nil, nil, false
-	}
-
-	if !c.started {
-		c.next = c.m.arena.next(c.m.head, 0)
-		if c.start != nil {
-			c.next = c.m.findGreaterOrEqual(c.start, nil)
-		}
-		c.started = true
-	}
-
-	if c.next == 0 {
-		c.exhausted = true
-		return nil, nil, false
-	}
-
 	key = c.m.arena.key(c.next)
 	if c.end != nil && c.m.cmp(key, c.end) > 0 {
-		c.exhausted = true
+		c.next = 0
 		return nil, nil, false
 	}
 
@@ -398,11 +380,18 @@ func (c *slIterator) Err() error {
 }
 
 func (m *slMemtable) Iterator(start, end []byte) core.Iterator {
-	return &slIterator{
-		m:     m,
-		start: start[:len(start):len(start)],
-		end:   end[:len(end):len(end)],
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	c := &slIterator{m: m, end: end}
+	switch {
+	case m.arena == nil:
+	case start == nil:
+		c.next = m.arena.next(m.head, 0)
+	default:
+		c.next = m.findGreaterOrEqual(start, nil)
 	}
+	return c
 }
 
 var _ core.Iterator = (*slIterator)(nil)

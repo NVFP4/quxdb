@@ -223,97 +223,9 @@ func BenchmarkMemtable(b *testing.B) {
 					})
 
 					b.Run("Get/ConcurrentR+W", func(b *testing.B) {
-						for _, readers := range benchReaders {
-							b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
-								if readers+1 > runtime.NumCPU() {
-									b.Skipf("needs %d CPUs, have %d", readers+1, runtime.NumCPU())
-								}
-								oldProcs := runtime.GOMAXPROCS(readers + 1)
-								b.Cleanup(func() {
-									runtime.GOMAXPROCS(oldProcs)
-								})
-
-								m := impl.Factory(WithCapacityBytes(2 * benchMemtableCapacity))
-								benchFill(b, m, keys, val)
-
-								start := make(chan struct{})
-								var stop atomic.Bool
-								var writes atomic.Uint64
-
-								writerDone := make(chan error, 1)
-								go func() {
-									<-start
-
-									for i := 0; i < benchSize && !stop.Load(); i++ {
-										newKey := benchKey(benchSize + i)
-										if err := m.Set(newKey, val); err != nil {
-											writerDone <- err
-											return
-										}
-										writes.Add(1)
-									}
-
-									writerDone <- nil
-								}()
-
-								var wg sync.WaitGroup
-								wg.Add(readers)
-
-								for r := range readers {
-									// Statically divide b.N so there is no atomic counter
-									// in the read hot path.
-									n := b.N / readers
-									if r < b.N%readers {
-										n++
-									}
-
-									// Spread readers across the keyspace.
-									offset := r * benchSize / readers
-
-									go func(n, offset int) {
-										defer wg.Done()
-										<-start
-
-										i := offset
-										for range n {
-											m.Get(keys[perm[i]])
-
-											i++
-											if i == benchSize {
-												i = 0
-											}
-										}
-									}(n, offset)
-								}
-
-								b.ResetTimer()
-								started := time.Now()
-								close(start)
-
-								wg.Wait()
-
-								// Stop the measured read phase here.
-								b.StopTimer()
-								elapsed := time.Since(started)
-
-								stop.Store(true)
-								err := <-writerDone
-
-								if elapsed > 0 {
-									b.ReportMetric(
-										float64(writes.Load())/elapsed.Seconds(),
-										"writes/s",
-									)
-								}
-
-								if err != nil {
-									b.Fatalf(
-										"writer stopped after %d writes: %v",
-										writes.Load(), err,
-									)
-								}
-							})
-						}
+						benchConcurrentRW(b, impl.Factory, keys, val, func(m Memtable, i int) {
+							m.Get(keys[perm[i]])
+						})
 					})
 
 					b.Run("Seek/Seq", func(b *testing.B) {
@@ -400,7 +312,114 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 						reportPerKey(b, benchSize)
 					})
+
+					b.Run("Iterator/ConcurrentR+W", func(b *testing.B) {
+						benchConcurrentRW(b, impl.Factory, keys, val, func(m Memtable, i int) {
+							it := m.Iterator(keys[perm[i]], nil)
+							for range benchScanLen {
+								if _, _, ok := it.Next(); !ok {
+									return
+								}
+							}
+						})
+					})
 				})
+			}
+		})
+	}
+}
+
+// runs b.N reads across readers while one writer appends new keys, and reports the writer's throughput
+func benchConcurrentRW(b *testing.B, factory func(...Option) Memtable, keys [][]byte, val []byte, read func(m Memtable, i int)) {
+	benchSize := len(keys)
+	for _, readers := range benchReaders {
+		b.Run(fmt.Sprintf("readers=%d", readers), func(b *testing.B) {
+			if readers+1 > runtime.NumCPU() {
+				b.Skipf("needs %d CPUs, have %d", readers+1, runtime.NumCPU())
+			}
+			oldProcs := runtime.GOMAXPROCS(readers + 1)
+			b.Cleanup(func() {
+				runtime.GOMAXPROCS(oldProcs)
+			})
+
+			m := factory(WithCapacityBytes(2 * benchMemtableCapacity))
+			benchFill(b, m, keys, val)
+
+			start := make(chan struct{})
+			var stop atomic.Bool
+			var writes atomic.Uint64
+
+			writerDone := make(chan error, 1)
+			go func() {
+				<-start
+
+				for i := 0; i < benchSize && !stop.Load(); i++ {
+					newKey := benchKey(benchSize + i)
+					if err := m.Set(newKey, val); err != nil {
+						writerDone <- err
+						return
+					}
+					writes.Add(1)
+				}
+
+				writerDone <- nil
+			}()
+
+			var wg sync.WaitGroup
+			wg.Add(readers)
+
+			for r := range readers {
+				// Statically divide b.N so there is no atomic counter
+				// in the read hot path.
+				n := b.N / readers
+				if r < b.N%readers {
+					n++
+				}
+
+				// Spread readers across the keyspace.
+				offset := r * benchSize / readers
+
+				go func(n, offset int) {
+					defer wg.Done()
+					<-start
+
+					i := offset
+					for range n {
+						read(m, i)
+
+						i++
+						if i == benchSize {
+							i = 0
+						}
+					}
+				}(n, offset)
+			}
+
+			b.ResetTimer()
+			started := time.Now()
+			close(start)
+
+			wg.Wait()
+
+			// Stop the measured read phase here.
+			b.StopTimer()
+			elapsed := time.Since(started)
+
+			stop.Store(true)
+			err := <-writerDone
+
+			if elapsed > 0 {
+				b.ReportMetric(
+					float64(writes.Load())/elapsed.Seconds(),
+					"writes/s",
+				)
+			}
+
+			if err != nil {
+				b.Fatalf(
+					"writer stopped after %d writes: %v",
+					writes.Load(), err,
+				)
 			}
 		})
 	}

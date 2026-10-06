@@ -66,11 +66,6 @@ func (c *blockIterator) reset(block *Block, startKey, endKey []byte) {
 		endKey:   endKey,
 	}
 
-	if startKey != nil && endKey != nil && bytes.Compare(startKey, endKey) > 0 {
-		c.recOff = c.recEnd
-		return
-	}
-
 	// Only used when the block has a lower bound.
 	if startKey != nil {
 		seekOff, ok, err := searchBlockIndex(block.rawIndex, startKey)

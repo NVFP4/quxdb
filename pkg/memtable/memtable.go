@@ -48,8 +48,8 @@ type Memtable interface {
 	Clear()
 
 	// Iterator returns a weakly consistent iterator over the inclusive [start, end]
-	// range. A nil bound is unbounded. Bounds are borrowed and must remain
-	// immutable until the iterator is exhausted.
+	// range. A nil bound is unbounded. end is borrowed and must remain immutable
+	// until the iterator is exhausted.
 	Iterator(start, end []byte) core.Iterator
 }
 

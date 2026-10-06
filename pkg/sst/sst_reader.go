@@ -2,19 +2,12 @@ package sst
 
 import "github.com/yashgorana/quxdb/pkg/core"
 
-// Seek returns the entry at or after orderedKey within its indexed block.
+// Seek returns the first entry at or after orderedKey.
 func (s *SST) Seek(orderedKey []byte) (key, value []byte, found bool, err error) {
-	span, ok := s.index.SearchSpan(orderedKey)
-	if !ok {
-		return nil, nil, false, nil
-	}
-
-	block, err := s.data.BlockAt(span)
-	if err != nil {
-		return nil, nil, false, err
-	}
-
-	return block.Seek(orderedKey)
+	var it sstIterator
+	it.init(s.data, &s.index.SparseIndex, orderedKey, nil)
+	key, value, found = it.Next()
+	return key, value, found, it.Err()
 }
 
 // MayContain reports whether the bloom filter may hold filterKey.

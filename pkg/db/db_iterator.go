@@ -104,8 +104,7 @@ type snapshotIterator struct {
 	readSeq        quxSeq
 	dropTombstones bool
 
-	lastUserKey []byte
-	resolved    bool // tells an empty user key apart from none yet
+	lastUserKey []byte // nil until the first key, UserKey never returns nil
 }
 
 func newSnapshotIterator(cur core.Iterator, readSeq quxSeq, dropTombstones bool) *snapshotIterator {
@@ -129,10 +128,10 @@ func (c *snapshotIterator) Next() (key, value []byte, ok bool) {
 		}
 		userKey := qkey.UserKey()
 		// versions sort newest first, so the first visible one wins
-		if c.resolved && bytes.Equal(userKey, c.lastUserKey) {
+		if c.lastUserKey != nil && bytes.Equal(userKey, c.lastUserKey) {
 			continue
 		}
-		c.lastUserKey, c.resolved = userKey, true
+		c.lastUserKey = userKey
 
 		if qkey.Op() == quxOpDelete && c.dropTombstones {
 			continue

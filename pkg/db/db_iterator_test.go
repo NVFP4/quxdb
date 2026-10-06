@@ -122,6 +122,13 @@ func TestSnapshotIteratorResolvesNewestVisibleVersionPerKey(t *testing.T) {
 	assert.Equal(t, []string{"a@9=a9", "b@6=deleted", "c@4=c4"}, drain(t, compaction))
 }
 
+func TestSnapshotIteratorResolvesEmptyUserKey(t *testing.T) {
+	reader := newSnapshotIterator(newMergeIterator([]core.Iterator{
+		&sliceIterator{entries: []entry{set("", 3, "e3"), set("", 1, "e1"), set("a", 2, "a2")}},
+	}), math.MaxUint64, true)
+	assert.Equal(t, []string{"@3=e3", "a@2=a2"}, drain(t, reader))
+}
+
 func TestMergeIteratorStopsOnSourceError(t *testing.T) {
 	broken := errors.New("broken block")
 	cur := newSnapshotIterator(newMergeIterator([]core.Iterator{
