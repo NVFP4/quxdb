@@ -7,11 +7,11 @@ import (
 )
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
-	RenderPlainText(w, r, http.StatusOK, version.DetailedWithApp)
+	renderPlainText(w, r, http.StatusOK, version.DetailedWithApp)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	RenderJSON(w, r, http.StatusOK, map[string]string{
+	renderJSON(w, r, http.StatusOK, map[string]string{
 		"status": "ok",
 	})
 }

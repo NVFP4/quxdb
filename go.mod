@@ -4,7 +4,6 @@ go 1.26.4
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/go-chi/chi/v5 v5.3.2
 	github.com/gofrs/flock v0.13.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/stretchr/testify v1.12.1

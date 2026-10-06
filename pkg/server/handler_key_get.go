@@ -3,24 +3,13 @@ package server
 import (
 	"bufio"
 	"net/http"
-	"net/url"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/yashgorana/quxdb/pkg/db"
 )
 
 func hGetKey(db *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key, err := url.PathUnescape(chi.URLParam(r, "key"))
-		if err != nil {
-			http.Error(w, "invalid key", http.StatusBadRequest)
-			return
-		}
-		if key == "" {
-			http.Error(w, "no key provided", http.StatusBadRequest)
-			return
-		}
-
+		key := r.PathValue("key")
 		value, ok, err := db.Get([]byte(key))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -30,7 +19,7 @@ func hGetKey(db *db.QuxDB) http.HandlerFunc {
 			http.Error(w, "key not found", http.StatusNotFound)
 			return
 		}
-		RenderBinary(w, r, http.StatusOK, value)
+		renderBinary(w, r, http.StatusOK, value)
 	}
 }
 
@@ -53,7 +42,7 @@ func hGetKeys(db *db.QuxDB) http.HandlerFunc {
 		defer bw.Flush()
 		for e, err := range db.Scan(lower, upper) {
 			if err != nil {
-				// status is already sent, so abort instead of ending cleanly
+				// status already sent, abort the response
 				panic(http.ErrAbortHandler)
 			}
 			_, _ = bw.Write(e.Key)

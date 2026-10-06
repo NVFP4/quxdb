@@ -32,16 +32,14 @@ func (s *QuxServer) StartWithContext(ctx context.Context) error {
 	addr := s.config.Addr()
 
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: setupHttpRoutes(s.db),
-		// Configs
+		Addr:              addr,
+		Handler:           setupHttpRoutes(s.db),
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1 MB
+		MaxHeaderBytes:    1 << 20,
 		TLSConfig: &tls.Config{
-			// Force TLS 1.3 to ensure modern ciphers and better performance
 			MinVersion:               tls.VersionTLS13,
 			PreferServerCipherSuites: true,
 			CurvePreferences:         []tls.CurveID{tls.X25519, tls.CurveP256},
@@ -57,7 +55,7 @@ func (s *QuxServer) StartWithContext(ctx context.Context) error {
 	go func() {
 		fmt.Printf("quxdb server: http://%s\n", addr)
 		if srvErr := srv.Serve(ln); srvErr != nil && srvErr != http.ErrServerClosed {
-			errCh <- srvErr // http.Serve crashed
+			errCh <- srvErr
 		}
 	}()
 
@@ -74,13 +72,12 @@ func (s *QuxServer) StartWithContext(ctx context.Context) error {
 
 		fmt.Println("server context cancelled")
 
-		// give 60s for server to stop and drain connections
 		stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		// first stop server
+		// stop the server before the db
 		if err := srv.Shutdown(stopCtx); err != nil {
-			_ = srv.Close() // force close if graceful shutdown fails
+			_ = srv.Close()
 			errs = append(errs, err)
 		}
 		fmt.Println("server stopped")
