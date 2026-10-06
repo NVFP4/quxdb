@@ -38,12 +38,12 @@ func hGetKeys(db *db.QuxDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 
-		var start, end []byte
-		if s := q.Get("start"); s != "" {
-			start = []byte(s)
+		var lower, upper []byte
+		if s := q.Get("lower"); s != "" {
+			lower = []byte(s)
 		}
-		if e := q.Get("end"); e != "" {
-			end = []byte(e)
+		if s := q.Get("upper"); s != "" {
+			upper = []byte(s)
 		}
 
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -51,16 +51,15 @@ func hGetKeys(db *db.QuxDB) http.HandlerFunc {
 
 		bw := bufio.NewWriter(w)
 		defer bw.Flush()
-		it := db.Iter(start, end)
-		for key, value := range it.All() {
-			_, _ = bw.Write(key)
+		for e, err := range db.Scan(lower, upper) {
+			if err != nil {
+				// status is already sent, so abort instead of ending cleanly
+				panic(http.ErrAbortHandler)
+			}
+			_, _ = bw.Write(e.Key)
 			_ = bw.WriteByte('\t')
-			_, _ = bw.Write(value)
+			_, _ = bw.Write(e.Value)
 			_ = bw.WriteByte('\n')
-		}
-		if it.Err() != nil {
-			// status is already sent, so abort instead of ending cleanly
-			panic(http.ErrAbortHandler)
 		}
 	}
 }

@@ -95,11 +95,11 @@ func TestCloseWaitsForBackgroundRemoval(t *testing.T) {
 
 func tableValue(t *testing.T, table *SST, target []byte) []byte {
 	t.Helper()
-	cursor := table.Cursor(nil, nil)
+	it := table.Iterator(nil, nil)
 	for {
-		key, value, ok := cursor.Next()
+		key, value, ok := it.Next()
 		if !ok {
-			require.NoError(t, cursor.Err())
+			require.NoError(t, it.Err())
 			return nil
 		}
 		if bytes.Equal(key, target) {

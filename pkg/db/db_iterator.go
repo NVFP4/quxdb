@@ -6,8 +6,8 @@ import (
 	"github.com/yashgorana/quxdb/pkg/core"
 )
 
-// mergeCursor k-way merges sources with a loser tree, ties go to the earlier source.
-type mergeCursor struct {
+// mergeIterator k-way merges sources with a loser tree, ties go to the earlier source.
+type mergeIterator struct {
 	sources []mergeSource
 	tree    []int // [0] is the winner, the rest hold losers
 	err     error
@@ -15,15 +15,15 @@ type mergeCursor struct {
 }
 
 type mergeSource struct {
-	cur   core.Cursor
+	cur   core.Iterator
 	key   []byte
 	value []byte
 	done  bool
 }
 
-func newMergeCursor(sources []core.Cursor) *mergeCursor {
+func newMergeIterator(sources []core.Iterator) *mergeIterator {
 	k := len(sources)
-	m := &mergeCursor{sources: make([]mergeSource, k), tree: make([]int, max(k, 1))}
+	m := &mergeIterator{sources: make([]mergeSource, k), tree: make([]int, max(k, 1))}
 	for i, cur := range sources {
 		m.sources[i].cur = cur
 		if !m.sources[i].next() {
@@ -44,7 +44,7 @@ func newMergeCursor(sources []core.Cursor) *mergeCursor {
 }
 
 // entries stay valid until the next call.
-func (m *mergeCursor) Next() (key, value []byte, ok bool) {
+func (m *mergeIterator) Next() (key, value []byte, ok bool) {
 	if m.err != nil || len(m.sources) == 0 {
 		return nil, nil, false
 	}
@@ -67,7 +67,7 @@ func (m *mergeCursor) Next() (key, value []byte, ok bool) {
 	return winner.key, winner.value, true
 }
 
-func (m *mergeCursor) Err() error {
+func (m *mergeIterator) Err() error {
 	return m.err
 }
 
@@ -78,7 +78,7 @@ func (s *mergeSource) next() bool {
 }
 
 // walks w's leaf to the root, leaving losers behind.
-func (m *mergeCursor) replay(w int) {
+func (m *mergeIterator) replay(w int) {
 	k := len(m.sources)
 	for node := (w + k) / 2; node > 0; node /= 2 {
 		if loser := m.tree[node]; w != -1 && (loser == -1 || m.beats(loser, w)) {
@@ -89,7 +89,7 @@ func (m *mergeCursor) replay(w int) {
 }
 
 // exhausted sources lose, ties go to the earlier source.
-func (m *mergeCursor) beats(a, b int) bool {
+func (m *mergeIterator) beats(a, b int) bool {
 	sa, sb := &m.sources[a], &m.sources[b]
 	if sa.done || sb.done {
 		return !sa.done || sb.done && a < b
@@ -98,21 +98,25 @@ func (m *mergeCursor) beats(a, b int) bool {
 	return cmp < 0 || cmp == 0 && a < b
 }
 
-// mvccCursor yields each user key's newest version at or below readSeq.
-type mvccCursor struct {
-	cur            core.Cursor
+// snapshotIterator yields each user key's newest version at or below readSeq from an iterator sorted by quxKey.
+type snapshotIterator struct {
+	cur            core.Iterator
 	readSeq        quxSeq
-	keepTombstones bool
+	dropTombstones bool
 
 	lastUserKey []byte
 	resolved    bool // tells an empty user key apart from none yet
 }
 
-func newMVCCCursor(merged core.Cursor, readSeq quxSeq, keepTombstones bool) *mvccCursor {
-	return &mvccCursor{cur: merged, readSeq: readSeq, keepTombstones: keepTombstones}
+func newSnapshotIterator(cur core.Iterator, readSeq quxSeq, dropTombstones bool) *snapshotIterator {
+	return &snapshotIterator{
+		cur:            cur,
+		readSeq:        readSeq,
+		dropTombstones: dropTombstones,
+	}
 }
 
-func (c *mvccCursor) Next() (key, value []byte, ok bool) {
+func (c *snapshotIterator) Next() (key, value []byte, ok bool) {
 	for {
 		key, value, ok = c.cur.Next()
 		if !ok {
@@ -130,13 +134,13 @@ func (c *mvccCursor) Next() (key, value []byte, ok bool) {
 		}
 		c.lastUserKey, c.resolved = userKey, true
 
-		if qkey.Op() == quxOpDelete && !c.keepTombstones {
+		if qkey.Op() == quxOpDelete && c.dropTombstones {
 			continue
 		}
 		return key, value, true
 	}
 }
 
-func (c *mvccCursor) Err() error {
+func (c *snapshotIterator) Err() error {
 	return c.cur.Err()
 }

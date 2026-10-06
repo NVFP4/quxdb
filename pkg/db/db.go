@@ -61,7 +61,7 @@ type QuxDB struct {
 	lsm       *lsmState
 	compactor *lsmCompactor
 
-	committedSeq     atomic.Uint64
+	committedSeq     atomicSeq
 	writeSeq         quxSeq
 	lastCommittedLSN wal.LSN
 	readOnly         atomic.Pointer[error] // set once by the first wal failure
@@ -123,7 +123,7 @@ func (db *QuxDB) Start(ctx context.Context) error {
 	}
 
 	checkpoint := db.lsm.currentVersion().Checkpoint()
-	lastSeq := checkpoint.LastSeq
+	lastSeq := quxSeq(checkpoint.LastSeq)
 	lastLSN := wal.LSN(checkpoint.LastLSN)
 	db.committedSeq.Store(lastSeq)
 
@@ -150,7 +150,7 @@ func (db *QuxDB) Start(ctx context.Context) error {
 	}
 	fmt.Println("db: wal recover completed")
 
-	db.writeSeq = quxSeq(lastSeq)
+	db.writeSeq = lastSeq
 	db.lastCommittedLSN = lastLSN
 	db.wal.RetainFrom(wal.LSN(checkpoint.LastLSN))
 
@@ -229,7 +229,8 @@ func (db *QuxDB) Get(key []byte) ([]byte, bool, error) {
 	}
 
 	var probed, negatives, falsePositives int
-	for table := range view.tableCandidates(key) {
+	for meta := range view.version.PointLookup(key) {
+		table := view.tables.Table(meta.ID)
 		probed++
 		if !table.MayContain(key) {
 			negatives++
@@ -290,65 +291,54 @@ func (db *QuxDB) Delete(key []byte) error {
 	return db.awaitResult(req).err
 }
 
-// Iterator scans a key range, check Err after ranging over All.
-type Iterator struct {
-	db         *QuxDB
-	start, end []byte
-	err        error
+// Entry is a key-value pair borrowed from a scan until its next iteration.
+type Entry struct {
+	Key, Value []byte
 }
 
-// Iter returns an iterator over live keys in [start, end], nil bounds are open.
-func (db *QuxDB) Iter(start, end []byte) *Iterator {
-	return &Iterator{db: db, start: start, end: end}
-}
-
-// Err returns the read error that ended the last All, if any.
-func (it *Iterator) Err() error {
-	return it.err
-}
-
-// All yields live keys in order from a view pinned for the whole range.
-func (it *Iterator) All() iter.Seq2[[]byte, []byte] {
-	return func(yield func([]byte, []byte) bool) {
-		it.err = nil
-		start, end := it.start, it.end
-		if start != nil && end != nil && bytes.Compare(start, end) > 0 {
+// Scan yields live entries with keys in [lowerKey, upperKey) from one pinned view, nil bounds are open.
+// a read error ends the scan as the final pair.
+func (db *QuxDB) Scan(lowerKey, upperKey []byte) iter.Seq2[Entry, error] {
+	return func(yield func(Entry, error) bool) {
+		if lowerKey != nil && upperKey != nil && bytes.Compare(lowerKey, upperKey) >= 0 {
 			return
 		}
 
-		view := it.db.lsm.acquire()
+		view := db.lsm.acquire()
 		defer view.release()
-		readSeq := it.db.committedSeq.Load()
+		// pin before loading readSeq so compaction can't drop versions visible at it
+		readSeq := db.committedSeq.Load()
 
-		var startKey, endKey []byte
-		if start != nil {
-			startKey = newSeekStart(start, readSeq) // heap alloc
-		}
-		if end != nil {
-			endKey = newSeekEndInclusive(end) // heap alloc
-		}
+		sources := scanSources(view, lowerKey, upperKey, readSeq)
 
-		tables := view.tableRangeCandidates(start, end)
-		sources := make([]core.Cursor, 0, len(view.memtables)+len(tables))
-		for _, mt := range view.memtables {
-			sources = append(sources, mt.Cursor(startKey, endKey))
-		}
-		for _, table := range tables {
-			sources = append(sources, table.Cursor(startKey, endKey))
-		}
-
-		cur := newMVCCCursor(newMergeCursor(sources), readSeq, false)
+		cur := newSnapshotIterator(newMergeIterator(sources), readSeq, true)
 		for {
-			key, val, ok := cur.Next()
+			qkey, val, ok := cur.Next()
 			if !ok {
-				it.err = cur.Err()
+				break
+			}
+			if !yield(Entry{Key: quxKey(qkey).UserKey(), Value: val}, nil) {
 				return
 			}
-			if !yield(quxKey(key).UserKey(), val) {
-				return
-			}
+		}
+		if err := cur.Err(); err != nil {
+			yield(Entry{}, err)
 		}
 	}
+}
+
+// kept out of the scan closure so its range-over-func state stays on the stack
+func scanSources(view *lsmView, lowerUserKey, upperUserKey []byte, readSeq quxSeq) []core.Iterator {
+	seekStart, seekEnd := newSeekRange(lowerUserKey, upperUserKey, readSeq)
+
+	sources := make([]core.Iterator, 0, len(view.memtables)+view.version.Len())
+	for _, mt := range view.memtables {
+		sources = append(sources, mt.Iterator(seekStart, seekEnd))
+	}
+	for meta := range view.version.RangeLookup(lowerUserKey, upperUserKey) {
+		sources = append(sources, view.tables.Table(meta.ID).Iterator(seekStart, seekEnd))
+	}
+	return sources
 }
 
 func (db *QuxDB) enqueueWrite(key, val []byte, op quxOp) (*writeReq, error) {
@@ -464,13 +454,13 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 	db.lsm.publishMemtableMetrics()
 }
 
-func (db *QuxDB) setMemtable(qkey quxKey, val []byte, lastSeq uint64, lastLSN wal.LSN) error {
+func (db *QuxDB) setMemtable(qkey quxKey, val []byte, lastSeq quxSeq, lastLSN wal.LSN) error {
 	for {
 		err := db.lsm.activeMemtable().Set(qkey, val)
 		if !errors.Is(err, memtable.ErrMemtableFull) {
 			return err
 		}
-			db.rolloverMemtable(lastSeq, lastLSN)
+		db.rolloverMemtable(lastSeq, lastLSN)
 	}
 }
 
@@ -484,7 +474,7 @@ func (db *QuxDB) enterReadOnly(cause error) error {
 	return db.Err()
 }
 
-func (db *QuxDB) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) {
+func (db *QuxDB) rolloverMemtable(lastSeq quxSeq, lastLSN wal.LSN) {
 	mt := db.lsm.rolloverMemtable(lastSeq, lastLSN)
 
 	fmt.Printf("db: rollover memtable size=%.2fMB keys=%d lastSeq=%d lastLSN=%d\n",
@@ -524,8 +514,7 @@ func (db *QuxDB) flushMemtables() {
 			if err != nil {
 				panic(err)
 			}
-			// a single memtable needs no merge
-			c := newMVCCCursor(mt.Cursor(nil, nil), math.MaxUint64, true)
+			c := newSnapshotIterator(mt.Iterator(nil, nil), math.MaxUint64, false)
 			for {
 				key, val, ok := c.Next()
 				if !ok {

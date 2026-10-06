@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -80,7 +81,7 @@ func TestApplyAllowsOverlappingNonL0Tables(t *testing.T) {
 	require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: first}}))
 	require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: second}}))
 	assertLevelIDs(t, vs.CurrentVersion().Level(1), 1, 2)
-	assertLevelIDs(t, pointLookup(vs.CurrentVersion(), first.MaxKey), 1, 2)
+	assertLevelIDs(t, slices.Collect(vs.CurrentVersion().PointLookup(first.MaxKey)), 1, 2)
 }
 
 func TestCandidatesScanL1PlusTables(t *testing.T) {
@@ -93,8 +94,10 @@ func TestCandidatesScanL1PlusTables(t *testing.T) {
 		require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(id, 1)}}))
 	}
 
-	assertLevelIDs(t, pointLookup(vs.CurrentVersion(), []byte{3, 4}), 3)
-	assertLevelIDs(t, vs.CurrentVersion().RangeLookupCandidates([]byte{1, 4}, []byte{4, 5}), 2, 1, 3)
+	assertLevelIDs(t, slices.Collect(vs.CurrentVersion().PointLookup([]byte{3, 4})), 3)
+	assertLevelIDs(t, slices.Collect(vs.CurrentVersion().RangeLookup([]byte{1, 4}, []byte{4, 5})), 2, 1, 3)
+	// end is exclusive, so a table starting at end is skipped
+	assertLevelIDs(t, slices.Collect(vs.CurrentVersion().RangeLookup([]byte{1, 4}, []byte{3, 4})), 2, 1)
 }
 
 func TestApplyPublishesFreshVersion(t *testing.T) {
@@ -391,15 +394,6 @@ func catalogLines(t *testing.T, dir string) int {
 	data, err := os.ReadFile(filepath.Join(dir, catFilename))
 	require.NoError(t, err)
 	return bytes.Count(data, []byte("\n"))
-}
-
-func pointLookup(v *Version, key []byte) []*sst.Metadata {
-	var tables []*sst.Metadata
-	v.PointLookup(key, func(tab *sst.Metadata) bool {
-		tables = append(tables, tab)
-		return true
-	})
-	return tables
 }
 
 func assertLevelIDs(t *testing.T, tables []*sst.Metadata, ids ...uint64) {

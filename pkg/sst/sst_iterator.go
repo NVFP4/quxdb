@@ -6,7 +6,7 @@ import (
 	"github.com/yashgorana/quxdb/pkg/core"
 )
 
-type sstCursor struct {
+type sstIterator struct {
 	blocks *MappedBlockData
 	index  *SparseIndex
 
@@ -18,16 +18,16 @@ type sstCursor struct {
 	startKey []byte
 	endKey   []byte
 
-	cur  blockCursor
+	cur  blockIterator
 	done bool
 	err  error
 }
 
-func newSSTCursor(
+func newSSTIterator(
 	blocks *MappedBlockData,
 	index *SparseIndex,
 	startKey, endKey []byte,
-) *sstCursor {
+) *sstIterator {
 	numBlocks := index.Len()
 
 	firstBlock := 0
@@ -46,7 +46,7 @@ func newSSTCursor(
 	empty := firstBlock >= endBlock ||
 		startKey != nil && endKey != nil && bytes.Compare(startKey, endKey) > 0
 
-	return &sstCursor{
+	return &sstIterator{
 		blocks:     blocks,
 		index:      index,
 		firstBlock: firstBlock,
@@ -58,7 +58,7 @@ func newSSTCursor(
 	}
 }
 
-func (c *sstCursor) Next() (key, value []byte, ok bool) {
+func (c *sstIterator) Next() (key, value []byte, ok bool) {
 	for !c.done {
 		if key, value, ok = c.cur.Next(); ok {
 			return key, value, true
@@ -78,11 +78,11 @@ func (c *sstCursor) Next() (key, value []byte, ok bool) {
 	return nil, nil, false
 }
 
-func (c *sstCursor) Err() error {
+func (c *sstIterator) Err() error {
 	return c.err
 }
 
-func (c *sstCursor) advanceBlock() bool {
+func (c *sstIterator) advanceBlock() bool {
 	if c.nextBlock >= c.endBlock {
 		c.done = true
 		return false
@@ -118,4 +118,4 @@ func (c *sstCursor) advanceBlock() bool {
 	return true
 }
 
-var _ core.Cursor = (*sstCursor)(nil)
+var _ core.Iterator = (*sstIterator)(nil)

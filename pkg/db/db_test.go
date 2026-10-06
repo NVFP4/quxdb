@@ -97,7 +97,7 @@ func TestPointTombstoneShadowsOlderSST(t *testing.T) {
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
-		return db.lsm.currentVersion().Checkpoint().LastSeq == tombstoneSeq &&
+		return quxSeq(db.lsm.currentVersion().Checkpoint().LastSeq) == tombstoneSeq &&
 			db.lsm.immutableMemtableCount() == cachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
@@ -117,7 +117,8 @@ func TestQuxDBRange(t *testing.T) {
 	assert.NoError(t, db.Delete([]byte("a")))
 
 	assert.Equal(t, []string{"b=b2", "c=c1"}, collectRange(t, db, nil, nil))
-	assert.Equal(t, []string{"b=b2"}, collectRange(t, db, []byte("b"), []byte("b")))
+	assert.Equal(t, []string{"b=b2"}, collectRange(t, db, []byte("b"), []byte("c")))
+	assert.Empty(t, collectRange(t, db, []byte("b"), []byte("b")))
 	assert.Empty(t, collectRange(t, db, []byte("c"), []byte("b")))
 }
 
@@ -137,7 +138,7 @@ func TestQuxDBRangeAcrossMemtablesAndSSTs(t *testing.T) {
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
-		return db.lsm.currentVersion().Checkpoint().LastSeq == flushedSeq &&
+		return quxSeq(db.lsm.currentVersion().Checkpoint().LastSeq) == flushedSeq &&
 			db.lsm.immutableMemtableCount() == cachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
@@ -150,7 +151,8 @@ func TestQuxDBRangeAcrossMemtablesAndSSTs(t *testing.T) {
 		[]string{"a=new-a", "b=new-b", "c=new-c", "e=old-e", "retained-0=value"},
 		collectRange(t, db, nil, nil),
 	)
-	assert.Equal(t, []string{"b=new-b", "c=new-c"}, collectRange(t, db, []byte("b"), []byte("d")))
+	// e lives in an sst and sits exactly at the exclusive upper bound
+	assert.Equal(t, []string{"b=new-b", "c=new-c"}, collectRange(t, db, []byte("b"), []byte("e")))
 }
 
 func TestMemtableCheckpointCapturedAtRollover(t *testing.T) {
@@ -163,7 +165,7 @@ func TestMemtableCheckpointCapturedAtRollover(t *testing.T) {
 	assert.Zero(t, mt.lastLSN)
 
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	assert.Equal(t, uint64(2), mt.lastSeq)
+	assert.Equal(t, quxSeq(2), mt.lastSeq)
 	assert.Equal(t, db.lastCommittedLSN, mt.lastLSN)
 }
 
@@ -186,7 +188,7 @@ func TestQuxDBRangeEarlyStopReleasesMemtables(t *testing.T) {
 	require.NoError(t, db.Set([]byte("a"), []byte("1")))
 	require.NoError(t, db.Set([]byte("b"), []byte("2")))
 
-	for range db.Iter(nil, nil).All() {
+	for range db.Scan(nil, nil) {
 		break
 	}
 
@@ -208,7 +210,7 @@ func TestCommittedSequenceAdvancesAfterSet(t *testing.T) {
 
 	assert.Zero(t, db.committedSeq.Load())
 	require.NoError(t, db.Set([]byte("key"), []byte("value")))
-	assert.Equal(t, uint64(1), db.committedSeq.Load())
+	assert.Equal(t, quxSeq(1), db.committedSeq.Load())
 }
 
 func TestCommittedSequenceRestoredFromWAL(t *testing.T) {
@@ -228,9 +230,9 @@ func TestCommittedSequenceRestoredFromWAL(t *testing.T) {
 		require.NoError(t, reopened.Stop(t.Context()))
 	})
 
-	assert.Equal(t, uint64(2), reopened.committedSeq.Load())
+	assert.Equal(t, quxSeq(2), reopened.committedSeq.Load())
 	require.NoError(t, reopened.Set([]byte("third"), []byte("3")))
-	assert.Equal(t, uint64(3), reopened.committedSeq.Load())
+	assert.Equal(t, quxSeq(3), reopened.committedSeq.Load())
 }
 
 func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
@@ -258,7 +260,7 @@ func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 	checkpoint := db.lsm.currentVersion().Checkpoint()
 	require.NotZero(t, checkpoint.LastLSN)
 
-	newestSeq := uint64(cachedImmutables + 3)
+	newestSeq := quxSeq(cachedImmutables + 3)
 	expected["newest"] = fmt.Sprintf("%d", newestSeq)
 	require.NoError(t, db.Set([]byte("newest"), []byte(expected["newest"])))
 	require.NoError(t, db.Stop(t.Context()))
@@ -317,7 +319,7 @@ func TestRecoverySkipsKVsFlushedByMidBatchRollover(t *testing.T) {
 	}
 	view.release()
 	assert.Equal(t, n-int(checkpoint.LastSeq), replayed)
-	assert.Equal(t, uint64(n), reopened.committedSeq.Load())
+	assert.Equal(t, quxSeq(n), reopened.committedSeq.Load())
 	for i := range n {
 		got, found, err := reopened.Get(fmt.Appendf(nil, "key-%04d", i))
 		require.NoError(t, err)
@@ -359,10 +361,11 @@ func TestCorruptBlockSurfacesAsReadError(t *testing.T) {
 
 	_, _, err = reopened.Get([]byte("key"))
 	require.ErrorIs(t, err, sst.ErrChecksumMismatch)
-	it := reopened.Iter(nil, nil)
-	for range it.All() {
+	var scanErr error
+	for _, err := range reopened.Scan(nil, nil) {
+		scanErr = err
 	}
-	require.ErrorIs(t, it.Err(), sst.ErrChecksumMismatch)
+	require.ErrorIs(t, scanErr, sst.ErrChecksumMismatch)
 }
 
 func TestFailedStartReleasesLockAndCanRetry(t *testing.T) {
@@ -411,14 +414,13 @@ func newTestQuxDB(t *testing.T) *QuxDB {
 	return db
 }
 
-func collectRange(t *testing.T, db *QuxDB, start, end []byte) []string {
+func collectRange(t *testing.T, db *QuxDB, lower, upper []byte) []string {
 	t.Helper()
 	var items []string
-	it := db.Iter(start, end)
-	for key, value := range it.All() {
-		items = append(items, string(key)+"="+string(value))
+	for e, err := range db.Scan(lower, upper) {
+		require.NoError(t, err)
+		items = append(items, string(e.Key)+"="+string(e.Value))
 	}
-	require.NoError(t, it.Err())
 	return items
 }
 

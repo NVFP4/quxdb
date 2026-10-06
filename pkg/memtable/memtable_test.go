@@ -24,24 +24,24 @@ var memtableTestImpls = []memtableTestImpl{
 	{"BTree", func(opts ...Option) Memtable { return newBTreeMemtable(opts...) }},
 }
 
-func testCursorValue(version int) []byte {
+func testIteratorValue(version int) []byte {
 	value := fmt.Appendf(nil, "version-%03d:", version)
 	return append(value, bytes.Repeat([]byte{'x'}, version)...)
 }
 
-func collectCursorKeys(t *testing.T, m Memtable, start, end []byte) []string {
+func collectIteratorKeys(t *testing.T, m Memtable, start, end []byte) []string {
 	t.Helper()
 
 	var keys []string
-	cursor := m.Cursor(start, end)
+	it := m.Iterator(start, end)
 	for {
-		key, _, ok := cursor.Next()
+		key, _, ok := it.Next()
 		if !ok {
 			break
 		}
 		keys = append(keys, string(key))
 	}
-	require.NoError(t, cursor.Err())
+	require.NoError(t, it.Err())
 	return keys
 }
 
@@ -190,7 +190,7 @@ func TestCapacity(t *testing.T) {
 	}
 }
 
-func TestCursor(t *testing.T) {
+func TestIterator(t *testing.T) {
 	const count = 256
 
 	for _, impl := range memtableTestImpls {
@@ -206,20 +206,20 @@ func TestCursor(t *testing.T) {
 				require.NoError(t, m.Set(keys[i], values[i]))
 			}
 
-			cursor := m.Cursor(nil, nil)
+			it := m.Iterator(nil, nil)
 			for i := range count {
-				key, value, ok := cursor.Next()
-				require.True(t, ok, "cursor ended at item %d", i)
+				key, value, ok := it.Next()
+				require.True(t, ok, "iterator ended at item %d", i)
 				assert.Equal(t, keys[i], key)
 				assert.Equal(t, values[i], value)
 			}
-			_, _, ok := cursor.Next()
+			_, _, ok := it.Next()
 			assert.False(t, ok)
 		})
 	}
 }
 
-func TestCursorRanges(t *testing.T) {
+func TestIteratorRanges(t *testing.T) {
 	tests := []struct {
 		name       string
 		start, end []byte
@@ -244,14 +244,14 @@ func TestCursorRanges(t *testing.T) {
 
 			for _, tt := range tests {
 				t.Run(tt.name, func(t *testing.T) {
-					assert.Equal(t, tt.want, collectCursorKeys(t, m, tt.start, tt.end))
+					assert.Equal(t, tt.want, collectIteratorKeys(t, m, tt.start, tt.end))
 				})
 			}
 		})
 	}
 }
 
-func TestCursorIndependence(t *testing.T) {
+func TestIteratorIndependence(t *testing.T) {
 	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
 			m := impl.new()
@@ -259,8 +259,8 @@ func TestCursorIndependence(t *testing.T) {
 				require.NoError(t, m.Set([]byte(key), []byte("value-"+key)))
 			}
 
-			first := m.Cursor(nil, nil)
-			second := m.Cursor([]byte("b"), nil)
+			first := m.Iterator(nil, nil)
+			second := m.Iterator([]byte("b"), nil)
 
 			key, _, ok := first.Next()
 			require.True(t, ok)
@@ -281,28 +281,28 @@ func TestCursorIndependence(t *testing.T) {
 	}
 }
 
-func TestCursorErrors(t *testing.T) {
+func TestIteratorErrors(t *testing.T) {
 	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
 			m := impl.new()
 			require.NoError(t, m.Set([]byte("a"), []byte("value")))
-			cursor := m.Cursor(nil, nil)
+			it := m.Iterator(nil, nil)
 
-			assert.NoError(t, cursor.Err())
-			_, _, ok := cursor.Next()
+			assert.NoError(t, it.Err())
+			_, _, ok := it.Next()
 			require.True(t, ok)
-			assert.NoError(t, cursor.Err())
-			_, _, ok = cursor.Next()
+			assert.NoError(t, it.Err())
+			_, _, ok = it.Next()
 			assert.False(t, ok)
-			assert.NoError(t, cursor.Err())
+			assert.NoError(t, it.Err())
 		})
 	}
 }
 
-func TestCursorExhaustion(t *testing.T) {
+func TestIteratorExhaustion(t *testing.T) {
 	for _, impl := range memtableTestImpls {
 		t.Run(impl.name, func(t *testing.T) {
-			empty := impl.new().Cursor(nil, nil)
+			empty := impl.new().Iterator(nil, nil)
 			for range 3 {
 				key, value, ok := empty.Next()
 				assert.False(t, ok)
@@ -312,11 +312,11 @@ func TestCursorExhaustion(t *testing.T) {
 
 			m := impl.new()
 			require.NoError(t, m.Set([]byte("a"), []byte("value")))
-			cursor := m.Cursor(nil, nil)
-			_, _, ok := cursor.Next()
+			it := m.Iterator(nil, nil)
+			_, _, ok := it.Next()
 			require.True(t, ok)
 			for range 3 {
-				key, value, ok := cursor.Next()
+				key, value, ok := it.Next()
 				assert.False(t, ok)
 				assert.Nil(t, key)
 				assert.Nil(t, value)
@@ -325,7 +325,7 @@ func TestCursorExhaustion(t *testing.T) {
 	}
 }
 
-func TestCursorConcurrency(t *testing.T) {
+func TestIteratorConcurrency(t *testing.T) {
 	const (
 		userCount      = 128
 		versionCount   = 32
@@ -336,7 +336,7 @@ func TestCursorConcurrency(t *testing.T) {
 
 	allowedValues := make(map[string]struct{}, versionCount+1)
 	for version := 0; version <= versionCount; version++ {
-		allowedValues[string(testCursorValue(version))] = struct{}{}
+		allowedValues[string(testIteratorValue(version))] = struct{}{}
 	}
 
 	for _, impl := range memtableTestImpls {
@@ -355,7 +355,7 @@ func TestCursorConcurrency(t *testing.T) {
 					keys[user][version] = key
 					planned[string(key)] = struct{}{}
 				}
-				require.NoError(t, m.Set(keys[user][0], testCursorValue(0)))
+				require.NoError(t, m.Set(keys[user][0], testIteratorValue(0)))
 			}
 
 			start := make(chan struct{})
@@ -369,7 +369,7 @@ func TestCursorConcurrency(t *testing.T) {
 
 					// Growing updates preserve old borrowed values while new keys reshape the index.
 					for version := 1; version <= versionCount; version++ {
-						value := testCursorValue(version)
+						value := testIteratorValue(version)
 						for user := writerID; user < userCount; user += writerCount {
 							if err := m.Set(keys[user][version], value); err != nil {
 								t.Errorf("Set(%q): %v", keys[user][version], err)
@@ -391,20 +391,20 @@ func TestCursorConcurrency(t *testing.T) {
 					<-start
 
 					for range scansPerReader {
-						cursor := m.Cursor(nil, nil)
+						it := m.Iterator(nil, nil)
 						var previous []byte
 						count := 0
 						for {
-							key, value, ok := cursor.Next()
+							key, value, ok := it.Next()
 							if !ok {
 								break
 							}
 							if previous != nil && compareMVCCKey(previous, key) >= 0 {
-								t.Errorf("cursor out of order: %x then %x", previous, key)
+								t.Errorf("iterator out of order: %x then %x", previous, key)
 								return
 							}
 							if _, ok := planned[string(key)]; !ok {
-								t.Errorf("cursor returned unknown key %x", key)
+								t.Errorf("iterator returned unknown key %x", key)
 								return
 							}
 
@@ -412,23 +412,23 @@ func TestCursorConcurrency(t *testing.T) {
 							version := binary.LittleEndian.Uint64(key[userLen : userLen+8])
 							if version == 0 {
 								if _, ok := allowedValues[string(value)]; !ok {
-									t.Errorf("cursor key %x returned invalid value %q", key, value)
+									t.Errorf("iterator key %x returned invalid value %q", key, value)
 									return
 								}
-							} else if !bytes.Equal(value, testCursorValue(int(version))) {
-								t.Errorf("cursor key %x returned invalid value %q", key, value)
+							} else if !bytes.Equal(value, testIteratorValue(int(version))) {
+								t.Errorf("iterator key %x returned invalid value %q", key, value)
 								return
 							}
 
 							previous = append(previous[:0], key...)
 							count++
 							if count > len(planned) {
-								t.Errorf("cursor returned more than %d items", len(planned))
+								t.Errorf("iterator returned more than %d items", len(planned))
 								return
 							}
 						}
-						if err := cursor.Err(); err != nil {
-							t.Errorf("cursor error: %v", err)
+						if err := it.Err(); err != nil {
+							t.Errorf("iterator error: %v", err)
 							return
 						}
 					}
@@ -438,22 +438,22 @@ func TestCursorConcurrency(t *testing.T) {
 			close(start)
 			wg.Wait()
 
-			cursor := m.Cursor(nil, nil)
+			it := m.Iterator(nil, nil)
 			for user := range userCount {
 				for version := versionCount; version >= 0; version-- {
-					key, value, ok := cursor.Next()
+					key, value, ok := it.Next()
 					require.True(t, ok)
 					assert.Equal(t, keys[user][version], key)
 					if version == 0 {
-						assert.Equal(t, testCursorValue(versionCount), value)
+						assert.Equal(t, testIteratorValue(versionCount), value)
 					} else {
-						assert.Equal(t, testCursorValue(version), value)
+						assert.Equal(t, testIteratorValue(version), value)
 					}
 				}
 			}
-			_, _, ok := cursor.Next()
+			_, _, ok := it.Next()
 			assert.False(t, ok)
-			assert.NoError(t, cursor.Err())
+			assert.NoError(t, it.Err())
 			assert.Equal(t, len(planned), m.Len())
 		})
 	}
@@ -475,7 +475,7 @@ func TestBorrowedViews(t *testing.T) {
 			assert.Equal(t, len(key), cap(key))
 			assert.Equal(t, len(value), cap(value))
 
-			key, value, ok = m.Cursor([]byte("a"), []byte("b")).Next()
+			key, value, ok = m.Iterator([]byte("a"), []byte("b")).Next()
 			require.True(t, ok)
 			assert.Equal(t, len(key), cap(key))
 			assert.Equal(t, len(value), cap(value))
@@ -517,7 +517,7 @@ func TestClear(t *testing.T) {
 			assert.False(t, ok)
 			_, _, ok = m.Seek(nil)
 			assert.False(t, ok)
-			_, _, ok = m.Cursor(nil, nil).Next()
+			_, _, ok = m.Iterator(nil, nil).Next()
 			assert.False(t, ok)
 
 			m.Clear()
@@ -541,7 +541,7 @@ func TestClearComparator(t *testing.T) {
 			older := makeMVCCKey([]byte("key"), 1, 1)
 			require.NoError(t, m.Set(older, nil))
 			require.NoError(t, m.Set(newer, nil))
-			key, _, ok := m.Cursor(nil, nil).Next()
+			key, _, ok := m.Iterator(nil, nil).Next()
 			require.True(t, ok)
 			assert.Equal(t, newer, key)
 		})
@@ -570,7 +570,7 @@ func TestComparator(t *testing.T) {
 				string(keys[2]),
 				string(keys[3]),
 				string(keys[4]),
-			}, collectCursorKeys(t, m, nil, nil))
+			}, collectIteratorKeys(t, m, nil, nil))
 
 			seek := makeMVCCKey([]byte("a"), ^uint64(0), 0xff)
 			key, value, ok := m.Seek(seek)
@@ -703,16 +703,16 @@ func TestConcurrency(t *testing.T) {
 				assert.Equal(t, writeValues[i], value)
 			}
 
-			cursor := m.Cursor(nil, nil)
+			it := m.Iterator(nil, nil)
 			for i := range totalWrites {
-				key, value, ok := cursor.Next()
-				require.True(t, ok, "cursor ended at item %d", i)
+				key, value, ok := it.Next()
+				require.True(t, ok, "iterator ended at item %d", i)
 				assert.Equal(t, writeKeys[i], key)
 				assert.Equal(t, writeValues[i], value)
 			}
-			_, _, ok := cursor.Next()
+			_, _, ok := it.Next()
 			assert.False(t, ok)
-			assert.NoError(t, cursor.Err())
+			assert.NoError(t, it.Err())
 		})
 	}
 }

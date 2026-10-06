@@ -89,8 +89,8 @@ func (b *Block) recordAt(offset uint32) (recordView, error) {
 	return decodeBlockRecord(b.data[off:])
 }
 
-func (b *Block) Cursor(start, end []byte) core.Cursor {
-	c := blockCursor{}
+func (b *Block) Iterator(start, end []byte) core.Iterator {
+	c := blockIterator{}
 	c.reset(b, start, end)
 	return &c
 }

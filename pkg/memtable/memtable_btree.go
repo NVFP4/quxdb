@@ -286,7 +286,7 @@ func (m *btreeMemtable) Clear() {
 	m.data = nil
 }
 
-func (m *btreeMemtable) fillCursorBatch(
+func (m *btreeMemtable) fillIteratorBatch(
 	start []byte,
 	leafIdx uint32,
 	batch *[btreeLeafMaxItems]btreeKVEntry,
@@ -660,7 +660,7 @@ func (m *btreeMemtable) value(e btreeKVEntry) []byte {
 
 // ----------------------------------------------------------------------------
 
-type btreeCursor struct {
+type btreeIterator struct {
 	m         *btreeMemtable
 	start     []byte
 	end       []byte
@@ -671,19 +671,19 @@ type btreeCursor struct {
 	exhausted bool
 }
 
-func (m *btreeMemtable) Cursor(start, end []byte) core.Cursor {
-	return &btreeCursor{
+func (m *btreeMemtable) Iterator(start, end []byte) core.Iterator {
+	return &btreeIterator{
 		m:     m,
 		start: start[:len(start):len(start)],
 		end:   end[:len(end):len(end)],
 	}
 }
 
-func (c *btreeCursor) Err() error {
+func (c *btreeIterator) Err() error {
 	return nil
 }
 
-func (c *btreeCursor) Next() (key, value []byte, ok bool) {
+func (c *btreeIterator) Next() (key, value []byte, ok bool) {
 	for {
 		if c.i < c.n {
 			e := c.batch[c.i]
@@ -701,7 +701,7 @@ func (c *btreeCursor) Next() (key, value []byte, ok bool) {
 			return nil, nil, false
 		}
 
-		nextLeaf, n := c.m.fillCursorBatch(c.start, c.leafIdx, &c.batch)
+		nextLeaf, n := c.m.fillIteratorBatch(c.start, c.leafIdx, &c.batch)
 		c.leafIdx = nextLeaf
 		c.n = n
 		c.i = 0
@@ -719,4 +719,4 @@ func (c *btreeCursor) Next() (key, value []byte, ok bool) {
 	}
 }
 
-var _ core.Cursor = (*btreeCursor)(nil)
+var _ core.Iterator = (*btreeIterator)(nil)

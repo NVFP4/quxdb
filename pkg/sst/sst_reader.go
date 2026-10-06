@@ -22,9 +22,9 @@ func (s *SST) MayContain(filterKey []byte) bool {
 	return s.filter.Contains(filterKey)
 }
 
-// Cursor iterates a key range and must not outlive the pinning View.
-func (s *SST) Cursor(start, end []byte) core.Cursor {
-	return newSSTCursor(
+// Iterator iterates a key range and must not outlive the pinning View.
+func (s *SST) Iterator(start, end []byte) core.Iterator {
+	return newSSTIterator(
 		s.data,
 		&s.index.SparseIndex,
 		start, end,

@@ -166,7 +166,7 @@ func TestLsmStateConcurrentAcquireDuringEdits(t *testing.T) {
 	var retired []string
 	for i := range iterations {
 		table := buildLsmTestTable(t)
-		flushed := state.rolloverMemtable(uint64(i+1), wal.LSN(i+1))
+		flushed := state.rolloverMemtable(quxSeq(i+1), wal.LSN(i+1))
 		require.NoError(t, state.replaceMemtablesWithSSTs([]*quxMemtable{flushed}, []*sst.Metadata{table}))
 		require.NoError(t, state.replaceSSTs([]*sst.Metadata{table}, nil))
 		retired = append(retired, table.Path)

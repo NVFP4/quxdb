@@ -87,14 +87,14 @@ func TestBTreeAscending(t *testing.T) {
 	}
 	assert.Equal(t, expectedLeaves, leafCount)
 
-	cursor := m.Cursor(nil, nil)
+	it := m.Iterator(nil, nil)
 	for i := range count {
-		key, value, ok := cursor.Next()
-		require.True(t, ok, "cursor ended at item %d", i)
+		key, value, ok := it.Next()
+		require.True(t, ok, "iterator ended at item %d", i)
 		assert.Equal(t, fmt.Sprintf("key-%05d", i), string(key))
 		assert.Equal(t, []byte("v"), value)
 	}
-	_, _, ok := cursor.Next()
+	_, _, ok := it.Next()
 	assert.False(t, ok)
 }
 
@@ -112,9 +112,9 @@ func TestBTreeMiddleInsert(t *testing.T) {
 
 	var previous []byte
 	seen := 0
-	cursor := m.Cursor(nil, nil)
+	it := m.Iterator(nil, nil)
 	for {
-		key, _, ok := cursor.Next()
+		key, _, ok := it.Next()
 		if !ok {
 			break
 		}
@@ -127,7 +127,7 @@ func TestBTreeMiddleInsert(t *testing.T) {
 	assert.Equal(t, m.Len(), seen)
 }
 
-func TestBTreeCursorWriterProgress(t *testing.T) {
+func TestBTreeIteratorWriterProgress(t *testing.T) {
 	m := newBTreeMemtable()
 	expected := make([]string, 0, btreeLeafMaxItems)
 	for i := range btreeLeafMaxItems {
@@ -138,24 +138,24 @@ func TestBTreeCursorWriterProgress(t *testing.T) {
 
 	reachedNext := make(chan struct{})
 	releaseNext := make(chan struct{})
-	cursorDone := make(chan []string, 1)
+	iterDone := make(chan []string, 1)
 	go func() {
 		got := make([]string, 0, btreeLeafMaxItems)
-		cursor := m.Cursor(nil, nil)
-		key, _, ok := cursor.Next()
+		it := m.Iterator(nil, nil)
+		key, _, ok := it.Next()
 		if ok {
 			got = append(got, string(key))
 		}
 		close(reachedNext)
 		<-releaseNext
 		for {
-			key, _, ok = cursor.Next()
+			key, _, ok = it.Next()
 			if !ok {
 				break
 			}
 			got = append(got, string(key))
 		}
-		cursorDone <- got
+		iterDone <- got
 	}()
 
 	<-reachedNext
@@ -169,11 +169,11 @@ func TestBTreeCursorWriterProgress(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(time.Second):
 		close(releaseNext)
-		t.Fatal("write blocked while cursor was paused")
+		t.Fatal("write blocked while iterator was paused")
 	}
 
 	close(releaseNext)
-	assert.Equal(t, expected, <-cursorDone)
+	assert.Equal(t, expected, <-iterDone)
 }
 
 func TestBTreeClear(t *testing.T) {

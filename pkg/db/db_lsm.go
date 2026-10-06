@@ -108,7 +108,7 @@ func (s *lsmState) immutableMemtableCount() int {
 	return len(s.current.Load().memtables) - 1
 }
 
-func (s *lsmState) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) *quxMemtable {
+func (s *lsmState) rolloverMemtable(lastSeq quxSeq, lastLSN wal.LSN) *quxMemtable {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -132,7 +132,7 @@ func (s *lsmState) rolloverMemtable(lastSeq uint64, lastLSN wal.LSN) *quxMemtabl
 func (s *lsmState) replaceMemtablesWithSSTs(flushed []*quxMemtable, toAdd []*sst.Metadata) error {
 	last := flushed[len(flushed)-1]
 	return s.applyEdit(toAdd, nil, len(flushed), &vset.Checkpoint{
-		LastSeq: last.lastSeq,
+		LastSeq: uint64(last.lastSeq),
 		LastLSN: uint64(last.lastLSN),
 	})
 }
@@ -220,7 +220,7 @@ func (s *lsmState) close() error {
 type quxMemtable struct {
 	memtable.Memtable
 	lastLSN wal.LSN
-	lastSeq uint64
+	lastSeq quxSeq
 }
 
 func newQuxMemtable() *quxMemtable {

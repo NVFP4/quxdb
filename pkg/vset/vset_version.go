@@ -2,6 +2,7 @@ package vset
 
 import (
 	"bytes"
+	"iter"
 	"slices"
 
 	"github.com/yashgorana/quxdb/pkg/sst"
@@ -73,72 +74,54 @@ func (v *Version) All() []*sst.Metadata {
 	return meta
 }
 
-// PointLookup calls yield for tables that may hold key, l0 newest first, until yield returns false.
-func (v *Version) PointLookup(key []byte, yield func(*sst.Metadata) bool) {
-	if len(key) == 0 {
-		return
-	}
-
-	// L0 overlap, so sort latest first
-	tables := v.levels[0]
-	for i := len(tables) - 1; i >= 0; i-- {
-		tab := tables[i]
-		if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 && !yield(tab) {
+// PointLookup yields tables that may hold key, l0 newest first.
+func (v *Version) PointLookup(key []byte) iter.Seq[*sst.Metadata] {
+	return func(yield func(*sst.Metadata) bool) {
+		if len(key) == 0 {
 			return
 		}
-	}
 
-	// scan every table instead of binary search, support both tiered/hybrid compaction
-	for lvl := 1; lvl < MaxLevels; lvl++ {
-		for _, tab := range v.levels[lvl] {
+		// L0 overlap, so sort latest first
+		tables := v.levels[0]
+		for i := len(tables) - 1; i >= 0; i-- {
+			tab := tables[i]
 			if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 && !yield(tab) {
 				return
+			}
+		}
+
+		// scan every table instead of binary search, support both tiered/hybrid compaction
+		for lvl := 1; lvl < MaxLevels; lvl++ {
+			for _, tab := range v.levels[lvl] {
+				if bytes.Compare(key, tab.MinKey) >= 0 && bytes.Compare(key, tab.MaxKey) <= 0 && !yield(tab) {
+					return
+				}
 			}
 		}
 	}
 }
 
-// RangeLookupCandidates returns tables overlapping start..end, with start <= end.
-func (v *Version) RangeLookupCandidates(start, end []byte) []*sst.Metadata {
-	var meta []*sst.Metadata
-
-	if len(start) > 0 && len(end) > 0 && bytes.Compare(start, end) > 0 {
-		return meta
-	}
-
-	// L0 tables may overlap, so test every run newest-first.
-	tables := v.levels[0]
-	for i := len(tables) - 1; i >= 0; i-- {
-		tab := tables[i]
-		hasStart := true
-		hasEnd := true
-		if len(start) > 0 {
-			hasStart = bytes.Compare(start, tab.MaxKey) <= 0
-		}
-		if len(end) > 0 {
-			hasEnd = bytes.Compare(end, tab.MinKey) >= 0
-		}
-		if hasStart && hasEnd {
-			meta = append(meta, tab)
-		}
-	}
-
-	// scan every table instead of binary search, support both tiered/hybrid compaction
-	for lvl := 1; lvl < MaxLevels; lvl++ {
-		for _, tab := range v.levels[lvl] {
-			hasStart := true
-			hasEnd := true
-			if len(start) > 0 {
-				hasStart = bytes.Compare(start, tab.MaxKey) <= 0
+// RangeLookup yields tables overlapping [start, end), l0 newest first, empty bounds are open.
+func (v *Version) RangeLookup(start, end []byte) iter.Seq[*sst.Metadata] {
+	return func(yield func(*sst.Metadata) bool) {
+		tables := v.levels[0]
+		for i := len(tables) - 1; i >= 0; i-- {
+			if overlaps(tables[i], start, end) && !yield(tables[i]) {
+				return
 			}
-			if len(end) > 0 {
-				hasEnd = bytes.Compare(end, tab.MinKey) >= 0
-			}
-			if hasStart && hasEnd {
-				meta = append(meta, tab)
+		}
+
+		for lvl := 1; lvl < MaxLevels; lvl++ {
+			for _, tab := range v.levels[lvl] {
+				if overlaps(tab, start, end) && !yield(tab) {
+					return
+				}
 			}
 		}
 	}
+}
 
-	return meta
+func overlaps(tab *sst.Metadata, start, end []byte) bool {
+	return (len(start) == 0 || bytes.Compare(start, tab.MaxKey) <= 0) &&
+		(len(end) == 0 || bytes.Compare(end, tab.MinKey) > 0)
 }

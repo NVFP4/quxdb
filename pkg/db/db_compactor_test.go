@@ -103,8 +103,9 @@ func TestCompactionMovesNonOverlappingL0Batch(t *testing.T) {
 	}
 }
 
-func TestCompactionKeepsNewestVersionsAndTombstonesAboveBottom(t *testing.T) {
+func TestCompactionKeepsNewestVersionsAndTombstonesOverOlderTables(t *testing.T) {
 	state, compactor := newTestCompactor(t)
+	deeper := addCompactionTable(t, state, 2, set("b", 1, "b1"))
 	older := addCompactionTable(t, state, 0, set("a", 1, "a1"), set("b", 2, "b2"), set("c", 3, "c3"))
 	newer := addCompactionTable(t, state, 0, set("a", 4, "a4"), del("b", 5))
 
@@ -113,9 +114,39 @@ func TestCompactionKeepsNewestVersionsAndTombstonesAboveBottom(t *testing.T) {
 	version := state.currentVersion()
 	assert.Empty(t, version.Level(0))
 	require.Len(t, version.Level(1), 1)
+	// b@1 still sits in l2, so the tombstone must stay to shadow it
 	assert.Equal(t, []string{"a@4=a4", "b@5=deleted", "c@3=c3"}, compactionEntries(t, state, version.Level(1)[0]))
+	assert.Equal(t, []string{"b@1=b1"}, compactionEntries(t, state, deeper))
 	requireNoDirEventually(t, older.Path)
 	requireNoDirEventually(t, newer.Path)
+}
+
+func TestCompactionAboveBottomDropsTombstonesWithNothingOlderBelow(t *testing.T) {
+	state, compactor := newTestCompactor(t)
+	addCompactionTable(t, state, 2, set("x", 1, "x1")) // deeper but outside the inputs' range
+	older := addCompactionTable(t, state, 0, set("a", 1, "a1"), set("b", 2, "b2"), set("c", 3, "c3"))
+	newer := addCompactionTable(t, state, 0, set("a", 4, "a4"), del("b", 5))
+
+	runCompaction(t, state, compactor, 0, older, newer)
+
+	l1 := state.currentVersion().Level(1)
+	require.Len(t, l1, 1)
+	assert.Equal(t, []string{"a@4=a4", "c@3=c3"}, compactionEntries(t, state, l1[0]))
+}
+
+func TestCompactionKeepsTombstonesOverSameLevelTables(t *testing.T) {
+	state, compactor := newTestCompactor(t)
+	// overlapping l1 tables are allowed, the one left out still holds b@1
+	addCompactionTable(t, state, 1, set("b", 1, "b1"))
+	source := addCompactionTable(t, state, 1, set("a", 4, "a4"), del("b", 5))
+	next := addCompactionTable(t, state, 2, set("a", 2, "a2")) // an l2 input forces a rewrite over a move
+
+	runCompaction(t, state, compactor, 1, source, next)
+
+	l2 := state.currentVersion().Level(2)
+	require.Len(t, l2, 1)
+	assert.NotEqual(t, next.ID, l2[0].ID)
+	assert.Equal(t, []string{"a@4=a4", "b@5=deleted"}, compactionEntries(t, state, l2[0]))
 }
 
 func TestCompactionIntoBottomDropsTombstones(t *testing.T) {
@@ -169,7 +200,7 @@ func TestCompactionSplitsOutputsAtTargetSize(t *testing.T) {
 	state, compactor := newTestCompactor(t)
 	var entries []entry
 	for i := range 20 {
-		entries = append(entries, set(fmt.Sprintf("k%02d", i), uint64(i+1), "0123456789abcdef"))
+		entries = append(entries, set(fmt.Sprintf("k%02d", i), quxSeq(i+1), "0123456789abcdef"))
 	}
 	first := addCompactionTable(t, state, 0, entries[:10]...)
 	second := addCompactionTable(t, state, 0, entries[10:]...)
@@ -233,7 +264,7 @@ func compactionEntries(t *testing.T, state *lsmState, table *sst.Metadata) []str
 	t.Helper()
 	view := state.acquire()
 	defer view.release()
-	return drain(t, view.tables.Table(table.ID).Cursor(nil, nil))
+	return drain(t, view.tables.Table(table.ID).Iterator(nil, nil))
 }
 
 func TestEstimateOutputKeys(t *testing.T) {

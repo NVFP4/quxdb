@@ -17,7 +17,7 @@ const (
 var ErrMemtableFull = errors.New("memtable full")
 
 // Memtable implementations are safe for concurrent method calls. Borrowed
-// results and individual Cursor values retain the narrower ownership and
+// results and individual Iterator values retain the narrower ownership and
 // concurrency rules documented below.
 type Memtable interface {
 	// Get the value for the key from the memtable.
@@ -42,15 +42,15 @@ type Memtable interface {
 
 	// Clear removes all entries and drops references to data and structural
 	// allocations. The memtable remains reusable and allocates lazily on the
-	// next Set. Clear invalidates borrowed views and cursors, so callers must stop
+	// next Set. Clear invalidates borrowed views and iterators, so callers must stop
 	// using them before calling Clear. Reclamation is scheduled by the Go
 	// runtime rather than forced synchronously.
 	Clear()
 
-	// Cursor returns a weakly consistent cursor over the inclusive [start, end]
+	// Iterator returns a weakly consistent iterator over the inclusive [start, end]
 	// range. A nil bound is unbounded. Bounds are borrowed and must remain
-	// immutable until the cursor is exhausted.
-	Cursor(start, end []byte) core.Cursor
+	// immutable until the iterator is exhausted.
+	Iterator(start, end []byte) core.Iterator
 }
 
 // ----------------------------------------------------------------------------

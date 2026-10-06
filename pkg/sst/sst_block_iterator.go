@@ -13,16 +13,16 @@ const (
 )
 
 // iterates within the block
-type blockCursor struct {
-	data     []byte
-	recOff   int // offset of the next record
-	recEnd   int // end of the records region
+type blockIterator struct {
+	data     []byte // raw block bytes, mmap backed
+	recOff   int    // offset of the next record
+	recEnd   int    // end of the records region
 	startKey []byte
 	endKey   []byte
 	err      error
 }
 
-func (c *blockCursor) Next() (key, value []byte, ok bool) {
+func (c *blockIterator) Next() (key, value []byte, ok bool) {
 	for c.err == nil && c.recOff < c.recEnd {
 		// Bound decoding to the records region. A malformed record must not
 		// consume bytes from the block index.
@@ -53,12 +53,12 @@ func (c *blockCursor) Next() (key, value []byte, ok bool) {
 	return nil, nil, false
 }
 
-func (c *blockCursor) Err() error {
+func (c *blockIterator) Err() error {
 	return c.err
 }
 
-func (c *blockCursor) reset(block *Block, startKey, endKey []byte) {
-	*c = blockCursor{
+func (c *blockIterator) reset(block *Block, startKey, endKey []byte) {
+	*c = blockIterator{
 		data:     block.data,
 		recOff:   blockHeaderLen,
 		recEnd:   blockHeaderLen + block.recLen,
@@ -89,4 +89,4 @@ func (c *blockCursor) reset(block *Block, startKey, endKey []byte) {
 	}
 }
 
-var _ core.Cursor = (*blockCursor)(nil)
+var _ core.Iterator = (*blockIterator)(nil)

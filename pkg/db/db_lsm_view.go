@@ -1,8 +1,6 @@
 package db
 
 import (
-	"iter"
-
 	"github.com/yashgorana/quxdb/pkg/sst"
 	"github.com/yashgorana/quxdb/pkg/vset"
 )
@@ -16,21 +14,4 @@ type lsmView struct {
 
 func (v *lsmView) release() {
 	v.tables.Release()
-}
-
-func (v *lsmView) tableCandidates(key []byte) iter.Seq[*sst.SST] {
-	return func(yield func(*sst.SST) bool) {
-		v.version.PointLookup(key, func(table *sst.Metadata) bool {
-			return yield(v.tables.Table(table.ID))
-		})
-	}
-}
-
-func (v *lsmView) tableRangeCandidates(start, end []byte) []*sst.SST {
-	candidates := v.version.RangeLookupCandidates(start, end)
-	tables := make([]*sst.SST, len(candidates))
-	for i, table := range candidates {
-		tables[i] = v.tables.Table(table.ID)
-	}
-	return tables
 }

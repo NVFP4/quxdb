@@ -21,14 +21,14 @@ type entry struct {
 	value string
 }
 
-// sliceCursor yields entries in order, then fails with err if set.
-type sliceCursor struct {
+// sliceIterator yields entries in order, then fails with err if set.
+type sliceIterator struct {
 	entries []entry
 	err     error
 	pos     int
 }
 
-func (c *sliceCursor) Next() ([]byte, []byte, bool) {
+func (c *sliceIterator) Next() ([]byte, []byte, bool) {
 	if c.pos >= len(c.entries) {
 		return nil, nil, false
 	}
@@ -37,7 +37,7 @@ func (c *sliceCursor) Next() ([]byte, []byte, bool) {
 	return e.key, []byte(e.value), true
 }
 
-func (c *sliceCursor) Err() error {
+func (c *sliceIterator) Err() error {
 	if c.pos >= len(c.entries) {
 		return c.err
 	}
@@ -52,7 +52,7 @@ func del(key string, seq quxSeq) entry {
 	return entry{newQuxKey([]byte(key), seq, quxOpDelete), ""}
 }
 
-func drain(t *testing.T, cur core.Cursor) []string {
+func drain(t *testing.T, cur core.Iterator) []string {
 	t.Helper()
 	var out []string
 	for {
@@ -69,22 +69,22 @@ func drain(t *testing.T, cur core.Cursor) []string {
 	}
 }
 
-func TestMergeCursorInterleavesSourcesInKeyOrder(t *testing.T) {
-	merged := newMergeCursor([]core.Cursor{
-		&sliceCursor{entries: []entry{set("a", 3, "a3"), set("c", 1, "c1")}},
-		&sliceCursor{entries: []entry{set("a", 2, "a2"), set("b", 5, "b5")}},
-		&sliceCursor{},
+func TestMergeIteratorInterleavesSourcesInKeyOrder(t *testing.T) {
+	cur := newMergeIterator([]core.Iterator{
+		&sliceIterator{entries: []entry{set("a", 3, "a3"), set("c", 1, "c1")}},
+		&sliceIterator{entries: []entry{set("a", 2, "a2"), set("b", 5, "b5")}},
+		&sliceIterator{},
 	})
 
-	assert.Equal(t, []string{"a@3=a3", "a@2=a2", "b@5=b5", "c@1=c1"}, drain(t, merged))
+	assert.Equal(t, []string{"a@3=a3", "a@2=a2", "b@5=b5", "c@1=c1"}, drain(t, cur))
 }
 
-func TestMergeCursorMatchesStableSortForAnySourceCount(t *testing.T) {
+func TestMergeIteratorMatchesStableSortForAnySourceCount(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	for k := 1; k <= 17; k++ {
 		for round := range 50 {
 			var want []string
-			sources := make([]core.Cursor, k)
+			sources := make([]core.Iterator, k)
 			for i := range sources {
 				var entries []entry
 				for range rng.IntN(20) { // some sources stay empty
@@ -94,40 +94,40 @@ func TestMergeCursorMatchesStableSortForAnySourceCount(t *testing.T) {
 				for _, e := range entries {
 					want = append(want, fmt.Sprintf("%s@1=%s", e.key.UserKey(), e.value))
 				}
-				sources[i] = &sliceCursor{entries: entries}
+				sources[i] = &sliceIterator{entries: entries}
 			}
 			// stable sort keeps source order for equal keys
 			slices.SortStableFunc(want, func(a, b string) int { return strings.Compare(a[:3], b[:3]) })
 
-			got := drain(t, newMergeCursor(sources))
+			got := drain(t, newMergeIterator(sources))
 			require.Equal(t, want, got, "k=%d round=%d", k, round)
 		}
 	}
 }
 
-func TestMVCCCursorResolvesNewestVisibleVersionPerKey(t *testing.T) {
-	sources := func() []core.Cursor {
-		return []core.Cursor{
-			&sliceCursor{entries: []entry{set("a", 9, "a9"), del("b", 6), set("c", 4, "c4")}},
-			&sliceCursor{entries: []entry{set("a", 5, "a5"), set("b", 3, "b3"), set("c", 2, "c2")}},
+func TestSnapshotIteratorResolvesNewestVisibleVersionPerKey(t *testing.T) {
+	sources := func() []core.Iterator {
+		return []core.Iterator{
+			&sliceIterator{entries: []entry{set("a", 9, "a9"), del("b", 6), set("c", 4, "c4")}},
+			&sliceIterator{entries: []entry{set("a", 5, "a5"), set("b", 3, "b3"), set("c", 2, "c2")}},
 		}
 	}
 
 	// a@9 is above readSeq and b's tombstone hides b@3
-	reader := newMVCCCursor(newMergeCursor(sources()), 7, false)
+	reader := newSnapshotIterator(newMergeIterator(sources()), 7, true)
 	assert.Equal(t, []string{"a@5=a5", "c@4=c4"}, drain(t, reader))
 
 	// compaction keeps the tombstone so b@3 can't resurface below
-	compaction := newMVCCCursor(newMergeCursor(sources()), math.MaxUint64, true)
+	compaction := newSnapshotIterator(newMergeIterator(sources()), math.MaxUint64, false)
 	assert.Equal(t, []string{"a@9=a9", "b@6=deleted", "c@4=c4"}, drain(t, compaction))
 }
 
-func TestMergeCursorStopsOnSourceError(t *testing.T) {
+func TestMergeIteratorStopsOnSourceError(t *testing.T) {
 	broken := errors.New("broken block")
-	cur := newMVCCCursor(newMergeCursor([]core.Cursor{
-		&sliceCursor{entries: []entry{set("a", 1, "a1"), set("z", 1, "z1")}},
-		&sliceCursor{entries: []entry{set("b", 1, "b1")}, err: broken},
-	}), math.MaxUint64, false)
+	cur := newSnapshotIterator(newMergeIterator([]core.Iterator{
+		&sliceIterator{entries: []entry{set("a", 1, "a1"), set("z", 1, "z1")}},
+		&sliceIterator{entries: []entry{set("b", 1, "b1")}, err: broken},
+	}), math.MaxUint64, true)
 
 	var keys []string
 	for {

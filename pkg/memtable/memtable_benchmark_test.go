@@ -379,14 +379,14 @@ func BenchmarkMemtable(b *testing.B) {
 						}
 					})
 
-					b.Run("Cursor/All", func(b *testing.B) {
+					b.Run("Iterator/All", func(b *testing.B) {
 						m := impl.Factory()
 						benchFill(b, m, keys, val)
 
 						b.ReportAllocs()
 						for b.Loop() {
 							count := 0
-							c := m.Cursor(nil, nil)
+							c := m.Iterator(nil, nil)
 							for {
 								_, _, ok := c.Next()
 								if !ok {

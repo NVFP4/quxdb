@@ -77,9 +77,9 @@ func TestBuilderReusedBufferWritesNoStaleBytes(t *testing.T) {
 	registry := NewRegistry()
 	view := requireView(t, registry, []*Metadata{meta})
 	table := view.Table(meta.ID)
-	cursor := table.Cursor(nil, nil)
+	it := table.Iterator(nil, nil)
 	for i := range keys {
-		key, val, ok := cursor.Next()
+		key, val, ok := it.Next()
 		require.True(t, ok)
 		require.Equal(t, keys[i], key)
 		require.Equal(t, vals[i], val)
@@ -89,9 +89,9 @@ func TestBuilderReusedBufferWritesNoStaleBytes(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, vals[i], val)
 	}
-	_, _, ok := cursor.Next()
+	_, _, ok := it.Next()
 	require.False(t, ok)
-	require.NoError(t, cursor.Err())
+	require.NoError(t, it.Err())
 	view.Release()
 	require.NoError(t, registry.Close())
 

@@ -204,15 +204,15 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 		outputs = nil
 	}()
 
-	sources := make([]core.Cursor, 0, len(plan.inputs))
+	sources := make([]core.Iterator, 0, len(plan.inputs))
 	for _, table := range plan.inputs {
-		sources = append(sources, plan.view.tables.Table(table.ID).Cursor(nil, nil))
+		sources = append(sources, plan.view.tables.Table(table.ID).Iterator(nil, nil))
 	}
 
 	targetLevel := plan.sourceLevel + 1
 	targetSize := tableTargetBytes
-	// tombstones only drop at the last level, where nothing older can resurface
-	cur := newMVCCCursor(newMergeCursor(sources), math.MaxUint64, targetLevel < vset.MaxLevels-1)
+	drop := canDropTombstones(plan.view.version, plan.sourceLevel, plan.inputs)
+	cur := newSnapshotIterator(newMergeIterator(sources), math.MaxUint64, drop)
 	opts := sst.BuilderOpts{
 		Dir:       c.dataDir,
 		Level:     uint8(targetLevel),
@@ -282,6 +282,21 @@ func movable(inputs []*sst.Metadata, targetLevel int) bool {
 	for i := 1; i < len(sorted); i++ {
 		if bytes.Compare(sorted[i-1].MaxKey, sorted[i].MinKey) >= 0 {
 			return false
+		}
+	}
+	return true
+}
+
+// true when no other table at l1 or deeper overlaps the inputs
+func canDropTombstones(version *vset.Version, sourceLevel int, inputs []*sst.Metadata) bool {
+	minKey, maxKey := tableRange(inputs)
+	for level := max(sourceLevel, 1); level < vset.MaxLevels; level++ {
+		for _, table := range version.Level(level) {
+			if overlaps(table, minKey, maxKey) && !slices.ContainsFunc(inputs, func(in *sst.Metadata) bool {
+				return in.ID == table.ID
+			}) {
+				return false
+			}
 		}
 	}
 	return true

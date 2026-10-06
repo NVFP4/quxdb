@@ -351,7 +351,7 @@ func (m *slMemtable) findGreaterOrEqual(key []byte, prev *[slMaxHeight]uint32) u
 
 var _ Memtable = (*slMemtable)(nil)
 
-type slCursor struct {
+type slIterator struct {
 	m         *slMemtable
 	start     []byte
 	end       []byte
@@ -360,7 +360,7 @@ type slCursor struct {
 	exhausted bool
 }
 
-func (c *slCursor) Next() (key, value []byte, ok bool) {
+func (c *slIterator) Next() (key, value []byte, ok bool) {
 	c.m.mu.RLock()
 	defer c.m.mu.RUnlock()
 
@@ -393,16 +393,16 @@ func (c *slCursor) Next() (key, value []byte, ok bool) {
 	return key, value, true
 }
 
-func (c *slCursor) Err() error {
+func (c *slIterator) Err() error {
 	return nil
 }
 
-func (m *slMemtable) Cursor(start, end []byte) core.Cursor {
-	return &slCursor{
+func (m *slMemtable) Iterator(start, end []byte) core.Iterator {
+	return &slIterator{
 		m:     m,
 		start: start[:len(start):len(start)],
 		end:   end[:len(end):len(end)],
 	}
 }
 
-var _ core.Cursor = (*slCursor)(nil)
+var _ core.Iterator = (*slIterator)(nil)
