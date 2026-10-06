@@ -385,25 +385,11 @@ func (db *QuxDB) writeLoop() {
 	batch := make([]*writeReq, 0, maxBatch)
 	fmt.Println("db: write loop started")
 
-	for {
-		// block for first req
-		req, ok := <-db.reqChan
-		if !ok {
-			break
-		}
+	for req := range db.reqChan {
 		batch = append(batch, req)
-
-	drain:
-		for len(batch) < maxBatch {
-			select { // non-blocking channel check
-			case req, ok := <-db.reqChan:
-				if !ok {
-					break drain
-				}
-				batch = append(batch, req)
-			default:
-				break drain
-			}
+		// sole receiver, so a non-empty buffer never blocks
+		for len(batch) < maxBatch && len(db.reqChan) > 0 {
+			batch = append(batch, <-db.reqChan)
 		}
 
 		db.commitBatch(batch)
@@ -479,15 +465,13 @@ func (db *QuxDB) commitBatch(batch []*writeReq) {
 }
 
 func (db *QuxDB) setMemtable(qkey quxKey, val []byte, lastSeq uint64, lastLSN wal.LSN) error {
-retry:
-	if err := db.lsm.activeMemtable().Set(qkey, val); err != nil {
-		if errors.Is(err, memtable.ErrMemtableFull) {
-			db.rolloverMemtable(lastSeq, lastLSN)
-			goto retry
+	for {
+		err := db.lsm.activeMemtable().Set(qkey, val)
+		if !errors.Is(err, memtable.ErrMemtableFull) {
+			return err
 		}
-		return err
+			db.rolloverMemtable(lastSeq, lastLSN)
 	}
-	return nil
 }
 
 // enterReadOnly stops accepting writes after a wal failure and returns the error writes get from now on.
