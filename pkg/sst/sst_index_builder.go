@@ -1,7 +1,6 @@
 package sst
 
 import (
-	"bufio"
 	"os"
 	"path/filepath"
 
@@ -37,18 +36,10 @@ func (ib *indexBuilder) Finalize() (err error) {
 	}
 	defer fd.Close()
 
-	bw := bufio.NewWriterSize(fd, indexBufCap)
-	_, err = WriteSparseIndex(bw, &ib.index)
-	if err != nil {
+	if _, err = WriteSparseIndex(fd, &ib.index); err != nil {
 		return err
 	}
-
-	if err = bw.Flush(); err != nil {
-		return err
-	}
-
-	err = fs.SyncData(fd)
-	return err
+	return fs.SyncData(fd)
 }
 
 func (ib *indexBuilder) Close() error {

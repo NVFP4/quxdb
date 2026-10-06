@@ -23,8 +23,8 @@ SST INDEX FILE (.qidx)
 ------------------------------------------------------------------
 Field		Bytes	Description
 ------------------------------------------------------------------
-header		24		QIDX File Header (see sst_header.go)
 index		var		SST Index Data
+footer		18		QIDX File Footer (see sst_footer.go)
 ------------------------------------------------------------------
 
 All fixed-size int fields are stored in LE byte-order, except for `magic`
@@ -48,10 +48,8 @@ const (
 )
 
 type sparseIndexEntry struct {
-	// fence or separator. never stores an owned slice.
-	sepKey []byte
-	// span of block
-	span Span
+	sepKey []byte // upper bound of the block's keys, may alias caller keys
+	span   Span
 }
 
 type SparseIndex struct {
@@ -96,7 +94,7 @@ func (si *SparseIndex) SpanAt(i int) (Span, bool) {
 	return si.entries[i].span, true
 }
 
-// expects a valid `minKey` > `maxKey` & `span`
+// expects minKey <= maxKey, with minKey above the previous entry's key
 func (si *SparseIndex) add(minKey, maxKey []byte, span Span) error {
 	// not gonna compare minKey > maxKey - wasted compute on an obvious precondition
 	if len(minKey) == 0 || len(maxKey) == 0 || span.Size == 0 {
@@ -226,8 +224,8 @@ func decodeSparseIndex(src []byte) (SparseIndex, int, error) {
 	entries := make([]sparseIndexEntry, ne)
 	for i := range ne {
 		entry := sparseIndexEntry{}
-		len := decoder.UVarint("sparseIndex.keyLen")
-		entry.sepKey = decoder.Bytes("sparseIndex.key", int(len))
+		keyLen := decoder.UVarint("sparseIndex.keyLen")
+		entry.sepKey = decoder.Bytes("sparseIndex.key", int(keyLen))
 		entry.span.Offset = int(decoder.UVarint("sparseIndex.spanOff"))
 		entry.span.Size = int(decoder.UVarint("sparseIndex.spanSize"))
 		entries[i] = entry
@@ -246,22 +244,15 @@ func decodeSparseIndex(src []byte) (SparseIndex, int, error) {
 // ------ sparse index io ------
 
 func WriteSparseIndex(w io.Writer, idx *SparseIndex) (int, error) {
-	// write metadata header
-	h := sstHeader{sstTypeIndex, sstVersion, time.Now()}
-	hn, err := writeHeader(w, h)
-	if err != nil {
-		return 0, fmt.Errorf("sparse index write %w", err)
-	}
-
-	// write data
 	buf := make([]byte, 0, indexBufCap)
 	buf = encodeSparseIndex(buf, idx)
-	dn, err := w.Write(buf)
+	buf = appendFooter(buf, sstFooter{sstTypeIndex, sstVersion, time.Now()})
+
+	n, err := w.Write(buf)
 	if err != nil {
 		return 0, fmt.Errorf("sparse index write %w", err)
 	}
-
-	return hn + dn, nil
+	return n, nil
 }
 
 func OpenSparseIndex(path string) (*MappedSparseIndex, error) {
@@ -270,15 +261,12 @@ func OpenSparseIndex(path string) (*MappedSparseIndex, error) {
 		return nil, err
 	}
 
-	// decoded header
-	_, n, err := decodeHeader(mmapBytes[0:], sstTypeIndex)
-	if err != nil {
+	if _, err := decodeFooter(mmapBytes, sstTypeIndex); err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("sparse index decode %w", err)
 	}
 
-	// decode payload
-	idx, _, err := decodeSparseIndex(mmapBytes[n:])
+	idx, _, err := decodeSparseIndex(mmapBytes[:len(mmapBytes)-sstFooterLen])
 	if err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("sparse index decode %w", err)

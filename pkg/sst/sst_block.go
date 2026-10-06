@@ -22,15 +22,16 @@ recLen		4		Total bytes of records
 records[]	var		Contiguous bytes of SST Block records
 index		var		SST Block Index (see sst_block_index.go)
 crc			4		CRC32C of all preceding fields
-padding 	var 	Zero padding to the next 8-byte boundary
+padding 	var 	Zero padding to the next page boundary,
+                    absent after the last block
 ------------------------------------------------------------------
 
 SST BLOCK DATA FILE (.qdat)
 ------------------------------------------------------------------
 Field		Bytes	Description
 ------------------------------------------------------------------
-header		18		QDAT File Header (see sst_header.go)
 blocks[]	var		SST Blocks
+footer		18		QDAT File Footer (see sst_footer.go)
 ------------------------------------------------------------------
 
 All fixed-size int fields are stored in LE byte-order, except for `magic`
@@ -51,21 +52,11 @@ type recordView struct {
 	size  int
 }
 
+// Block is a read-only view of an encoded block.
 type Block struct {
-	data     []byte // raw contiguous byes
 	recLen   int
-	index    BlockIndex // write path
-	rawIndex []byte     // read path encoded index
-}
-
-func newBlock(indexCap int) Block {
-	return Block{
-		index: newBlockIndex(indexCap),
-	}
-}
-
-func (b *Block) clear() {
-	b.index.clear()
+	data     []byte // raw block bytes (mmap ref)
+	rawIndex []byte // encoded block index (mmap ref)
 }
 
 func (b *Block) Seek(target []byte) (key []byte, value []byte, ok bool, err error) {
@@ -73,7 +64,7 @@ func (b *Block) Seek(target []byte) (key []byte, value []byte, ok bool, err erro
 	if err != nil || !found {
 		return nil, nil, false, err
 	}
-	return b.scan(target, off, uint32(b.recLen))
+	return b.scan(target, off, uint32(blockHeaderLen+b.recLen))
 }
 
 func (b *Block) scan(target []byte, start uint32, limit uint32) ([]byte, []byte, bool, error) {
@@ -128,9 +119,7 @@ func OpenBlockData(path string) (*MappedBlockData, error) {
 		return nil, err
 	}
 
-	size := len(mmapBytes)
-	_, _, err = decodeHeader(mmapBytes[max(size-sstHeaderLen, 0):], sstTypeData)
-	if err != nil {
+	if _, err = decodeFooter(mmapBytes, sstTypeData); err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("block data decode %w", err)
 	}

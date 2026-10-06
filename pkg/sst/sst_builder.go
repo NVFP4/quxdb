@@ -15,6 +15,7 @@ var (
 	ErrEmptyKey         = errors.New("sst: empty key")
 	ErrClosed           = errors.New("sst: already closed")
 	ErrAlreadyFinalized = errors.New("sst: already finalized")
+	ErrEmptyBuild       = errors.New("sst: empty build")
 )
 
 // Record is one table entry.
@@ -132,13 +133,15 @@ func (b *Builder) Finalize() (*Metadata, error) {
 	if b.closed {
 		return nil, ErrAlreadyFinalized
 	}
+	if b.keys == 0 {
+		return nil, ErrEmptyBuild
+	}
 
 	b.closed = true
 
-	var errs []error
-	errs = append(errs, b.finalizeAll())
-	errs = append(errs, b.closeAll())
-	if err := errors.Join(errs...); err != nil {
+	finalizeErr := b.finalizeAll()
+	sizeBytes := b.blockWriter.fdOff
+	if err := errors.Join(finalizeErr, b.closeAll()); err != nil {
 		return nil, err
 	}
 
@@ -159,13 +162,10 @@ func (b *Builder) Finalize() (*Metadata, error) {
 		MinKey:    bytes.Clone(b.sstMinKey),
 		MaxKey:    bytes.Clone(b.sstMaxKey),
 		Keys:      b.keys,
-		SizeBytes: uint64(b.blockWriter.fdOff),
+		SizeBytes: uint64(sizeBytes),
 		CreatedAt: time.Now().UTC(),
 	}
 
-	b.blockWriter = nil
-	b.filterWriter = nil
-	b.indexWriter = nil
 	b.sstMinKey = nil
 	b.sstMaxKey = nil
 
@@ -176,12 +176,12 @@ func (b *Builder) Finalize() (*Metadata, error) {
 func (b *Builder) Abort() error {
 	b.closed = true
 
-	if err := b.closeAll(); err != nil {
-		return err
+	// writers are already closed after a failed Finalize
+	var err error
+	if b.blockWriter != nil {
+		err = b.closeAll()
 	}
-
-	// delete the dir
-	return os.RemoveAll(b.sstDir)
+	return errors.Join(err, os.RemoveAll(b.sstDir))
 }
 
 func (b *Builder) finalizeAll() error {
@@ -190,7 +190,9 @@ func (b *Builder) finalizeAll() error {
 		return err
 	}
 	if block != nil {
-		b.indexWriter.Add(block)
+		if err := b.indexWriter.Add(block); err != nil {
+			return err
+		}
 	}
 
 	if err := b.indexWriter.Finalize(); err != nil {
@@ -205,9 +207,9 @@ func (b *Builder) finalizeAll() error {
 }
 
 func (b *Builder) closeAll() error {
-	var errs []error
-	errs = append(errs, b.blockWriter.Close())
-	errs = append(errs, b.indexWriter.Close())
-	errs = append(errs, b.filterWriter.Close())
-	return errors.Join(errs...)
+	err := errors.Join(b.blockWriter.Close(), b.indexWriter.Close(), b.filterWriter.Close())
+	b.blockWriter = nil
+	b.indexWriter = nil
+	b.filterWriter = nil
+	return err
 }

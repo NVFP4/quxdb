@@ -49,7 +49,7 @@ func TestOpenRejectsCorruptPayload(t *testing.T) {
 			path := tableFile(meta, ext)
 			data, err := os.ReadFile(path)
 			require.NoError(t, err)
-			data[len(data)-5] ^= 0x01 // last payload byte, before the trailing crc
+			data[len(data)-sstFooterLen-5] ^= 0x01 // last payload byte, before its crc and the footer
 			require.NoError(t, os.WriteFile(path, data, 0o644))
 
 			registry := NewRegistry()

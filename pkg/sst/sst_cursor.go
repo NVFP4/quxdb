@@ -7,63 +7,64 @@ import (
 )
 
 type sstCursor struct {
-	data  *MappedBlockData
-	index *SparseIndex
+	blocks *MappedBlockData
+	index  *SparseIndex
 
-	first int
-	next  int
-	stop  int
+	// block ordinals, endBlock is exclusive
+	firstBlock int
+	nextBlock  int
+	endBlock   int
 
-	start []byte
-	end   []byte
+	startKey []byte
+	endKey   []byte
 
-	block blockCursor
-	done  bool
-	err   error
+	cur  blockCursor
+	done bool
+	err  error
 }
 
 func newSSTCursor(
-	data *MappedBlockData,
+	blocks *MappedBlockData,
 	index *SparseIndex,
-	start, end []byte,
+	startKey, endKey []byte,
 ) *sstCursor {
-	n := index.Len()
+	numBlocks := index.Len()
 
-	first := 0
-	if start != nil {
-		first = index.SearchSpanIndex(start)
+	firstBlock := 0
+	if startKey != nil {
+		firstBlock = index.SearchSpanIndex(startKey)
 	}
 
-	stop := n
-	if end != nil {
-		last := index.SearchSpanIndex(end)
-		if last < n {
-			stop = last + 1
+	endBlock := numBlocks
+	if endKey != nil {
+		lastBlock := index.SearchSpanIndex(endKey)
+		if lastBlock < numBlocks {
+			endBlock = lastBlock + 1
 		}
 	}
 
-	empty := first >= stop ||
-		start != nil && end != nil && bytes.Compare(start, end) > 0
+	empty := firstBlock >= endBlock ||
+		startKey != nil && endKey != nil && bytes.Compare(startKey, endKey) > 0
 
 	return &sstCursor{
-		data:  data,
-		index: index,
-		first: first,
-		next:  first,
-		stop:  stop,
-		start: start,
-		end:   end,
-		done:  empty,
+		blocks:     blocks,
+		index:      index,
+		firstBlock: firstBlock,
+		nextBlock:  firstBlock,
+		endBlock:   endBlock,
+		startKey:   startKey,
+		endKey:     endKey,
+		done:       empty,
 	}
 }
 
 func (c *sstCursor) Next() (key, value []byte, ok bool) {
 	for !c.done {
-		if key, value, ok = c.block.Next(); ok {
+		if key, value, ok = c.cur.Next(); ok {
 			return key, value, true
 		}
 
-		if err := c.block.Err(); err != nil {
+		if err := c.cur.Err(); err != nil {
 			c.err = err
 			c.done = true
 			break
@@ -82,37 +83,38 @@ func (c *sstCursor) Err() error {
 }
 
 func (c *sstCursor) advanceBlock() bool {
-	if c.next >= c.stop {
+	if c.nextBlock >= c.endBlock {
 		c.done = true
 		return false
 	}
 
-	ordinal := c.next
-	c.next++
+	blockIdx := c.nextBlock
+	c.nextBlock++
 
-	span, ok := c.index.SpanAt(ordinal)
+	span, ok := c.index.SpanAt(blockIdx)
 	if !ok {
 		c.err = ErrCorrupt
 		c.done = true
 		return false
 	}
 
-	block, err := c.data.BlockAt(span)
+	block, err := c.blocks.BlockAt(span)
 	if err != nil {
 		c.err = err
 		c.done = true
 		return false
 	}
 
-	var lower, upper []byte
-	if ordinal == c.first {
-		lower = c.start
+	// only the first and last blocks need key bounds
+	var lowerKey, upperKey []byte
+	if blockIdx == c.firstBlock {
+		lowerKey = c.startKey
 	}
-	if ordinal+1 == c.stop {
-		upper = c.end
+	if blockIdx+1 == c.endBlock {
+		upperKey = c.endKey
 	}
 
-	c.block.reset(&block, lower, upper)
+	c.cur.reset(&block, lowerKey, upperKey)
 	return true
 }
 

@@ -95,13 +95,13 @@ func TestBuilderReusedBufferWritesNoStaleBytes(t *testing.T) {
 	view.Release()
 	require.NoError(t, registry.Close())
 
-	// blocks are page aligned with zero padding, the last block is followed by the sst header
+	// blocks are page aligned with zero padding, the last block is followed by the sst footer
 	data, err := os.ReadFile(tableFile(meta, ".qdat"))
 	require.NoError(t, err)
 	blocks := 0
 	for off := 0; ; blocks++ {
 		end := off + int(binary.LittleEndian.Uint32(data[off+4:]))
-		if end+sstHeaderLen == len(data) {
+		if end+sstFooterLen == len(data) {
 			break
 		}
 		next := alignUpPage(end)
@@ -109,6 +109,61 @@ func TestBuilderReusedBufferWritesNoStaleBytes(t *testing.T) {
 		off = next
 	}
 	require.Greater(t, blocks, 10)
+}
+
+func TestSeekFindsRecordsNearBlockEnd(t *testing.T) {
+	dir := t.TempDir()
+	builder, err := NewBuilder(BuilderOpts{Dir: dir, ID: 1, SizeBytes: 64 << 10})
+	require.NoError(t, err)
+
+	// records shorter than the block header sit within its length of the record region end
+	keys := [][]byte{[]byte("a"), []byte("b"), []byte("c")}
+	for _, key := range keys {
+		require.NoError(t, builder.Add(Record{OrderedKey: key, FilterKey: key, Value: key}))
+	}
+	meta, err := builder.Finalize()
+	require.NoError(t, err)
+
+	registry := NewRegistry()
+	view := requireView(t, registry, []*Metadata{meta})
+	for _, key := range keys {
+		gotKey, val, ok, err := view.Table(meta.ID).Seek(key)
+		require.NoError(t, err)
+		require.True(t, ok, "seek %q", key)
+		require.Equal(t, key, gotKey)
+		require.Equal(t, key, val)
+	}
+	view.Release()
+	require.NoError(t, registry.Close())
+}
+
+func TestAbortAfterFailedFinalizeRemovesTmpDir(t *testing.T) {
+	dir := t.TempDir()
+	builder, err := NewBuilder(BuilderOpts{Dir: dir, ID: 1, SizeBytes: 64 << 10})
+	require.NoError(t, err)
+	require.NoError(t, builder.Add(Record{OrderedKey: []byte("a"), FilterKey: []byte("a"), Value: []byte("one")}))
+
+	// an existing index file fails its exclusive create
+	require.NoError(t, os.WriteFile(filepath.Join(builder.sstDir, sstIndexName(1)), nil, 0o644))
+	_, err = builder.Finalize()
+	require.ErrorIs(t, err, os.ErrExist)
+
+	require.NoError(t, builder.Abort())
+	assert.NoDirExists(t, builder.sstDir)
+	assert.NoDirExists(t, sstDirPath(dir, 1))
+}
+
+func TestFinalizeRejectsEmptyBuild(t *testing.T) {
+	dir := t.TempDir()
+	builder, err := NewBuilder(BuilderOpts{Dir: dir, ID: 1, SizeBytes: 64 << 10})
+	require.NoError(t, err)
+
+	_, err = builder.Finalize()
+	require.ErrorIs(t, err, ErrEmptyBuild)
+
+	require.NoError(t, builder.Abort())
+	assert.NoDirExists(t, builder.sstDir)
+	assert.NoDirExists(t, sstDirPath(dir, 1))
 }
 
 func buildTable(t *testing.T, dir string, id uint64) *Metadata {

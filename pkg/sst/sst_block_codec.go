@@ -15,6 +15,10 @@ func encodeBlockRecord(dst, key, val []byte) []byte {
 	return dst
 }
 
+func encodedBlockRecordLen(key, val []byte) int {
+	return uvarintSize(len(key)) + uvarintSize(len(val)) + len(key) + len(val)
+}
+
 func decodeBlockRecord(src []byte) (recordView, error) {
 	var rec recordView
 	decoder := codec.NewDecoder(src)
@@ -54,7 +58,7 @@ func decodeBlock(src []byte) (Block, int, error) {
 
 	// verify checksum of the payload
 	end := len(src)
-	crcOff := end - 4
+	crcOff := end - blockCRCLen
 	crc := decoder.Uint32At("block.crc", crcOff)
 	if crc != crc32.Checksum(src[0:crcOff], crc32Table) {
 		return block, 0, ErrChecksumMismatch
@@ -83,16 +87,15 @@ func decodeBlock(src []byte) (Block, int, error) {
 //  1. we write the index
 //  2. then write the header
 //  3. then compute the crc and append at the end
-func encodeBlock(dst []byte, block *Block) []byte {
-	// block.data is already written in buf (lol)
+func encodeBlock(dst []byte, index *blockIndex) []byte {
+	// records are already written in dst
 
 	recLen := len(dst[blockHeaderLen:])
 
 	// append block index
-	dst = encodeBlockIndex(dst, &block.index)
+	dst = encodeBlockIndex(dst, index)
 
-	blockEnd := len(dst)
-	blockLen := blockEnd + 4 // block end + crc
+	blockLen := len(dst) + blockCRCLen
 	encodeBlockHeader(dst[:0:blockHeaderLen], blockLen, recLen)
 
 	// full crc

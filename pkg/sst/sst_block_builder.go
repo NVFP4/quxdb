@@ -28,7 +28,7 @@ type blockBuilder struct {
 	writeBuf []byte   // write buffer for `fd`
 	written  int
 
-	blockData  Block
+	index      blockIndex
 	blockState blockState
 	indexState indexState
 	lastSealed blockState // reused return of writeBlock, valid until the next seal
@@ -48,17 +48,16 @@ func newBlockWriter(dir string, id uint64, dataSizeBytes uint64) (*blockBuilder,
 	}
 
 	return &blockBuilder{
-		fd:        fd,
-		writeBuf:  make([]byte, 0, alignUpPage(blockSizeTarget)),
-		blockData: newBlock(blockIndexCap),
+		fd:       fd,
+		writeBuf: make([]byte, 0, alignUpPage(blockSizeTarget)),
+		index:    newBlockIndex(blockIndexCap),
 	}, nil
 }
 
 func (bb *blockBuilder) Add(key, val []byte) (*blockState, error) {
 	var lastBlock *blockState
 
-	n := bb.canFit(key, val)
-	if n < 0 && bb.hasKeys() {
+	if bb.hasKeys() && !bb.fits(key, val) {
 		// cannot fit, flush the current block
 		b, err := bb.writeBlock(false)
 		if err != nil {
@@ -103,21 +102,15 @@ func (bb *blockBuilder) Close() error {
 	return err
 }
 
-func (bb *blockBuilder) canFit(key, val []byte) int {
-	kvSize := len(key) + len(val)
-
-	// k/v is bigger than block size
-	if kvSize > blockSizeTarget {
-		return -2
-	}
-
-	// kv will overflow the block
-	blockSize := bb.blockState.fileSpan.Size + int(bb.blockData.index.SizeBytes()) + len(key)
-	if blockSize+kvSize > blockSizeTarget {
-		return -1
-	}
-
-	return 0
+// upper bound of the sealed block size with this record, separators only shrink index keys
+func (bb *blockBuilder) fits(key, val []byte) bool {
+	recOff := bb.blockState.fileSpan.Size
+	size := recOff +
+		encodedBlockRecordLen(key, val) +
+		int(bb.index.sizeBytes) +
+		encodedBlockIndexEntryLen(key, recOff) +
+		blockCRCLen
+	return size <= blockSizeTarget
 }
 
 func (bb *blockBuilder) addBlockRecord(key, val []byte) BlockSpan {
@@ -149,7 +142,7 @@ func (bb *blockBuilder) writeBlock(isLastBlock bool) (*blockState, error) {
 		bb.indexRecord(bb.blockState.maxKey)
 	}
 
-	bb.writeBuf = encodeBlock(bb.writeBuf, &bb.blockData)
+	bb.writeBuf = encodeBlock(bb.writeBuf, &bb.index)
 	bb.blockState.fileSpan.Size = len(bb.writeBuf) // final size of the block
 
 	if !isLastBlock {
@@ -160,10 +153,7 @@ func (bb *blockBuilder) writeBlock(isLastBlock bool) (*blockState, error) {
 		// zero out the padding!
 		clear(bb.writeBuf[pre:])
 	} else {
-		var buf [sstHeaderLen]byte
-		fm := sstHeader{sstTypeData, sstVersion, time.Now()}
-		_ = encodeHeader(buf[:], fm)
-		bb.writeBuf = append(bb.writeBuf, buf[:]...)
+		bb.writeBuf = appendFooter(bb.writeBuf, sstFooter{sstTypeData, sstVersion, time.Now()})
 	}
 
 	bb.blockState.sealed = true
@@ -198,7 +188,7 @@ func (bb *blockBuilder) shouldIndexRecord() bool {
 }
 
 func (bb *blockBuilder) indexRecord(key []byte) {
-	bb.blockData.index.add(bb.indexState.startKey, key, bb.indexState.startKeyOffset)
+	bb.index.add(bb.indexState.startKey, key, bb.indexState.startKeyOffset)
 	bb.indexState.startKey = nil
 	bb.indexState.keys = bb.blockState.keys
 	bb.indexState.size = bb.blockState.fileSpan.Size
@@ -211,7 +201,7 @@ func (bb *blockBuilder) hasKeys() bool {
 func (bb *blockBuilder) reset() {
 	bb.blockState.reset()
 	bb.indexState.reset()
-	bb.blockData.clear()
+	bb.index.clear()
 	bb.writeBuf = bb.writeBuf[:0]
 }
 

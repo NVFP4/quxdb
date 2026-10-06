@@ -1,22 +1,6 @@
 package sst
 
-/*
-
-SST FILTER FILE (.qdat)
-------------------------------------------------------------------
-Field		Bytes	Description
-------------------------------------------------------------------
-header		18		QFLT File Header (see sst_header.go)
-bloom		var		Bloom Filter binary data
-crc			4		CRC32C of all preceding fields
-------------------------------------------------------------------
-
-All fixed-size int fields are stored in LE byte-order, except for `magic`
-
-*/
-
 import (
-	"bufio"
 	"os"
 	"path/filepath"
 
@@ -51,18 +35,10 @@ func (fb *filterBuilder) Finalize() error {
 	}
 	defer fd.Close()
 
-	bw := bufio.NewWriterSize(fd, indexBufCap)
-	_, err = WriteFilter(bw, fb.filter)
-	if err != nil {
+	if _, err = WriteFilter(fd, fb.filter); err != nil {
 		return err
 	}
-
-	if err = bw.Flush(); err != nil {
-		return err
-	}
-
-	err = fs.SyncData(fd)
-	return err
+	return fs.SyncData(fd)
 }
 
 func (fb *filterBuilder) Close() error {

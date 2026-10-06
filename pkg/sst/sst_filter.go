@@ -1,5 +1,20 @@
 package sst
 
+/*
+
+SST FILTER FILE (.qfltr)
+------------------------------------------------------------------
+Field		Bytes	Description
+------------------------------------------------------------------
+bloom		var		Bloom Filter binary data
+crc			4		CRC32C of the bloom data
+footer		18		QFLT File Footer (see sst_footer.go)
+------------------------------------------------------------------
+
+All fixed-size int fields are stored in LE byte-order, except for `magic`
+
+*/
+
 import (
 	"encoding/binary"
 	"fmt"
@@ -29,20 +44,19 @@ func OpenFilter(path string) (*MappedFilter, error) {
 		return nil, err
 	}
 
-	_, n, err := decodeHeader(mmapBytes, sstTypeFilter)
-	if err != nil {
+	if _, err := decodeFooter(mmapBytes, sstTypeFilter); err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("filter decode %w", err)
 	}
 
-	crcOff := len(mmapBytes) - 4
-	if crcOff < n || binary.LittleEndian.Uint32(mmapBytes[crcOff:]) != crc32.Checksum(mmapBytes[:crcOff], crc32Table) {
+	crcOff := len(mmapBytes) - sstFooterLen - 4
+	if crcOff < 0 || binary.LittleEndian.Uint32(mmapBytes[crcOff:]) != crc32.Checksum(mmapBytes[:crcOff], crc32Table) {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("filter decode %w", ErrChecksumMismatch)
 	}
 
 	mf := &MappedFilter{mmap: mmapBytes}
-	err = mf.UnmarshalSlice(mmapBytes[n:crcOff])
+	err = mf.UnmarshalSlice(mmapBytes[:crcOff])
 	if err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, err
@@ -52,26 +66,23 @@ func OpenFilter(path string) (*MappedFilter, error) {
 }
 
 func WriteFilter(w io.Writer, filter *bloom.BloomFilter) (int, error) {
-	crc := crc32.New(crc32Table)
-	mw := io.MultiWriter(w, crc)
-
-	hn, err := writeHeader(mw, sstHeader{sstTypeFilter, sstVersion, time.Now()})
-	if err != nil {
-		return 0, fmt.Errorf("filter write %w", err)
-	}
-
 	data, err := filter.MarshalBinary()
 	if err != nil {
 		return 0, fmt.Errorf("filter encode %w", err)
 	}
-	dn, err := mw.Write(data)
+	dn, err := w.Write(data)
 	if err != nil {
 		return 0, fmt.Errorf("filter write %w", err)
 	}
 
-	cn, err := w.Write(binary.LittleEndian.AppendUint32(nil, crc.Sum32()))
+	cn, err := w.Write(binary.LittleEndian.AppendUint32(nil, crc32.Checksum(data, crc32Table)))
 	if err != nil {
 		return 0, fmt.Errorf("filter write %w", err)
 	}
-	return hn + dn + cn, nil
+
+	fn, err := writeFooter(w, sstFooter{sstTypeFilter, sstVersion, time.Now()})
+	if err != nil {
+		return 0, fmt.Errorf("filter write %w", err)
+	}
+	return dn + cn + fn, nil
 }
