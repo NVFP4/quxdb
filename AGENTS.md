@@ -10,3 +10,7 @@ This is QuxDB, a high-performance LSM database written in Go 1.26.
 ## Comment Guidelines
 
 Comment only to add context a reader can't get from nearby code. Keep it lower case, one line (two at most), in the fewest words that carry the point: state the fact, not the reasoning behind it, e.g. `// set only by catalog snapshots`. No semicolons. Give public structs, interfaces and methods a simple one line docstring saying what they do.
+
+## Naming Guidelines
+
+Name consts `scopeName` (private) or `ScopeName` (public), where scope is the concept or type they belong to, never the package, e.g. `recordHeaderLen`, `segmentModeReadOnly`, `wal.DurabilitySynced`. Omit the scope in single-concept packages like `bloom`. Defaults are `defaultScopeName` / `DefaultScopeName` and follow the Options field path, e.g. `memtable.capacityBytes` → `defaultMemtableCapacityBytes`.

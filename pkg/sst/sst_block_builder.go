@@ -12,12 +12,7 @@ import (
 	"github.com/yashgorana/quxdb/pkg/fs"
 )
 
-const (
-	blockSizeTarget       = 32 << 10 // ~32 KiB Data
-	blockIndexStrideBytes = 2 << 10  // index key every 2 KiB
-	blockIndexStrideKeys  = 8        // index key every 8 keys
-	blockIndexCap         = 256      // yolo value
-)
+const blockIndexCap = 256 // yolo value
 
 // range of bytes within a block
 type BlockSpan Span
@@ -28,13 +23,17 @@ type blockBuilder struct {
 	writeBuf []byte   // write buffer for `fd`
 	written  int
 
+	blockSize   int
+	strideBytes int
+	strideKeys  int
+
 	index      blockIndex
 	blockState blockState
 	indexState indexState
 	lastSealed blockState // reused return of writeBlock, valid until the next seal
 }
 
-func newBlockWriter(dir string, id uint64, dataSizeBytes uint64) (*blockBuilder, error) {
+func newBlockWriter(dir string, id uint64, dataSizeBytes uint64, opts Options) (*blockBuilder, error) {
 	path := filepath.Join(dir, sstBlockDataName(id))
 	fd, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
@@ -48,9 +47,12 @@ func newBlockWriter(dir string, id uint64, dataSizeBytes uint64) (*blockBuilder,
 	}
 
 	return &blockBuilder{
-		fd:       fd,
-		writeBuf: make([]byte, 0, alignUpPage(blockSizeTarget)),
-		index:    newBlockIndex(blockIndexCap),
+		fd:          fd,
+		writeBuf:    make([]byte, 0, alignUpPage(opts.BlockTargetBytes)),
+		index:       newBlockIndex(blockIndexCap),
+		blockSize:   opts.BlockTargetBytes,
+		strideBytes: opts.IndexStrideBytes,
+		strideKeys:  opts.IndexStrideKeys,
 	}, nil
 }
 
@@ -110,7 +112,7 @@ func (bb *blockBuilder) fits(key, val []byte) bool {
 		int(bb.index.sizeBytes) +
 		encodedBlockIndexEntryLen(key, recOff) +
 		blockCRCLen
-	return size <= blockSizeTarget
+	return size <= bb.blockSize
 }
 
 func (bb *blockBuilder) addBlockRecord(key, val []byte) BlockSpan {
@@ -153,7 +155,7 @@ func (bb *blockBuilder) writeBlock(isLastBlock bool) (*blockState, error) {
 		// zero out the padding!
 		clear(bb.writeBuf[pre:])
 	} else {
-		bb.writeBuf = appendFooter(bb.writeBuf, sstFooter{sstTypeData, sstVersion, time.Now()})
+		bb.writeBuf = appendFooter(bb.writeBuf, sstFooter{fileTypeData, footerVersion, time.Now()})
 	}
 
 	bb.blockState.sealed = true
@@ -181,8 +183,8 @@ func (bb *blockBuilder) shouldIndexRecord() bool {
 	keysSinceIndex := bb.blockState.keys - bb.indexState.keys
 	bytesSinceIndex := bb.blockState.fileSpan.Size - bb.indexState.size
 
-	should := keysSinceIndex >= blockIndexStrideKeys ||
-		bytesSinceIndex >= blockIndexStrideBytes
+	should := keysSinceIndex >= bb.strideKeys ||
+		bytesSinceIndex >= bb.strideBytes
 
 	return should
 }

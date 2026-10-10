@@ -2,52 +2,56 @@ package wal
 
 import (
 	"errors"
-	"fmt"
-	"time"
+	"log/slog"
 )
 
-// Record is one payload written by Append and returned by Recover.
-type Record struct {
+// Entry is one payload written by Append and returned by Recover.
+type Entry struct {
 	LSN LSN
 	// valid until the callback returns
 	Data []byte
 }
 
-// WAL is an append-only log of Records, used from one goroutine except RetainFrom and Prune.
+// WAL is an append-only log of Entries, used from one goroutine except RetainFrom and Prune.
 type WAL struct {
 	segments *segmentSet
 	writer   *walWriter
 	reader   *walReader
+	log      *slog.Logger
 }
 
-// New returns a WAL stored in walDir, call Recover before using it.
+// New returns a WAL stored in walDir with DefaultOptions changed by opts, call Recover before using it.
 func New(walDir string, opts ...Option) (*WAL, error) {
-	options, err := applyOptions(opts)
-	if err != nil {
+	o := DefaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return NewWithOptions(walDir, o)
+}
+
+// NewWithOptions returns a WAL stored in walDir configured by o, call Recover before using it.
+func NewWithOptions(walDir string, o Options) (*WAL, error) {
+	if err := validateSegmentSize(o.SegmentBytes); err != nil {
 		return nil, err
 	}
-	segments := newSegmentSet(walDir, options.segmentSize)
+	segments := newSegmentSet(walDir, o.SegmentBytes, o.Logger)
 	return &WAL{
 		segments: segments,
 		writer:   newWalWriter(segments),
-		reader:   newWalReader(segments),
+		reader:   newWalReader(segments, o.ReadAheadBytes),
+		log:      o.Logger,
 	}, nil
 }
 
-// Recover passes every Record after `after` to fn, then readies the WAL for Append.
-func (w *WAL) Recover(after LSN, fn func(Record) error, policy CorruptionPolicy) error {
+// Recover passes every Entry after `after` to fn, then readies the WAL for Append.
+func (w *WAL) Recover(after LSN, fn func(Entry) error, policy CorruptionPolicy) error {
 	if err := w.segments.open(); err != nil {
 		return err
 	}
 
 	for _, seg := range w.segments.segments {
-		fmt.Printf("wal: segment id=%d mode=%d size=%dMiB startLSN=%d createdAt='%s'\n",
-			seg.segId,
-			seg.mode,
-			seg.segMaxSize>>20,
-			seg.startLSN,
-			seg.createdAt.Format(time.RFC3339),
-		)
+		w.log.Debug("segment found", "segment", seg.segId, "mode", seg.mode, "size", seg.segMaxSize,
+			"startLSN", seg.startLSN, "createdAt", seg.createdAt)
 	}
 
 	end, err := w.reader.replayAfter(after, fn)
@@ -57,20 +61,21 @@ func (w *WAL) Recover(after LSN, fn func(Record) error, policy CorruptionPolicy)
 	case !isCorruptionError(err):
 		return err
 	case after != 0 && end == after:
-		// cutting here would let the next Record take after's lsn
+		// cutting here would let the next Entry take after's lsn
 		return &CorruptionError{LSN: after, Err: err}
 	default:
 		torn, scanErr := w.segments.tornTail(end)
 		if scanErr != nil {
 			return errors.Join(err, scanErr)
 		}
+		w.log.Debug("torn tail scan", "lsn", end, "torn", torn, "err", err)
 		switch {
 		case torn:
-			fmt.Printf("wal: cutting torn tail at lsn=%d: %v\n", end, err)
+			w.log.Warn("cutting torn tail", "lsn", end, "err", err)
 		case policy == StopOnCorruption:
 			return &CorruptionError{LSN: end, Err: err}
 		default:
-			fmt.Printf("wal: mid-log corruption at lsn=%d, dropping every record after it: %v\n", end, err)
+			w.log.Warn("mid-log corruption, dropping every entry after it", "lsn", end, "err", err)
 		}
 		if err := w.segments.truncateTail(end); err != nil {
 			return err
@@ -82,17 +87,19 @@ func (w *WAL) Recover(after LSN, fn func(Record) error, policy CorruptionPolicy)
 	return nil
 }
 
-// Append writes parts as one Record and returns its LSN once the Record reaches d.
+// Append writes parts as one Entry and returns its LSN once the Entry reaches d.
 func (w *WAL) Append(parts [][]byte, d Durability) (LSN, error) {
 	return w.writer.append(parts, d)
 }
 
-// RetainFrom marks Records before lsn as no longer needed, Recover must not ask for them again.
+// RetainFrom marks Entries before lsn as no longer needed, Recover must not ask for them again.
 func (w *WAL) RetainFrom(lsn LSN) {
-	w.segments.retainFrom.Store(uint64(lsn))
+	if old := w.segments.retainFrom.Swap(uint64(lsn)); old != uint64(lsn) {
+		w.log.Debug("retain point advanced", "from", LSN(old), "to", lsn)
+	}
 }
 
-// Prune frees disk space held by Records no longer needed.
+// Prune frees disk space held by Entries no longer needed.
 func (w *WAL) Prune() error {
 	err := w.segments.prune()
 	// a freed segment can become the next one

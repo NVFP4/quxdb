@@ -51,8 +51,17 @@ type Builder struct {
 	closed bool
 }
 
-// NewBuilder starts building table opts.ID.
-func NewBuilder(opts BuilderOpts) (*Builder, error) {
+// NewBuilder starts building table opts.ID with DefaultOptions changed by options.
+func NewBuilder(opts BuilderOpts, options ...Option) (*Builder, error) {
+	layout := DefaultOptions()
+	for _, opt := range options {
+		opt(&layout)
+	}
+	return NewBuilderWithOptions(opts, layout)
+}
+
+// NewBuilderWithOptions starts building table opts.ID laid out by layout.
+func NewBuilderWithOptions(opts BuilderOpts, layout Options) (*Builder, error) {
 	id := opts.ID
 	finalDir := sstDirPath(opts.Dir, id)
 	sstDir := finalDir + ".tmp"
@@ -65,7 +74,7 @@ func NewBuilder(opts BuilderOpts) (*Builder, error) {
 		return nil, err
 	}
 
-	bw, err := newBlockWriter(sstDir, id, opts.SizeBytes)
+	bw, err := newBlockWriter(sstDir, id, opts.SizeBytes, layout)
 	if err != nil {
 		return nil, errors.Join(
 			err,
@@ -73,7 +82,7 @@ func NewBuilder(opts BuilderOpts) (*Builder, error) {
 		)
 	}
 
-	iw, err := newIndexWriter(sstDir, id, opts.SizeBytes)
+	iw, err := newIndexWriter(sstDir, id, opts.SizeBytes, layout.BlockTargetBytes)
 	if err != nil {
 		return nil, errors.Join(
 			err,
@@ -82,7 +91,7 @@ func NewBuilder(opts BuilderOpts) (*Builder, error) {
 		)
 	}
 
-	fw := newFilterWriter(sstDir, id, opts.Keys)
+	fw := newFilterWriter(sstDir, id, opts.Keys, layout.FilterBitsPerKey)
 
 	return &Builder{
 		id:           id,
@@ -155,7 +164,7 @@ func (b *Builder) Finalize() (*Metadata, error) {
 	}
 
 	metadata := &Metadata{
-		Version:   sstVersion,
+		Version:   footerVersion,
 		ID:        b.id,
 		Path:      sstFinalPath,
 		Level:     b.level,

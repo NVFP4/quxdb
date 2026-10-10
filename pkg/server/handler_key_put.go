@@ -6,10 +6,10 @@ import (
 	"net/http"
 
 	"github.com/yashgorana/quxdb/pkg/bufpool"
-	"github.com/yashgorana/quxdb/pkg/db"
+	"github.com/yashgorana/quxdb/pkg/quxdb"
 )
 
-func hPutKey(store *db.QuxDB) http.HandlerFunc {
+func hPutKey(store *quxdb.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
 
@@ -22,11 +22,11 @@ func hPutKey(store *db.QuxDB) http.HandlerFunc {
 		}
 
 		err := store.Set([]byte(key), body)
-		if errors.Is(err, db.ErrDbReadOnly) {
+		if errors.Is(err, quxdb.ErrDbReadOnly) {
 			http.Error(w, fmt.Sprintf("failed to set value: %v", err), http.StatusServiceUnavailable)
 			return
 		}
-		if errors.Is(err, db.ErrKeyTooLarge) {
+		if errors.Is(err, quxdb.ErrKeyTooLarge) {
 			http.Error(w, err.Error(), http.StatusRequestURITooLong)
 			return
 		}

@@ -1,4 +1,4 @@
-package db
+package quxdb
 
 import (
 	"bytes"
@@ -83,25 +83,25 @@ func TestPointTombstoneShadowsOlderSST(t *testing.T) {
 
 	require.NoError(t, db.Set([]byte("key"), []byte("old")))
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range cachedImmutables {
+	for i := range defaultMemtableCachedImmutables {
 		require.NoError(t, db.Set(fmt.Appendf(nil, "before-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
 		return db.lsm.currentVersion().Checkpoint().LastSeq == 1 &&
-			db.lsm.immutableMemtableCount() == cachedImmutables
+			db.lsm.immutableMemtableCount() == defaultMemtableCachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
 	require.NoError(t, db.Delete([]byte("key")))
 	tombstoneSeq := db.committedSeq.Load()
 	db.rolloverMemtable(tombstoneSeq, db.lastCommittedLSN)
-	for i := range cachedImmutables {
+	for i := range defaultMemtableCachedImmutables {
 		require.NoError(t, db.Set(fmt.Appendf(nil, "after-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
 		return quxSeq(db.lsm.currentVersion().Checkpoint().LastSeq) == tombstoneSeq &&
-			db.lsm.immutableMemtableCount() == cachedImmutables
+			db.lsm.immutableMemtableCount() == defaultMemtableCachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
 	value, found, err := db.Get([]byte("key"))
@@ -136,13 +136,13 @@ func TestQuxDBRangeAcrossMemtablesAndSSTs(t *testing.T) {
 
 	flushedSeq := db.committedSeq.Load()
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range cachedImmutables {
+	for i := range defaultMemtableCachedImmutables {
 		assert.NoError(t, db.Set(fmt.Appendf(nil, "retained-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
 	require.Eventually(t, func() bool {
 		return quxSeq(db.lsm.currentVersion().Checkpoint().LastSeq) == flushedSeq &&
-			db.lsm.immutableMemtableCount() == cachedImmutables
+			db.lsm.immutableMemtableCount() == defaultMemtableCachedImmutables
 	}, time.Second, 10*time.Millisecond)
 
 	assert.NoError(t, db.Set([]byte("a"), []byte("new-a")))
@@ -219,14 +219,14 @@ func TestCommittedSequenceAdvancesAfterSet(t *testing.T) {
 func TestCommittedSequenceRestoredFromWAL(t *testing.T) {
 	dir := t.TempDir()
 
-	db, err := New(dir)
+	db, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.NoError(t, db.Start(t.Context()))
 	require.NoError(t, db.Set([]byte("first"), []byte("1")))
 	require.NoError(t, db.Set([]byte("second"), []byte("2")))
 	require.NoError(t, db.Stop(t.Context()))
 
-	reopened, err := New(dir)
+	reopened, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.NoError(t, reopened.Start(t.Context()))
 	t.Cleanup(func() {
@@ -241,14 +241,14 @@ func TestCommittedSequenceRestoredFromWAL(t *testing.T) {
 func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 	dir := t.TempDir()
 
-	db, err := New(dir)
+	db, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.NoError(t, db.Start(t.Context()))
 	expected := map[string]string{"first": "1", "second": "2"}
 	require.NoError(t, db.Set([]byte("first"), []byte("1")))
 	require.NoError(t, db.Set([]byte("second"), []byte("2")))
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range cachedImmutables {
+	for i := range defaultMemtableCachedImmutables {
 		key := fmt.Sprintf("retained-%d", i)
 		value := fmt.Sprintf("%d", i+3)
 		expected[key] = value
@@ -258,17 +258,17 @@ func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return db.lsm.currentVersion().Checkpoint().LastSeq == 2 &&
-			db.lsm.immutableMemtableCount() == cachedImmutables
+			db.lsm.immutableMemtableCount() == defaultMemtableCachedImmutables
 	}, time.Second, 10*time.Millisecond)
 	checkpoint := db.lsm.currentVersion().Checkpoint()
 	require.NotZero(t, checkpoint.LastLSN)
 
-	newestSeq := quxSeq(cachedImmutables + 3)
+	newestSeq := quxSeq(defaultMemtableCachedImmutables + 3)
 	expected["newest"] = fmt.Sprintf("%d", newestSeq)
 	require.NoError(t, db.Set([]byte("newest"), []byte(expected["newest"])))
 	require.NoError(t, db.Stop(t.Context()))
 
-	reopened, err := New(dir)
+	reopened, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.Equal(t, checkpoint, reopened.lsm.currentVersion().Checkpoint())
 	require.NoError(t, reopened.Start(t.Context()))
@@ -287,7 +287,7 @@ func TestCheckpointRecoveryReplaysOnlyNewerRecords(t *testing.T) {
 
 func TestRecoverySkipsKVsFlushedByMidBatchRollover(t *testing.T) {
 	dir := t.TempDir()
-	db, err := New(dir)
+	db, err := New(WithDataDir(dir), WithMemtableBytes(16<<20))
 	require.NoError(t, err)
 	require.NoError(t, db.Start(t.Context()))
 
@@ -308,7 +308,7 @@ func TestRecoverySkipsKVsFlushedByMidBatchRollover(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 	require.NoError(t, db.Stop(t.Context()))
 
-	reopened, err := New(dir)
+	reopened, err := New(WithDataDir(dir), WithMemtableBytes(16<<20))
 	require.NoError(t, err)
 	checkpoint := reopened.lsm.currentVersion().Checkpoint()
 	require.Less(t, checkpoint.LastSeq, uint64(n))
@@ -333,12 +333,12 @@ func TestRecoverySkipsKVsFlushedByMidBatchRollover(t *testing.T) {
 
 func TestCorruptBlockSurfacesAsReadError(t *testing.T) {
 	dir := t.TempDir()
-	db, err := New(dir)
+	db, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.NoError(t, db.Start(t.Context()))
 	require.NoError(t, db.Set([]byte("key"), []byte("value")))
 	db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
-	for i := range cachedImmutables {
+	for i := range defaultMemtableCachedImmutables {
 		require.NoError(t, db.Set(fmt.Appendf(nil, "later-%d", i), []byte("value")))
 		db.rolloverMemtable(db.committedSeq.Load(), db.lastCommittedLSN)
 	}
@@ -357,7 +357,7 @@ func TestCorruptBlockSurfacesAsReadError(t *testing.T) {
 	raw[16] ^= 0x01 // inside the first block's records
 	require.NoError(t, os.WriteFile(data[0], raw, 0o644))
 
-	reopened, err := New(dir)
+	reopened, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.NoError(t, reopened.Start(t.Context()))
 	t.Cleanup(func() { require.NoError(t, reopened.Stop(t.Context())) })
@@ -377,7 +377,7 @@ func TestFailedStartReleasesLockAndCanRetry(t *testing.T) {
 	broken := filepath.Join(dir, "wal", "broken.quxwal")
 	require.NoError(t, os.WriteFile(broken, bytes.Repeat([]byte{0xab}, 64), 0o644))
 
-	db, err := New(dir)
+	db, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.Error(t, db.Start(t.Context()))
 
@@ -395,21 +395,21 @@ func TestFailedStartReleasesLockAndCanRetry(t *testing.T) {
 
 func TestStartRejectsLockedDir(t *testing.T) {
 	dir := t.TempDir()
-	first, err := New(dir)
+	first, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.NoError(t, first.Start(t.Context()))
 	t.Cleanup(func() { require.NoError(t, first.Stop(t.Context())) })
 
-	second, err := New(dir)
+	second, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.ErrorContains(t, second.Start(t.Context()), "locked by another process")
 	require.NoError(t, first.Set([]byte("key"), []byte("value")))
 }
 
-func newTestQuxDB(t *testing.T) *QuxDB {
+func newTestQuxDB(t *testing.T) *DB {
 	t.Helper()
 
-	db, err := New(t.TempDir())
+	db, err := New(WithDataDir(t.TempDir()))
 	require.NoError(t, err)
 	require.NoError(t, db.Start(t.Context()))
 	t.Cleanup(func() { require.NoError(t, db.Stop(t.Context())) })
@@ -417,7 +417,7 @@ func newTestQuxDB(t *testing.T) *QuxDB {
 	return db
 }
 
-func collectRange(t *testing.T, db *QuxDB, lower, upper []byte) []string {
+func collectRange(t *testing.T, db *DB, lower, upper []byte) []string {
 	t.Helper()
 	var items []string
 	for e, err := range db.Scan(lower, upper) {
@@ -428,11 +428,9 @@ func collectRange(t *testing.T, db *QuxDB, lower, upper []byte) []string {
 }
 
 func BenchmarkDBSet(b *testing.B) {
-	silenceStdout(b)
-
 	for _, size := range []int{128, 4 << 10, 16 << 10, 128 << 10, 256 << 10, 512 << 10, 1 << 20} {
 		b.Run(fmt.Sprintf("value=%d", size), func(b *testing.B) {
-			db, err := New(b.TempDir())
+			db, err := New(WithDataDir(b.TempDir()))
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -467,7 +465,6 @@ const (
 
 // BenchmarkDBReadWrite runs parallel reads while writers update random keys, over memtables and an sst.
 func BenchmarkDBReadWrite(b *testing.B) {
-	silenceStdout(b)
 	keys := make([][]byte, benchKeys)
 	for i := range keys {
 		keys[i] = fmt.Appendf(nil, "user-key-%08d", i)
@@ -499,7 +496,7 @@ func BenchmarkDBReadWrite(b *testing.B) {
 }
 
 // reports reads/s across b.N parallel reads and the writes/s the writers kept up meanwhile
-func benchReadWrite(b *testing.B, db *QuxDB, keys [][]byte, writers int, read func(r *rand.Rand)) {
+func benchReadWrite(b *testing.B, db *DB, keys [][]byte, writers int, read func(r *rand.Rand)) {
 	var stop atomic.Bool
 	var writes atomic.Int64
 	var wg sync.WaitGroup
@@ -538,8 +535,8 @@ func benchReadWrite(b *testing.B, db *QuxDB, keys [][]byte, writers int, read fu
 }
 
 // loads half the keys into an sst and the rest into memtables, in shuffled order
-func newBenchDB(b *testing.B, keys [][]byte) *QuxDB {
-	db, err := New(b.TempDir())
+func newBenchDB(b *testing.B, keys [][]byte) *DB {
+	db, err := New(WithDataDir(b.TempDir()))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -575,7 +572,7 @@ func newBenchDB(b *testing.B, keys [][]byte) *QuxDB {
 	load(order[:len(order)/2])
 	flushed := db.committedSeq.Load()
 	db.rolloverMemtable(flushed, db.lastCommittedLSN)
-	for i := range cachedImmutables {
+	for i := range defaultMemtableCachedImmutables {
 		if err := db.Set(fmt.Appendf(nil, "pad-%d", i), val); err != nil {
 			b.Fatal(err)
 		}
@@ -589,18 +586,4 @@ func newBenchDB(b *testing.B, keys [][]byte) *QuxDB {
 	}
 	load(order[len(order)/2:])
 	return db
-}
-
-// silenceStdout drops the db's progress prints for the benchmark's duration
-func silenceStdout(b *testing.B) {
-	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		b.Fatal(err)
-	}
-	oldStdout := os.Stdout
-	os.Stdout = devNull
-	b.Cleanup(func() {
-		os.Stdout = oldStdout
-		devNull.Close()
-	})
 }

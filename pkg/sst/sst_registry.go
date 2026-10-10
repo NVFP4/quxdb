@@ -2,7 +2,7 @@ package sst
 
 import (
 	"errors"
-	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 )
@@ -19,13 +19,15 @@ type Registry struct {
 	retired map[uint64]*tableHandle
 	cleanup sync.WaitGroup
 	mu      sync.Mutex
+	log     *slog.Logger
 }
 
-// NewRegistry returns an empty registry.
-func NewRegistry() *Registry {
+// NewRegistry returns an empty registry that reports failed removals to log.
+func NewRegistry(log *slog.Logger) *Registry {
 	return &Registry{
 		cache:   make(map[uint64]*tableHandle),
 		retired: make(map[uint64]*tableHandle),
+		log:     log,
 	}
 }
 
@@ -40,6 +42,7 @@ func (r *Registry) Open(tables []*Metadata) error {
 			return err
 		}
 		r.cache[meta.ID] = &tableHandle{meta: meta, sst: table}
+		r.log.Debug("table opened", "id", meta.ID, "level", meta.Level, "keys", meta.Keys, "bytes", meta.SizeBytes)
 	}
 	return nil
 }
@@ -62,6 +65,7 @@ func (r *Registry) View(tables []*Metadata) *View {
 // Retire marks the table for deletion & will delete once no reader references the table
 func (r *Registry) Retire(tables []*Metadata) {
 	var obsolete []*tableHandle
+	var deferred []uint64
 	r.mu.Lock()
 	for _, meta := range tables {
 		h, cached := r.cache[meta.ID]
@@ -73,23 +77,33 @@ func (r *Registry) Retire(tables []*Metadata) {
 		r.retired[meta.ID] = h
 		if h.refs == 0 {
 			obsolete = append(obsolete, h)
+		} else {
+			deferred = append(deferred, meta.ID)
 		}
 	}
 	r.mu.Unlock()
+	if len(deferred) > 0 {
+		r.log.Debug("removal deferred until readers release", "ids", deferred)
+	}
 
 	r.removeTables(obsolete)
 }
 
 // failed removals stay retired for Close to retry.
 func (r *Registry) removeTables(handles []*tableHandle) {
+	removed := make([]uint64, 0, len(handles))
 	for _, h := range handles {
 		if err := removeTable(h); err != nil {
-			fmt.Printf("sst: remove table %d error %v\n", h.meta.ID, err)
+			r.log.Error("remove table failed", "table", h.meta.ID, "err", err)
 			continue
 		}
 		r.mu.Lock()
 		delete(r.retired, h.meta.ID)
 		r.mu.Unlock()
+		removed = append(removed, h.meta.ID)
+	}
+	if len(removed) > 0 {
+		r.log.Info("removed tables", "ids", removed)
 	}
 }
 

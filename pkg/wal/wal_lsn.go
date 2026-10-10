@@ -1,6 +1,6 @@
 package wal
 
-// LSN is a Record's position in the log.
+// LSN is an Entry's position in the log.
 type LSN uint64
 type segID uint32
 

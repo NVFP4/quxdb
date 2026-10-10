@@ -27,41 +27,41 @@ import (
 )
 
 const (
-	sstVersion   = 1
-	sstFooterLen = 4 + 2 + 8 + 4
+	footerVersion = 1
+	footerLen     = 4 + 2 + 8 + 4
 )
+
+type fileType uint32
 
 const (
-	sstTypeData   sstType = 'Q'<<24 | 'D'<<16 | 'A'<<8 | 'T'
-	sstTypeIndex  sstType = 'Q'<<24 | 'I'<<16 | 'D'<<8 | 'X'
-	sstTypeFilter sstType = 'Q'<<24 | 'F'<<16 | 'L'<<8 | 'T'
+	fileTypeData   fileType = 'Q'<<24 | 'D'<<16 | 'A'<<8 | 'T'
+	fileTypeIndex  fileType = 'Q'<<24 | 'I'<<16 | 'D'<<8 | 'X'
+	fileTypeFilter fileType = 'Q'<<24 | 'F'<<16 | 'L'<<8 | 'T'
 )
 
-type sstType uint32
-
 type sstFooter struct {
-	stype     sstType
+	fileType  fileType
 	version   uint16
 	createdAt time.Time
 }
 
 func appendFooter(dst []byte, sf sstFooter) []byte {
 	start := len(dst)
-	dst = binary.BigEndian.AppendUint32(dst, uint32(sf.stype))
+	dst = binary.BigEndian.AppendUint32(dst, uint32(sf.fileType))
 	dst = binary.LittleEndian.AppendUint16(dst, sf.version)
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(sf.createdAt.UTC().UnixMilli()))
 	return binary.LittleEndian.AppendUint32(dst, crc32.Checksum(dst[start:], crc32Table))
 }
 
-// decodes the footer from the last sstFooterLen bytes of file
-func decodeFooter(file []byte, stype sstType) (sstFooter, error) {
+// decodes the footer from the last footerLen bytes of file
+func decodeFooter(file []byte, want fileType) (sstFooter, error) {
 	var sf sstFooter
 
-	if len(file) < sstFooterLen {
+	if len(file) < footerLen {
 		return sf, fmt.Errorf("sst footer: insufficient bytes to decode")
 	}
 
-	buf := file[len(file)-sstFooterLen:]
+	buf := file[len(file)-footerLen:]
 	decoder := codec.NewDecoder(buf)
 	st := decoder.Uint32BE("footer.type")
 	version := decoder.Uint16("footer.version")
@@ -73,11 +73,11 @@ func decodeFooter(file []byte, stype sstType) (sstFooter, error) {
 		return sf, err
 	}
 
-	if st != uint32(stype) {
+	if st != uint32(want) {
 		return sf, ErrInvalidFormat
 	}
 
-	if version != sstVersion {
+	if version != footerVersion {
 		return sf, ErrUnsupportedVersion
 	}
 
@@ -85,14 +85,14 @@ func decodeFooter(file []byte, stype sstType) (sstFooter, error) {
 		return sf, ErrChecksumMismatch
 	}
 
-	sf.stype = sstType(st)
+	sf.fileType = fileType(st)
 	sf.version = version
 	sf.createdAt = time.UnixMilli(int64(createdAt))
 	return sf, nil
 }
 
 func writeFooter(w io.Writer, sf sstFooter) (int, error) {
-	var buf [sstFooterLen]byte
+	var buf [footerLen]byte
 	b := appendFooter(buf[:0], sf)
 	n, err := w.Write(b)
 	if err != nil {
@@ -104,13 +104,13 @@ func writeFooter(w io.Writer, sf sstFooter) (int, error) {
 	return n, nil
 }
 
-func readFooter(r io.ReaderAt, size int64, stype sstType) (sstFooter, error) {
-	if size < sstFooterLen {
+func readFooter(r io.ReaderAt, size int64, want fileType) (sstFooter, error) {
+	if size < footerLen {
 		return sstFooter{}, fmt.Errorf("sst footer: insufficient bytes to decode")
 	}
-	var buf [sstFooterLen]byte
-	if _, err := r.ReadAt(buf[:], size-sstFooterLen); err != nil {
+	var buf [footerLen]byte
+	if _, err := r.ReadAt(buf[:], size-footerLen); err != nil {
 		return sstFooter{}, err
 	}
-	return decodeFooter(buf[:], stype)
+	return decodeFooter(buf[:], want)
 }

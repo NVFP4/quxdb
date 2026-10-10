@@ -44,12 +44,12 @@ func OpenFilter(path string) (*MappedFilter, error) {
 		return nil, err
 	}
 
-	if _, err := decodeFooter(mmapBytes, sstTypeFilter); err != nil {
+	if _, err := decodeFooter(mmapBytes, fileTypeFilter); err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("filter decode %w", err)
 	}
 
-	crcOff := len(mmapBytes) - sstFooterLen - 4
+	crcOff := len(mmapBytes) - footerLen - 4
 	if crcOff < 0 || binary.LittleEndian.Uint32(mmapBytes[crcOff:]) != crc32.Checksum(mmapBytes[:crcOff], crc32Table) {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("filter decode %w", ErrChecksumMismatch)
@@ -80,7 +80,7 @@ func WriteFilter(w io.Writer, filter *bloom.BloomFilter) (int, error) {
 		return 0, fmt.Errorf("filter write %w", err)
 	}
 
-	fn, err := writeFooter(w, sstFooter{sstTypeFilter, sstVersion, time.Now()})
+	fn, err := writeFooter(w, sstFooter{fileTypeFilter, footerVersion, time.Now()})
 	if err != nil {
 		return 0, fmt.Errorf("filter write %w", err)
 	}

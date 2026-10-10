@@ -5,19 +5,19 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/yashgorana/quxdb/pkg/db"
+	"github.com/yashgorana/quxdb/pkg/quxdb"
 )
 
-func hDeleteKey(store *db.QuxDB) http.HandlerFunc {
+func hDeleteKey(store *quxdb.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
 
 		err := store.Delete([]byte(key))
-		if errors.Is(err, db.ErrDbReadOnly) {
+		if errors.Is(err, quxdb.ErrDbReadOnly) {
 			http.Error(w, fmt.Sprintf("failed to delete key: %v", err), http.StatusServiceUnavailable)
 			return
 		}
-		if errors.Is(err, db.ErrKeyTooLarge) {
+		if errors.Is(err, quxdb.ErrKeyTooLarge) {
 			http.Error(w, err.Error(), http.StatusRequestURITooLong)
 			return
 		}

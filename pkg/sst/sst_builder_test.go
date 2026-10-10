@@ -23,7 +23,7 @@ func TestBuilderReplacesLeftoversOfUncommittedID(t *testing.T) {
 
 	assert.Equal(t, first.Path, second.Path)
 	assert.NoDirExists(t, second.Path+".tmp")
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	view := requireView(t, registry, []*Metadata{second})
 	assert.Equal(t, []byte("one"), tableValue(t, view.Table(second.ID), []byte("a")))
 	view.Release()
@@ -51,7 +51,7 @@ func TestBuilderOversizedFirstRecord(t *testing.T) {
 	meta, err := builder.Finalize()
 	require.NoError(t, err)
 
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	view := requireView(t, registry, []*Metadata{meta})
 	assert.Equal(t, big, tableValue(t, view.Table(meta.ID), []byte("a")))
 	assert.Equal(t, []byte("two"), tableValue(t, view.Table(meta.ID), []byte("b")))
@@ -74,7 +74,7 @@ func TestBuilderReusedBufferWritesNoStaleBytes(t *testing.T) {
 	meta, err := builder.Finalize()
 	require.NoError(t, err)
 
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	view := requireView(t, registry, []*Metadata{meta})
 	table := view.Table(meta.ID)
 	it := table.Iterator(nil, nil)
@@ -101,7 +101,7 @@ func TestBuilderReusedBufferWritesNoStaleBytes(t *testing.T) {
 	blocks := 0
 	for off := 0; ; blocks++ {
 		end := off + int(binary.LittleEndian.Uint32(data[off+4:]))
-		if end+sstFooterLen == len(data) {
+		if end+footerLen == len(data) {
 			break
 		}
 		next := alignUpPage(end)
@@ -124,7 +124,7 @@ func TestSeekFindsRecordsNearBlockEnd(t *testing.T) {
 	meta, err := builder.Finalize()
 	require.NoError(t, err)
 
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	view := requireView(t, registry, []*Metadata{meta})
 	for _, key := range keys {
 		gotKey, val, ok, err := view.Table(meta.ID).Seek(key)

@@ -1,4 +1,4 @@
-package db
+package quxdb
 
 import (
 	"github.com/yashgorana/quxdb/pkg/sst"

@@ -3,6 +3,7 @@ package memtable
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"github.com/yashgorana/quxdb/pkg/core"
 )
@@ -14,6 +15,8 @@ const (
 	Skiplist MemTableType = 1 << iota
 	BTree
 )
+
+const defaultCapacityBytes = 16 << 20
 
 var (
 	// ErrMemtableFull reports a write that doesn't fit in the capacity.
@@ -60,6 +63,24 @@ func (t MemTableType) String() string {
 	}
 }
 
+// MarshalText formats t as its name.
+func (t MemTableType) MarshalText() ([]byte, error) {
+	return []byte(t.String()), nil
+}
+
+// UnmarshalText parses "skiplist" or "btree".
+func (t *MemTableType) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case "skiplist":
+		*t = Skiplist
+	case "btree":
+		*t = BTree
+	default:
+		return fmt.Errorf("memtable: unknown type %q", text)
+	}
+	return nil
+}
+
 // ----------------------------------------------------------------------------
 
 // Option configures a memtable.
@@ -91,7 +112,7 @@ func WithCapacityBytes(capacity int) Option {
 func defaultOptions() Options {
 	return Options{
 		Comparator:    bytes.Compare,
-		CapacityBytes: 16 << 20,
+		CapacityBytes: defaultCapacityBytes,
 	}
 }
 

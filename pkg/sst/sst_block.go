@@ -96,7 +96,7 @@ func OpenBlockData(path string) (*MappedBlockData, error) {
 		return nil, err
 	}
 
-	if _, err = decodeFooter(mmapBytes, sstTypeData); err != nil {
+	if _, err = decodeFooter(mmapBytes, fileTypeData); err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("block data decode %w", err)
 	}

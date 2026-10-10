@@ -8,19 +8,15 @@ import (
 	"github.com/yashgorana/quxdb/pkg/fs"
 )
 
-const (
-	filterBitsPerKey = 12
-)
-
 type filterBuilder struct {
 	path   string
 	filter *bloom.BloomFilter
 }
 
-func newFilterWriter(dir string, id uint64, expectedKeys uint64) *filterBuilder {
+func newFilterWriter(dir string, id uint64, expectedKeys uint64, bitsPerKey uint8) *filterBuilder {
 	return &filterBuilder{
 		path:   filepath.Join(dir, sstFilterName(id)),
-		filter: bloom.NewWithBitsPerKey(expectedKeys, filterBitsPerKey),
+		filter: bloom.NewWithBitsPerKey(expectedKeys, bitsPerKey),
 	}
 }
 

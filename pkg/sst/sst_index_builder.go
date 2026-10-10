@@ -12,11 +12,11 @@ type indexBuilder struct {
 	index SparseIndex
 }
 
-func newIndexWriter(dir string, id uint64, dataSizeBytes uint64) (*indexBuilder, error) {
+func newIndexWriter(dir string, id uint64, dataSizeBytes uint64, blockSize int) (*indexBuilder, error) {
 	path := filepath.Join(dir, sstIndexName(id))
 
 	// 1.5x how many blocks may fit in provided data size
-	cap := int(dataSizeBytes / blockSizeTarget)
+	cap := int(dataSizeBytes) / blockSize
 	cap = cap + cap>>1
 
 	return &indexBuilder{

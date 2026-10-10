@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,31 +27,33 @@ type corruptRecordLengthCase struct {
 	want    error
 }
 
-const walTestSegmentSize = walSegmentMinSize
+const testSegmentSize = segmentMinSize
+
+var testLogger = slog.New(slog.DiscardHandler)
 
 func testLSN(sid segID, offset uint64) LSN {
-	return newLSN(sid, offset, walTestSegmentSize)
+	return newLSN(sid, offset, testSegmentSize)
 }
 
 func testLSNOffset(lsn LSN) uint64 {
-	return lsnOffset(lsn, walTestSegmentSize)
+	return lsnOffset(lsn, testSegmentSize)
 }
 
 func testLSNSegID(lsn LSN) segID {
-	return lsnSegID(lsn, walTestSegmentSize)
+	return lsnSegID(lsn, testSegmentSize)
 }
 
 func corruptRecordLengthCases() []corruptRecordLengthCase {
 	return []corruptRecordLengthCase{
 		{
 			name:    "too small",
-			recLen:  walRecordHeaderLen + walRecordMetaLen - 8,
+			recLen:  recordHeaderLen + recordMetaLen - 8,
 			dataLen: 0,
 			want:    ErrRecordTorn,
 		},
 		{
 			name:    "not aligned",
-			recLen:  walRecordHeaderLen + walRecordMetaLen + 1,
+			recLen:  recordHeaderLen + recordMetaLen + 1,
 			dataLen: 0,
 			want:    ErrRecordTorn,
 		},
@@ -85,13 +88,13 @@ func TestIsCorruptionError(t *testing.T) {
 
 func TestWALAppendRequiresRecover(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New(dir, WithSegmentSize(walTestSegmentSize))
+	w, err := New(dir, WithSegmentBytes(testSegmentSize))
 	require.NoError(t, err)
 
 	_, err = w.Append(parts("early"), DurabilitySynced)
 	require.ErrorIs(t, err, ErrNotRecovered)
 
-	require.NoError(t, w.Recover(0, func(Record) error { return nil }, StopOnCorruption))
+	require.NoError(t, w.Recover(0, func(Entry) error { return nil }, StopOnCorruption))
 	require.NoError(t, w.Close())
 	_, err = w.Append(parts("late"), DurabilitySynced)
 	require.ErrorIs(t, err, ErrNotRecovered)
@@ -100,12 +103,12 @@ func TestWALAppendRequiresRecover(t *testing.T) {
 func TestWALRecoverReadsSegmentsWithIDGaps(t *testing.T) {
 	dir := t.TempDir()
 
-	seg1, err := newSegment(dir, 1, walTestSegmentSize, "")
+	seg1, err := newSegment(dir, 1, testSegmentSize, "", testLogger)
 	require.NoError(t, err)
 	lsn1 := writeRecordAt(t, seg1, []byte("record-1"))
 	require.NoError(t, seg1.close())
 
-	seg3, err := newSegment(dir, 3, walTestSegmentSize, "")
+	seg3, err := newSegment(dir, 3, testSegmentSize, "", testLogger)
 	require.NoError(t, err)
 	lsn3 := writeRecordAt(t, seg3, []byte("record-3"))
 	require.NoError(t, seg3.close())
@@ -184,7 +187,7 @@ func TestWALRecoverRejectsInvalidAfter(t *testing.T) {
 	invalid := testLSN(w.segments.active.segId, w.segments.active.cursor+1)
 	require.NoError(t, w.Close())
 
-	_, err := recoverWAL(t, dir, invalid, StopOnCorruption, func(Record) error { return nil })
+	_, err := recoverWAL(t, dir, invalid, StopOnCorruption, func(Entry) error { return nil })
 	require.ErrorIs(t, err, io.EOF)
 }
 
@@ -196,7 +199,7 @@ func TestWALRecoverStopsOnCallbackError(t *testing.T) {
 
 	stop := errors.New("stop replay")
 	var got []string
-	_, err := recoverWAL(t, dir, 0, StopOnCorruption, func(r Record) error {
+	_, err := recoverWAL(t, dir, 0, StopOnCorruption, func(r Entry) error {
 		got = append(got, string(r.Data))
 		if string(r.Data) == "two" {
 			return stop
@@ -210,12 +213,12 @@ func TestWALRecoverStopsOnCallbackError(t *testing.T) {
 func TestWALNewSegmentIsFullSizeWithCursorAfterHeader(t *testing.T) {
 	w := openTestWAL(t, t.TempDir())
 
-	assert.Equal(t, uint64(walHeaderLenPadded), w.segments.active.cursor)
-	assert.Equal(t, uint64(walHeaderLenPadded), testLSNOffset(w.segments.active.startLSN))
+	assert.Equal(t, uint64(headerLenPadded), w.segments.active.cursor)
+	assert.Equal(t, uint64(headerLenPadded), testLSNOffset(w.segments.active.startLSN))
 	assertActiveSegmentReadWrite(t, w)
 	info, err := os.Stat(w.segments.active.path)
 	require.NoError(t, err)
-	assert.Equal(t, int64(walTestSegmentSize), info.Size())
+	assert.Equal(t, int64(testSegmentSize), info.Size())
 }
 
 func TestWALOpenRemovesUnfinishedSegments(t *testing.T) {
@@ -223,7 +226,7 @@ func TestWALOpenRemovesUnfinishedSegments(t *testing.T) {
 	w := openTestWAL(t, dir)
 	require.NoError(t, w.Close())
 
-	stale := filepath.Join(dir, walDir, segmentName(time.Now(), 9)+walTmpSuffix)
+	stale := filepath.Join(dir, segmentDir, segmentName(time.Now(), 9)+segmentTmpSuffix)
 	require.NoError(t, os.WriteFile(stale, []byte("partial"), 0o644))
 
 	reopened := openTestWAL(t, dir)
@@ -277,9 +280,9 @@ func TestWALTruncateRejectsOutOfBounds(t *testing.T) {
 	lsn := appendOne(t, w, "one")
 	cursor := w.segments.active.cursor
 
-	require.ErrorIs(t, w.segments.truncateTail(testLSN(testLSNSegID(lsn), uint64(walHeaderLenPadded-1))), ErrTruncateOutOfBounds)
+	require.ErrorIs(t, w.segments.truncateTail(testLSN(testLSNSegID(lsn), uint64(headerLenPadded-1))), ErrTruncateOutOfBounds)
 	require.ErrorIs(t, w.segments.truncateTail(testLSN(testLSNSegID(lsn), cursor+1)), ErrTruncateOutOfBounds)
-	require.ErrorContains(t, w.segments.truncateTail(testLSN(99, walHeaderLenPadded)), "unknown segment id=99")
+	require.ErrorContains(t, w.segments.truncateTail(testLSN(99, headerLenPadded)), "unknown segment id=99")
 	assert.Equal(t, cursor, w.segments.active.cursor)
 }
 
@@ -300,12 +303,12 @@ func TestWALPruneKeepsRetiredSegmentsForReuse(t *testing.T) {
 	require.NoError(t, w.Prune())
 	assert.Equal(t, []segID{1, 2}, segmentIDs(w))
 	assert.NoFileExists(t, seg0)
-	assert.FileExists(t, seg0+walPreparedSuffix)
+	assert.FileExists(t, seg0+segmentPreparedSuffix)
 
 	w.RetainFrom(c)
 	require.NoError(t, w.Prune())
 	assert.Equal(t, []segID{2}, segmentIDs(w))
-	assert.Equal(t, []string{seg0 + walPreparedSuffix, seg1 + walPreparedSuffix}, w.segments.spares)
+	assert.Equal(t, []string{seg0 + segmentPreparedSuffix, seg1 + segmentPreparedSuffix}, w.segments.spares)
 	require.NoError(t, w.Close())
 
 	reopened, got := recoverTestWAL(t, dir, c)
@@ -318,20 +321,20 @@ func TestWALPruneDeletesBeyondSpareLimit(t *testing.T) {
 	w.segments.stopPreparer()
 
 	var last LSN
-	for range walMaxSpares + 2 {
+	for range segmentMaxSpares + 2 {
 		last = appendOne(t, w, strings.Repeat("x", 4000))
 	}
 	paths := segmentPaths(w)
 
 	w.RetainFrom(last)
 	require.NoError(t, w.Prune())
-	assert.Len(t, w.segments.spares, walMaxSpares)
-	for _, path := range paths[:walMaxSpares] {
-		assert.FileExists(t, path+walPreparedSuffix)
+	assert.Len(t, w.segments.spares, segmentMaxSpares)
+	for _, path := range paths[:segmentMaxSpares] {
+		assert.FileExists(t, path+segmentPreparedSuffix)
 	}
-	for _, path := range paths[walMaxSpares : len(paths)-1] {
+	for _, path := range paths[segmentMaxSpares : len(paths)-1] {
 		assert.NoFileExists(t, path)
-		assert.NoFileExists(t, path+walPreparedSuffix)
+		assert.NoFileExists(t, path+segmentPreparedSuffix)
 	}
 }
 
@@ -367,7 +370,7 @@ func TestWALRolloverRecyclesSpareWithoutReplayingItsOldRecords(t *testing.T) {
 
 	// lose the end marker: the stale header beneath it belongs to segment 0
 	end := testLSNOffset(newLSN) + uint64(encodedRecordLen([]byte("new-record")))
-	stale := encodeTestRecordAt(testLSN(0, end), []byte("old-record"))[:walEndMarkerLen]
+	stale := encodeTestRecordAt(testLSN(0, end), []byte("old-record"))[:segmentEndMarkerLen]
 	_, err = w.segments.active.file.WriteAt(stale, int64(end))
 	require.NoError(t, err)
 	require.NoError(t, w.Close())
@@ -385,14 +388,14 @@ func TestWALPreparerSuppliesNextSegment(t *testing.T) {
 
 	next := waitPrepared(t, w)
 	assert.Equal(t, w.segments.active.segId+1, next.segId)
-	assert.True(t, strings.HasSuffix(next.path, walPreparedSuffix))
+	assert.True(t, strings.HasSuffix(next.path, segmentPreparedSuffix))
 	assert.FileExists(t, next.path)
 
 	appendOne(t, w, strings.Repeat("f", 4000))
 	lsn := appendOne(t, w, "next")
 	assert.Same(t, next, w.segments.active)
 	assert.Equal(t, next.segId, testLSNSegID(lsn))
-	assert.False(t, strings.HasSuffix(next.path, walPreparedSuffix))
+	assert.False(t, strings.HasSuffix(next.path, segmentPreparedSuffix))
 	assert.FileExists(t, next.path)
 
 	refilled := waitPrepared(t, w)
@@ -433,7 +436,7 @@ func TestWALPreparedSegmentLeftOnCloseIsReused(t *testing.T) {
 	reopened, got := recoverTestWAL(t, dir, 0)
 	assert.Equal(t, []testRecord{{one, "one"}}, got)
 	for _, seg := range reopened.segments.segments {
-		assert.False(t, strings.HasSuffix(seg.path, walPreparedSuffix), "prepared file opened as a segment")
+		assert.False(t, strings.HasSuffix(seg.path, segmentPreparedSuffix), "prepared file opened as a segment")
 	}
 
 	// the reopened preparer recycles it as the next segment
@@ -529,7 +532,7 @@ func TestWALAppendSplitsRecordAcrossSegments(t *testing.T) {
 }
 
 func TestWALAppendWritesMorePartsThanIOVMax(t *testing.T) {
-	w := openTestWAL(t, t.TempDir(), WithSegmentSize(16<<20))
+	w := openTestWAL(t, t.TempDir(), WithSegmentBytes(16<<20))
 
 	var ps [][]byte
 	var want []byte
@@ -552,8 +555,8 @@ func TestWALRecoverCutsTornSplitRecord(t *testing.T) {
 		at   uint64 // offset into the last partial walRecord that gets damaged
 		with []byte
 	}{
-		{name: "last partial walRecord lost", at: 0, with: make([]byte, walRecordHeaderLen)},
-		{name: "last partial walRecord header intact, data torn", at: walRecordHeaderLen + 5, with: []byte{0xff}},
+		{name: "last partial walRecord lost", at: 0, with: make([]byte, recordHeaderLen)},
+		{name: "last partial walRecord header intact, data torn", at: recordHeaderLen + 5, with: []byte{0xff}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -607,9 +610,9 @@ func TestWALAppendRollsOverWhenFull(t *testing.T) {
 	oldCursor := old.cursor
 
 	lsn := appendOne(t, w, "next")
-	assert.Equal(t, uint64(walHeaderLenPadded), testLSNOffset(fillLSN))
+	assert.Equal(t, uint64(headerLenPadded), testLSNOffset(fillLSN))
 	assert.Equal(t, oldCursor, old.cursor)
-	assert.Equal(t, testLSN(1, walHeaderLenPadded), lsn)
+	assert.Equal(t, testLSN(1, headerLenPadded), lsn)
 	assertInactiveSegmentUnmapped(t, w, 0)
 	require.NoError(t, w.Close())
 
@@ -624,7 +627,7 @@ func TestWALRecoverCutsInvalidTail(t *testing.T) {
 	good := appendOne(t, w, "good")
 	goodNext := testLSN(0, testLSNOffset(good)+uint64(encodedRecordLen([]byte("good"))))
 
-	badHeader := make([]byte, walRecordHeaderLen)
+	badHeader := make([]byte, recordHeaderLen)
 	copy(badHeader, "NOPE")
 	_, err := w.segments.active.file.WriteAt(badHeader, int64(testLSNOffset(goodNext)))
 	require.NoError(t, err)
@@ -633,10 +636,10 @@ func TestWALRecoverCutsInvalidTail(t *testing.T) {
 	reopened, got := recoverTestWAL(t, dir, 0)
 	assert.Equal(t, []testRecord{{good, "good"}}, got)
 	assert.Equal(t, testLSNOffset(goodNext), reopened.segments.active.cursor)
-	marker := make([]byte, walEndMarkerLen)
+	marker := make([]byte, segmentEndMarkerLen)
 	_, err = reopened.segments.active.file.ReadAt(marker, int64(testLSNOffset(goodNext)))
 	require.NoError(t, err)
-	assert.Equal(t, endMarker[:], marker)
+	assert.Equal(t, segmentEndMarker[:], marker)
 
 	afterLSN := appendOne(t, reopened, "after")
 	assert.Equal(t, goodNext, afterLSN)
@@ -673,7 +676,7 @@ func TestWALRecoverMidLogCorruption(t *testing.T) {
 	t.Run("stop leaves the log untouched", func(t *testing.T) {
 		dir, _, bad := setup(t)
 		for range 2 {
-			_, err := recoverWAL(t, dir, 0, StopOnCorruption, func(Record) error { return nil })
+			_, err := recoverWAL(t, dir, 0, StopOnCorruption, func(Entry) error { return nil })
 			var corrupt *CorruptionError
 			require.ErrorAs(t, err, &corrupt)
 			assert.Equal(t, bad, corrupt.LSN)
@@ -684,7 +687,7 @@ func TestWALRecoverMidLogCorruption(t *testing.T) {
 
 	t.Run("truncate keeps records before the damage", func(t *testing.T) {
 		dir, good, bad := setup(t)
-		w, err := recoverWAL(t, dir, 0, TruncateOnCorruption, func(Record) error { return nil })
+		w, err := recoverWAL(t, dir, 0, TruncateOnCorruption, func(Entry) error { return nil })
 		require.NoError(t, err)
 		// "after" encodes to the size of "bad", so without its end marker "third" would read as valid again
 		after := appendOne(t, w, "after")
@@ -702,17 +705,17 @@ func TestWALRecoverStopsOnCorruptionBeforeLaterSegment(t *testing.T) {
 
 	first, second := appendTwo(t, w, bytes.Repeat([]byte{'a'}, 4000), []byte("two"))
 	require.Equal(t, segID(1), testLSNSegID(second))
-	_, err := w.segments.byID[0].file.WriteAt([]byte{0xff}, int64(testLSNOffset(first)+walRecordHeaderLen+10))
+	_, err := w.segments.byID[0].file.WriteAt([]byte{0xff}, int64(testLSNOffset(first)+recordHeaderLen+10))
 	if err != nil {
 		// sealed segments are read-only, write through the path instead
 		file, openErr := os.OpenFile(w.segments.byID[0].path, os.O_RDWR, 0)
 		require.NoError(t, openErr)
-		_, err = file.WriteAt([]byte{0xff}, int64(testLSNOffset(first)+walRecordHeaderLen+10))
+		_, err = file.WriteAt([]byte{0xff}, int64(testLSNOffset(first)+recordHeaderLen+10))
 		require.NoError(t, errors.Join(err, file.Close()))
 	}
 	require.NoError(t, w.Close())
 
-	_, err = recoverWAL(t, dir, 0, StopOnCorruption, func(Record) error { return nil })
+	_, err = recoverWAL(t, dir, 0, StopOnCorruption, func(Entry) error { return nil })
 	var corrupt *CorruptionError
 	require.ErrorAs(t, err, &corrupt)
 	assert.Equal(t, first, corrupt.LSN)
@@ -726,7 +729,7 @@ func TestWALRecoverStopsOnCorruptAfterRecord(t *testing.T) {
 		zeroRecordBodyAndCRC(t, w, one, []byte("one"))
 		require.NoError(t, w.Close())
 
-		_, err := recoverWAL(t, dir, one, policy, func(Record) error { return nil })
+		_, err := recoverWAL(t, dir, one, policy, func(Entry) error { return nil })
 		var corrupt *CorruptionError
 		require.ErrorAs(t, err, &corrupt, "policy=%d", policy)
 		assert.Equal(t, one, corrupt.LSN)
@@ -734,9 +737,9 @@ func TestWALRecoverStopsOnCorruptAfterRecord(t *testing.T) {
 }
 
 func TestWALFailureIsSticky(t *testing.T) {
-	w, err := New(t.TempDir(), WithSegmentSize(walTestSegmentSize))
+	w, err := New(t.TempDir(), WithSegmentBytes(testSegmentSize))
 	require.NoError(t, err)
-	require.NoError(t, w.Recover(0, func(Record) error { return nil }, StopOnCorruption))
+	require.NoError(t, w.Recover(0, func(Entry) error { return nil }, StopOnCorruption))
 	t.Cleanup(func() { _ = w.Close() }) // the active file is closed below
 	appendOne(t, w, "ok")
 
@@ -746,12 +749,12 @@ func TestWALFailureIsSticky(t *testing.T) {
 	require.ErrorIs(t, err1, ErrWALFailed)
 	assert.Equal(t, err1, err2)
 	assert.Contains(t, err1.Error(), w.segments.active.path)
-	assert.NotContains(t, err1.Error(), walPreparedSuffix)
+	assert.NotContains(t, err1.Error(), segmentPreparedSuffix)
 }
 
 func TestWALOpenRejectsBadSegmentHeaderCRC(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := newSegment(dir, 0, walTestSegmentSize, "")
+	seg, err := newSegment(dir, 0, testSegmentSize, "", testLogger)
 	require.NoError(t, err)
 	segPath := seg.path
 	require.NoError(t, seg.close())
@@ -762,14 +765,14 @@ func TestWALOpenRejectsBadSegmentHeaderCRC(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
 
-	_, err = recoverWAL(t, dir, 0, StopOnCorruption, func(Record) error { return nil })
+	_, err = recoverWAL(t, dir, 0, StopOnCorruption, func(Entry) error { return nil })
 	require.ErrorIs(t, err, ErrHeaderChecksumMismatch)
 }
 
 func TestSegmentSetRolloverWrapsSegmentID(t *testing.T) {
 	dir := t.TempDir()
-	segments := newSegmentSet(dir, walTestSegmentSize)
-	old, err := newSegment(dir, ^segID(0), walTestSegmentSize, "")
+	segments := newSegmentSet(dir, testSegmentSize, testLogger)
+	old, err := newSegment(dir, ^segID(0), testSegmentSize, "", testLogger)
 	require.NoError(t, err)
 	segments.segments = append(segments.segments, old)
 	segments.byID[old.segId] = old
@@ -827,7 +830,7 @@ func TestWALReadRejectsInvalidLSN(t *testing.T) {
 	_, _, err = readAt(w, testLSN(testLSNSegID(lsn), w.segments.active.cursor))
 	require.ErrorIs(t, err, io.EOF)
 
-	_, _, err = readAt(w, testLSN(42, walHeaderLenPadded))
+	_, _, err = readAt(w, testLSN(42, headerLenPadded))
 	require.ErrorContains(t, err, "unknown segment id=42")
 }
 
@@ -842,7 +845,7 @@ func TestWALRecordPaddingZeroed(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, len(buf), n)
 
-	pad := buf[walRecordHeaderLen+len(data)+walRecordMetaLen:]
+	pad := buf[recordHeaderLen+len(data)+recordMetaLen:]
 	require.NotEmpty(t, pad)
 	assert.Equal(t, make([]byte, len(pad)), pad)
 }
@@ -894,7 +897,7 @@ func TestWALReadRejectsBadRecordLengths(t *testing.T) {
 			w := openTestWAL(t, t.TempDir())
 			lsn := appendOne(t, w, "payload")
 
-			var header [walRecordHeaderLen]byte
+			var header [recordHeaderLen]byte
 			h := walRecordHeader{
 				lsn:     uint64(lsn),
 				recLen:  tt.recLen,
@@ -967,7 +970,7 @@ func TestWALReadRejectsRecordPastCursor(t *testing.T) {
 		name string
 		keep uint64
 	}{
-		{name: "torn header", keep: walRecordHeaderLen - 1},
+		{name: "torn header", keep: recordHeaderLen - 1},
 		{name: "short record", keep: uint64(encodedRecordLen([]byte("payload"))) - 8},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -983,7 +986,7 @@ func TestWALReadRejectsRecordPastCursor(t *testing.T) {
 
 func TestWALReplayReadsActiveSegmentAcrossWindows(t *testing.T) {
 	dir := t.TempDir()
-	size := WithSegmentSize(1 << 20)
+	size := WithSegmentBytes(1 << 20)
 	w := openTestWAL(t, dir, size)
 
 	var want []testRecord
@@ -993,7 +996,7 @@ func TestWALReplayReadsActiveSegmentAcrossWindows(t *testing.T) {
 		require.NoError(t, err)
 		want = append(want, testRecord{lsn, data})
 	}
-	big := string(patterned(3 * walReadAhead)) // larger than one read-ahead
+	big := string(patterned(3 * defaultReadAheadBytes)) // larger than one read-ahead
 	want = append(want, testRecord{appendOne(t, w, big), big})
 	require.NoError(t, w.Close())
 
@@ -1018,19 +1021,19 @@ func TestWALReadAfterTruncateSeesRewrittenTail(t *testing.T) {
 }
 
 func TestReadRecordBytesRejectsTornInput(t *testing.T) {
-	buf := encodeTestRecordAt(testLSN(0, walHeaderLenPadded), []byte("record"))
+	buf := encodeTestRecordAt(testLSN(0, headerLenPadded), []byte("record"))
 
-	_, err := readRecordBytes(buf[:walRecordHeaderLen-1], 0)
+	_, err := readRecordBytes(buf[:recordHeaderLen-1], 0)
 	require.ErrorIs(t, err, ErrRecordTorn)
 
-	_, err = readRecordBytes(buf[:walRecordHeaderLen+1], 0)
+	_, err = readRecordBytes(buf[:recordHeaderLen+1], 0)
 	require.ErrorIs(t, err, ErrRecordTorn)
 }
 
 func BenchmarkWALAppend(b *testing.B) {
 	w, err := New(b.TempDir())
 	require.NoError(b, err)
-	require.NoError(b, w.Recover(0, func(Record) error { return nil }, StopOnCorruption))
+	require.NoError(b, w.Recover(0, func(Entry) error { return nil }, StopOnCorruption))
 	b.Cleanup(func() { require.NoError(b, w.Close()) })
 
 	var ps [][]byte
@@ -1089,7 +1092,7 @@ func encodeRecord(dst []byte, rec *walRecord) int {
 	off, _ := encodeRecordHeader(dst, &rec.walRecordHeader)
 	off += copy(dst[off:], rec.data)
 	binary.LittleEndian.PutUint32(dst[off:], crc32.Checksum(dst[:off], crc32Table))
-	off += walRecordMetaLen
+	off += recordMetaLen
 	clear(dst[off:rec.recLen])
 	return int(rec.recLen)
 }
@@ -1114,17 +1117,17 @@ func writeRecordAt(t *testing.T, seg *walSegment, data []byte) LSN {
 
 func zeroRecordBodyAndCRC(t *testing.T, w *WAL, lsn LSN, data []byte) {
 	t.Helper()
-	zeroes := make([]byte, encodedRecordLen(data)-walRecordHeaderLen)
-	written, err := w.segments.byID[testLSNSegID(lsn)].file.WriteAt(zeroes, int64(testLSNOffset(lsn)+walRecordHeaderLen))
+	zeroes := make([]byte, encodedRecordLen(data)-recordHeaderLen)
+	written, err := w.segments.byID[testLSNSegID(lsn)].file.WriteAt(zeroes, int64(testLSNOffset(lsn)+recordHeaderLen))
 	require.NoError(t, err)
 	require.Equal(t, len(zeroes), written)
 }
 
 // recoverWAL opens dir and recovers it, the WAL is closed at test end even when Recover fails.
-func recoverWAL(t *testing.T, dir string, after LSN, policy CorruptionPolicy, fn func(Record) error, opts ...Option) (*WAL, error) {
+func recoverWAL(t *testing.T, dir string, after LSN, policy CorruptionPolicy, fn func(Entry) error, opts ...Option) (*WAL, error) {
 	t.Helper()
 	if len(opts) == 0 {
-		opts = append(opts, WithSegmentSize(walTestSegmentSize))
+		opts = append(opts, WithSegmentBytes(testSegmentSize))
 	}
 	w, err := New(dir, opts...)
 	require.NoError(t, err)
@@ -1135,7 +1138,7 @@ func recoverWAL(t *testing.T, dir string, after LSN, policy CorruptionPolicy, fn
 func recoverTestWAL(t *testing.T, dir string, after LSN, opts ...Option) (*WAL, []testRecord) {
 	t.Helper()
 	var got []testRecord
-	w, err := recoverWAL(t, dir, after, StopOnCorruption, func(r Record) error {
+	w, err := recoverWAL(t, dir, after, StopOnCorruption, func(r Entry) error {
 		got = append(got, testRecord{r.LSN, string(r.Data)})
 		return nil
 	}, opts...)

@@ -1,15 +1,16 @@
 package server
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/yashgorana/quxdb/pkg/db"
+	"github.com/yashgorana/quxdb/pkg/quxdb"
 )
 
-func setupHttpRoutes(db *db.QuxDB) http.Handler {
+func setupHttpRoutes(db *quxdb.DB, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", indexHandler)
 	mux.HandleFunc("GET /health", healthHandler)
@@ -21,5 +22,5 @@ func setupHttpRoutes(db *db.QuxDB) http.Handler {
 		prometheus.DefaultGatherer,
 		promhttp.HandlerOpts{EnableOpenMetrics: true},
 	))
-	return middlewares(mux, promInstrument, recoverer)
+	return middlewares(mux, instrument(log), recoverer(log))
 }

@@ -1,4 +1,4 @@
-package db
+package quxdb
 
 import (
 	"bytes"
@@ -47,7 +47,7 @@ func TestPickCompaction(t *testing.T) {
 		_, inputs := pickCompaction(testVersion(t,
 			testMeta(1, 0, "a", "c", mib), testMeta(2, 0, "d", "f", mib), testMeta(3, 0, "g", "i", mib),
 			testMeta(4, 1, "a", "z", mib),
-		))
+		), DefaultOptions().Compaction)
 		assert.Empty(t, inputs)
 	})
 
@@ -56,7 +56,7 @@ func TestPickCompaction(t *testing.T) {
 			testMeta(1, 0, "b", "c", mib), testMeta(2, 0, "c", "d", mib), testMeta(3, 0, "d", "e", mib),
 			testMeta(4, 0, "e", "f", mib), testMeta(5, 0, "x", "y", mib),
 			testMeta(6, 1, "a", "b", mib), testMeta(7, 1, "f", "g", mib), testMeta(8, 1, "m", "n", mib),
-		))
+		), DefaultOptions().Compaction)
 		assert.Equal(t, 0, level)
 		assert.Equal(t, []uint64{1, 2, 3, 4, 6, 7}, tableIDs(inputs))
 	})
@@ -66,23 +66,23 @@ func TestPickCompaction(t *testing.T) {
 		level, inputs := pickCompaction(testVersion(t,
 			testMeta(1, 1, "a", "c", 200*mib), testMeta(2, 1, "m", "n", 200*mib),
 			testMeta(3, 2, "b", "d", 2000*mib), testMeta(4, 2, "m", "o", 100*mib),
-		))
+		), DefaultOptions().Compaction)
 		assert.Equal(t, 1, level)
 		assert.Equal(t, []uint64{2, 4}, tableIDs(inputs))
 	})
 
 	t.Run("bottom level is never picked", func(t *testing.T) {
-		_, inputs := pickCompaction(testVersion(t, testMeta(1, vset.MaxLevels-1, "a", "z", tib)))
+		_, inputs := pickCompaction(testVersion(t, testMeta(1, vset.MaxLevels-1, "a", "z", tib)), DefaultOptions().Compaction)
 		assert.Empty(t, inputs)
 	})
 }
 
 func TestLevelTargets(t *testing.T) {
-	small := levelTargets(testVersion(t, testMeta(1, vset.MaxLevels-1, "a", "z", gib)))
+	small := levelTargets(testVersion(t, testMeta(1, vset.MaxLevels-1, "a", "z", gib)), DefaultOptions().Compaction)
 	assert.Equal(t, [vset.MaxLevels]int64{0, 256 * mib, 2560 * mib, 25600 * mib, 0}, small)
 
 	// a 10 TiB bottom pulls every level up so each pair stays 10x apart
-	large := levelTargets(testVersion(t, testMeta(1, vset.MaxLevels-1, "a", "z", 10*tib)))
+	large := levelTargets(testVersion(t, testMeta(1, vset.MaxLevels-1, "a", "z", 10*tib)), DefaultOptions().Compaction)
 	assert.Equal(t, [vset.MaxLevels]int64{0, 10 * tib / 1000, 10 * tib / 100, 10 * tib / 10, 0}, large)
 }
 
@@ -193,11 +193,7 @@ func TestCompactionRewritesLoneTableIntoBottom(t *testing.T) {
 }
 
 func TestCompactionSplitsOutputsAtTargetSize(t *testing.T) {
-	saved := tableTargetBytes
-	t.Cleanup(func() { tableTargetBytes = saved })
-	tableTargetBytes = 128
-
-	state, compactor := newTestCompactor(t)
+	state, compactor := newTestCompactor(t, WithTableTargetBytes(128))
 	var entries []entry
 	for i := range 20 {
 		entries = append(entries, set(fmt.Sprintf("k%02d", i), quxSeq(i+1), "0123456789abcdef"))
@@ -219,13 +215,17 @@ func TestCompactionSplitsOutputsAtTargetSize(t *testing.T) {
 	assert.Len(t, all, 20)
 }
 
-func newTestCompactor(t *testing.T) (*lsmState, *lsmCompactor) {
+func newTestCompactor(t *testing.T, opts ...Option) (*lsmState, *lsmCompactor) {
 	t.Helper()
+	o := DefaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
 	dir := t.TempDir()
-	state, err := newLsmState(dir)
+	state, err := newLsmState(dir, o)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, state.close()) })
-	return state, newLsmCompactor(dir, state, func() {})
+	return state, newLsmCompactor(dir, state, o, func() {})
 }
 
 // builds a table from entries and publishes it at level.

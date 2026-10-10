@@ -32,11 +32,11 @@ import (
 )
 
 const (
-	walVersion       = 2
-	walHeaderMagic32 = 'Q'<<24 | 'W'<<16 | 'A'<<8 | 'L'
+	headerVersion = 2
+	headerMagic32 = 'Q'<<24 | 'W'<<16 | 'A'<<8 | 'L'
 
-	walHeaderLen       = 8*2 + 4*3 + 2*2
-	walHeaderLenPadded = (walHeaderLen + 7) &^ 7
+	headerLen       = 8*2 + 4*3 + 2*2
+	headerLenPadded = (headerLen + 7) &^ 7
 )
 
 var (
@@ -57,7 +57,7 @@ type walHeader struct {
 func encodeHeader(dst []byte, h *walHeader) (int, error) {
 	off := 0
 
-	binary.BigEndian.PutUint32(dst[off:], walHeaderMagic32)
+	binary.BigEndian.PutUint32(dst[off:], headerMagic32)
 	off += 4
 
 	binary.LittleEndian.PutUint16(dst[off:], h.segVer)
@@ -100,10 +100,10 @@ func decodeHeader(src []byte) (walHeader, int, error) {
 	if err := decoder.Err(); err != nil {
 		return h, 0, err
 	}
-	if magic != walHeaderMagic32 {
+	if magic != headerMagic32 {
 		return h, 0, ErrHeaderInvalidFormat
 	}
-	if h.segVer != walVersion {
+	if h.segVer != headerVersion {
 		return h, 0, ErrHeaderInvalidVer
 	}
 	if h.crc != crc32.Checksum(src[:crcOff], crc32Table) {
@@ -115,7 +115,7 @@ func decodeHeader(src []byte) (walHeader, int, error) {
 }
 
 func writeHeader(w io.WriterAt, h *walHeader) (int, error) {
-	var buf [walHeaderLenPadded]byte
+	var buf [headerLenPadded]byte
 
 	_, err := encodeHeader(buf[:], h)
 	if err != nil {
@@ -134,7 +134,7 @@ func writeHeader(w io.WriterAt, h *walHeader) (int, error) {
 }
 
 func readHeader(r io.ReaderAt) (*walHeader, int, error) {
-	var buf [walHeaderLenPadded]byte
+	var buf [headerLenPadded]byte
 
 	n, err := r.ReadAt(buf[:], 0)
 	if err != nil {

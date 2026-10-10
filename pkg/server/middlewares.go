@@ -1,7 +1,7 @@
 package server
 
 import (
-	"fmt"
+	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"strconv"
@@ -62,45 +62,52 @@ func (w *statusWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-// promInstrument records the latency of each request under its route pattern.
-func promInstrument(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		sw := statusWriters.Get().(*statusWriter)
-		sw.ResponseWriter, sw.status = w, 0
-		next.ServeHTTP(sw, r)
-		dur := time.Since(start)
+// instrument records each request's latency under its route pattern and logs server errors.
+func instrument(log *slog.Logger) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			sw := statusWriters.Get().(*statusWriter)
+			sw.ResponseWriter, sw.status = w, 0
+			next.ServeHTTP(sw, r)
+			dur := time.Since(start)
 
-		status := sw.status
-		if status == 0 {
-			status = http.StatusOK
-		}
-		sw.ResponseWriter = nil
-		statusWriters.Put(sw)
+			status := sw.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			sw.ResponseWriter = nil
+			statusWriters.Put(sw)
 
-		// set by the mux during routing
-		endpoint := r.Pattern
-		if endpoint == "" {
-			endpoint = "<no-match>"
-		}
-		httpRequestDuration.WithLabelValues(endpoint, strconv.Itoa(status)).Observe(dur.Seconds())
-	})
+			// set by the mux during routing
+			endpoint := r.Pattern
+			if endpoint == "" {
+				endpoint = "<no-match>"
+			}
+			httpRequestDuration.WithLabelValues(endpoint, strconv.Itoa(status)).Observe(dur.Seconds())
+			if status >= http.StatusInternalServerError {
+				log.Error("request failed", "method", r.Method, "path", r.URL.Path, "status", status, "took", dur)
+			}
+		})
+	}
 }
 
 // recoverer turns a handler panic into a 500 and logs its stack, except http.ErrAbortHandler.
-func recoverer(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			rec := recover()
-			if rec == nil {
-				return
-			}
-			if rec == http.ErrAbortHandler {
-				panic(rec)
-			}
-			fmt.Printf("server: panic serving %s %s: %v\n%s", r.Method, r.URL.Path, rec, debug.Stack())
-			w.WriteHeader(http.StatusInternalServerError)
-		}()
-		next.ServeHTTP(w, r)
-	})
+func recoverer(log *slog.Logger) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				rec := recover()
+				if rec == nil {
+					return
+				}
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
+				log.Error("handler panic", "method", r.Method, "path", r.URL.Path, "panic", rec, "stack", string(debug.Stack()))
+				w.WriteHeader(http.StatusInternalServerError)
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
 }

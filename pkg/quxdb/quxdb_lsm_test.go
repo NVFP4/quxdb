@@ -1,4 +1,4 @@
-package db
+package quxdb
 
 import (
 	"errors"
@@ -93,7 +93,7 @@ func TestLsmStateCompactionPublishesOutputAndRetiresInputs(t *testing.T) {
 
 func TestLsmStateMoveTableChangesLevelWithoutTouchingFiles(t *testing.T) {
 	dir := t.TempDir()
-	state, err := newLsmState(dir)
+	state, err := newLsmState(dir, DefaultOptions())
 	require.NoError(t, err)
 	table := buildLsmTestTable(t)
 	flushed := state.rolloverMemtable(1, 1)
@@ -111,7 +111,7 @@ func TestLsmStateMoveTableChangesLevelWithoutTouchingFiles(t *testing.T) {
 	require.NoError(t, state.close())
 	assert.DirExists(t, table.Path)
 
-	reopened, err := newLsmState(dir)
+	reopened, err := newLsmState(dir, DefaultOptions())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, reopened.close()) })
 	assert.Empty(t, reopened.currentVersion().Level(0))
@@ -178,7 +178,7 @@ func TestLsmStateConcurrentAcquireDuringEdits(t *testing.T) {
 
 func newTestLsmState(t *testing.T) *lsmState {
 	t.Helper()
-	state, err := newLsmState(t.TempDir())
+	state, err := newLsmState(t.TempDir(), DefaultOptions())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, state.close()) })
 	return state

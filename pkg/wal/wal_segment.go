@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,11 +19,9 @@ import (
 )
 
 const (
-	walSegmentMinSize     = 4 << 10  // 4KiB
-	walSegmentDefaultSize = 64 << 20 // 64MiB
-	walSegmentFlags       = 0
-	walEndMarkerLen       = 8 // zeros after the last record, read as end of segment
-	walReadAhead          = 64 << 10
+	segmentMinSize      = 4 << 10 // 4KiB
+	segmentFlags        = 0
+	segmentEndMarkerLen = 8 // zeros after the last record, read as end of segment
 )
 
 var (
@@ -35,7 +34,7 @@ var (
 	crc32Table = crc32.MakeTable(crc32.Castagnoli)
 	base32Hex  = base32.HexEncoding.WithPadding(base32.NoPadding)
 
-	endMarker [walEndMarkerLen]byte
+	segmentEndMarker [segmentEndMarkerLen]byte
 )
 
 type segmentMode uint8
@@ -47,6 +46,7 @@ const (
 
 type walSegment struct {
 	path string
+	log  *slog.Logger
 	file *os.File
 	mode segmentMode
 
@@ -64,9 +64,9 @@ type walSegment struct {
 }
 
 // newSegment creates a full-size zero-filled segment through a temp file, named with suffix.
-func newSegment(dir string, id segID, segSize uint64, suffix string) (*walSegment, error) {
+func newSegment(dir string, id segID, segSize uint64, suffix string, log *slog.Logger) (*walSegment, error) {
 	createdAt := time.Now().UTC()
-	segPath := filepath.Join(dir, walDir, segmentName(createdAt, id))
+	segPath := filepath.Join(dir, segmentDir, segmentName(createdAt, id))
 
 	if err := pathlib.EnsureParent(segPath); err != nil {
 		return nil, err
@@ -76,7 +76,7 @@ func newSegment(dir string, id segID, segSize uint64, suffix string) (*walSegmen
 		return nil, fmt.Errorf("wal: segment already exists for id=%d", id)
 	}
 
-	tmpPath := segPath + walTmpSuffix
+	tmpPath := segPath + segmentTmpSuffix
 	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o755)
 	if err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
@@ -107,11 +107,11 @@ func newSegment(dir string, id segID, segSize uint64, suffix string) (*walSegmen
 		return nil, errors.Join(fmt.Errorf("wal: %w", err), file.Close())
 	}
 
-	return activeSegment(file, segPath+suffix, h, offset)
+	return activeSegment(file, segPath+suffix, h, offset, log)
 }
 
 // recycleSegment reuses a pruned spare as segment id named with suffix, its stale records carry older segment ids.
-func recycleSegment(sparePath, dir string, id segID, segSize uint64, suffix string) (*walSegment, error) {
+func recycleSegment(sparePath, dir string, id segID, segSize uint64, suffix string, log *slog.Logger) (*walSegment, error) {
 	file, err := os.OpenFile(sparePath, os.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
@@ -131,7 +131,7 @@ func recycleSegment(sparePath, dir string, id segID, segSize uint64, suffix stri
 	createdAt := time.Now().UTC()
 	h := newWalHeader(id, segSize, createdAt)
 	// header and end marker in one write
-	var buf [walHeaderLenPadded + walEndMarkerLen]byte
+	var buf [headerLenPadded + segmentEndMarkerLen]byte
 	if _, err := encodeHeader(buf[:], &h); err != nil {
 		return fail(err)
 	}
@@ -141,26 +141,26 @@ func recycleSegment(sparePath, dir string, id segID, segSize uint64, suffix stri
 	if err := fs.SyncData(file); err != nil {
 		return fail(err)
 	}
-	segPath := filepath.Join(dir, walDir, segmentName(createdAt, id)) + suffix
+	segPath := filepath.Join(dir, segmentDir, segmentName(createdAt, id)) + suffix
 	if err := fs.RenameDurable(sparePath, segPath); err != nil {
 		return fail(err)
 	}
 
-	return activeSegment(file, segPath, h, walHeaderLenPadded)
+	return activeSegment(file, segPath, h, headerLenPadded, log)
 }
 
 func newWalHeader(id segID, segSize uint64, createdAt time.Time) walHeader {
 	return walHeader{
-		segVer:     walVersion,
+		segVer:     headerVersion,
 		segId:      id,
 		createdAt:  createdAt,
 		segMaxSize: segSize,
-		segFlags:   walSegmentFlags,
+		segFlags:   segmentFlags,
 	}
 }
 
 // activeSegment reopens a just-renamed file under path so io errors name the segment, not its old name.
-func activeSegment(file *os.File, path string, h walHeader, offset uint64) (*walSegment, error) {
+func activeSegment(file *os.File, path string, h walHeader, offset uint64, log *slog.Logger) (*walSegment, error) {
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
 	}
@@ -173,6 +173,7 @@ func activeSegment(file *os.File, path string, h walHeader, offset uint64) (*wal
 		cursor:    offset,
 		file:      file,
 		path:      path,
+		log:       log,
 		startLSN:  newLSN(h.segId, offset, h.segMaxSize),
 		mode:      segmentModeReadWrite,
 	}, nil
@@ -180,7 +181,7 @@ func activeSegment(file *os.File, path string, h walHeader, offset uint64) (*wal
 
 // activate gives a prepared segment its final name, durably so its records are found after a crash.
 func (s *walSegment) activate() error {
-	final, ok := strings.CutSuffix(s.path, walPreparedSuffix)
+	final, ok := strings.CutSuffix(s.path, segmentPreparedSuffix)
 	if !ok {
 		return nil
 	}
@@ -198,7 +199,7 @@ func (s *walSegment) activate() error {
 }
 
 // openSegment opens an existing segment with its cursor at the segment end.
-func openSegment(segPath string, segmentSize uint64, mode segmentMode) (*walSegment, error) {
+func openSegment(segPath string, segmentSize uint64, mode segmentMode, log *slog.Logger) (*walSegment, error) {
 	var (
 		file  *os.File
 		err   error
@@ -239,6 +240,7 @@ func openSegment(segPath string, segmentSize uint64, mode segmentMode) (*walSegm
 		cursor:    h.segMaxSize,
 		file:      file,
 		path:      segPath,
+		log:       log,
 		startLSN:  newLSN(h.segId, uint64(n), h.segMaxSize),
 		mode:      mode,
 	}, nil
@@ -295,9 +297,9 @@ func (s *walSegment) openReadOnlyMmapLocked() ([]byte, error) {
 		return nil, err
 	}
 
-	err = fs.Advise(mmap, fs.AdviceSequential)
-	if err != nil {
-		fmt.Printf("wal: madvise err %s\n", err)
+	// a hint, reads work without it
+	if err := fs.Advise(mmap, fs.AdviceSequential); err != nil {
+		s.log.Debug("madvise failed", "segment", s.segId, "err", err)
 	}
 
 	if err := s.closeFile(); err != nil {
@@ -331,13 +333,13 @@ func (s *walSegment) munmap() error {
 	return err
 }
 
-func (s *walSegment) read(lsn LSN) (rec walRecord, next LSN, err error) {
+func (s *walSegment) read(lsn LSN, readAhead int) (rec walRecord, next LSN, err error) {
 	switch s.mode {
 	case segmentModeReadWrite:
 		if s.file == nil {
 			return walRecord{}, 0, fmt.Errorf("wal: active segment id=%d has no file descriptor", s.segId)
 		}
-		return s.readFromFile(lsn)
+		return s.readFromFile(lsn, readAhead)
 	case segmentModeReadOnly:
 		mmap, err := s.getMmap()
 		if err != nil {
@@ -349,13 +351,13 @@ func (s *walSegment) read(lsn LSN) (rec walRecord, next LSN, err error) {
 	}
 }
 
-func (s *walSegment) readFromFile(lsn LSN) (walRecord, LSN, error) {
+func (s *walSegment) readFromFile(lsn LSN, readAhead int) (walRecord, LSN, error) {
 	offset, err := s.offsetFromLSN(lsn)
 	if err != nil {
 		return walRecord{}, 0, err
 	}
 
-	src, err := s.window(offset, walRecordHeaderLen)
+	src, err := s.window(offset, recordHeaderLen, readAhead)
 	if err != nil {
 		return walRecord{}, 0, err
 	}
@@ -363,7 +365,7 @@ func (s *walSegment) readFromFile(lsn LSN) (walRecord, LSN, error) {
 	if err != nil {
 		return walRecord{}, 0, err
 	}
-	if src, err = s.window(offset, int(h.recLen)); err != nil {
+	if src, err = s.window(offset, int(h.recLen), readAhead); err != nil {
 		return walRecord{}, 0, err
 	}
 	rec, _, err := decodeRecord(src)
@@ -373,12 +375,12 @@ func (s *walSegment) readFromFile(lsn LSN) (walRecord, LSN, error) {
 	return s.finishRead(rec, lsn, offset)
 }
 
-// window returns the n bytes at off, preading at least walReadAhead bytes up to the cursor into rbuf on a miss.
-func (s *walSegment) window(off uint64, n int) ([]byte, error) {
+// window returns the n bytes at off, preading at least readAhead bytes up to the cursor into rbuf on a miss.
+func (s *walSegment) window(off uint64, n, readAhead int) ([]byte, error) {
 	if off >= s.rbufOff && off+uint64(n) <= s.rbufOff+uint64(len(s.rbuf)) {
 		return s.rbuf[off-s.rbufOff:][:n], nil
 	}
-	size := min(uint64(max(n, walReadAhead)), s.cursor-off)
+	size := min(uint64(max(n, readAhead)), s.cursor-off)
 	if size < uint64(n) {
 		return nil, ErrRecordTorn
 	}
@@ -441,7 +443,7 @@ func (s *walSegment) finishRead(rec walRecord, lsn LSN, offset uint64) (walRecor
 	return rec, newLSN(s.segId, nextOffset, s.segMaxSize), nil
 }
 
-// hasRecordStartFrom reports whether a valid walRecord starting a Record of this segment starts at or after off.
+// hasRecordStartFrom reports whether a valid walRecord starting an Entry of this segment starts at or after off.
 func (s *walSegment) hasRecordStartFrom(off uint64) (bool, error) {
 	file, err := os.Open(s.path)
 	if err != nil {
@@ -454,14 +456,14 @@ func (s *walSegment) hasRecordStartFrom(off uint64) (bool, error) {
 	defer fs.Unmap(b)
 
 	for off = alignUp8u(off); recordCapacity(s.segMaxSize-off) >= 0; off += 8 {
-		if binary.BigEndian.Uint32(b[off:]) != walRecordMagic32 {
+		if binary.BigEndian.Uint32(b[off:]) != recordMagic32 {
 			continue
 		}
 		h, _, err := decodeRecordHeader(b[off:])
 		if err != nil || LSN(h.lsn) != newLSN(s.segId, off, s.segMaxSize) {
 			continue
 		}
-		// a partial walRecord without the start flag can belong to the damaged Record itself
+		// a partial walRecord without the start flag can belong to the damaged Entry itself
 		if h.starts() {
 			return true, nil
 		}
@@ -478,7 +480,7 @@ func (s *walSegment) sync() error {
 
 // recordCapacity is the largest record payload that fits in room bytes.
 func recordCapacity(room uint64) int {
-	return int((room-1)&^7) - walRecordHeaderLen - walRecordMetaLen
+	return int((room-1)&^7) - recordHeaderLen - recordMetaLen
 }
 
 func alignUp8u(n uint64) uint64 {
@@ -516,7 +518,7 @@ func (s *walSegment) truncate(lsn LSN) error {
 		return err
 	}
 	if recordCapacity(s.segMaxSize-offset) >= 0 {
-		if _, err := s.file.WriteAt(endMarker[:], int64(offset)); err != nil {
+		if _, err := s.file.WriteAt(segmentEndMarker[:], int64(offset)); err != nil {
 			return err
 		}
 	}

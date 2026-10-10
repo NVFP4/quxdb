@@ -14,10 +14,8 @@ import (
 )
 
 const (
-	catFilename       = "QUXCATALOG"
+	catalogFilename   = "QUXCATALOG"
 	catalogBufferSize = 4 << 10
-	// dead records that trigger a catalog snapshot
-	maxStaleRecords = 1024
 )
 
 var (
@@ -49,7 +47,7 @@ type catalog struct {
 }
 
 func openCatalog(dir string) (*catalog, error) {
-	path := filepath.Join(dir, catFilename)
+	path := filepath.Join(dir, catalogFilename)
 
 	// cleanup stale partial catalog
 	if err := os.Remove(path + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -72,27 +70,33 @@ func openCatalog(dir string) (*catalog, error) {
 	}, nil
 }
 
-func (c *catalog) replay(callback func(catalogRecord) error) error {
+// replay feeds callback every record and returns the bytes of a torn tail it cut off.
+func (c *catalog) replay(callback func(catalogRecord) error) (int64, error) {
 	if _, err := c.fd.Seek(0, io.SeekStart); err != nil {
-		return err
+		return 0, err
 	}
 
 	jr := jsonl.NewReader[catalogRecord](c.fd)
 
 	for rec, err := range jr.Records() {
 		if err != nil {
-			if errors.Is(err, jsonl.ErrTornRead) {
-				return c.truncate(int64(jr.SafeOffset()))
+			if !errors.Is(err, jsonl.ErrTornRead) {
+				return 0, err
 			}
-			return err
+			size, err := c.size()
+			if err != nil {
+				return 0, err
+			}
+			safe := int64(jr.SafeOffset())
+			return size - safe, c.truncate(safe)
 		}
 		if err := callback(rec); err != nil {
-			return err
+			return 0, err
 		}
 		c.records++
 	}
 
-	return nil
+	return 0, nil
 }
 
 func (c *catalog) appendAll(records []catalogRecord) error {

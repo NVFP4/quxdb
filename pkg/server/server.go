@@ -3,37 +3,38 @@ package server
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
 
-	"github.com/yashgorana/quxdb/pkg/db"
+	"github.com/yashgorana/quxdb/pkg/quxdb"
 )
 
-type QuxServer struct {
-	config QuxServerConfig
-	db     *db.QuxDB
+// Server serves a DB over http.
+type Server struct {
+	config Config
+	db     *quxdb.DB
+	log    *slog.Logger
 }
 
-func NewServer(config QuxServerConfig) (*QuxServer, error) {
-	db, err := db.New(config.DataDir)
-	if err != nil {
-		return nil, err
-	}
-	return &QuxServer{
+// New creates a server for db, which the caller starts before serving and stops after.
+func New(config Config, db *quxdb.DB, logger *slog.Logger) *Server {
+	return &Server{
 		config: config,
 		db:     db,
-	}, nil
+		log:    logger.With("mod", "server"),
+	}
 }
 
-func (s *QuxServer) StartWithContext(ctx context.Context) error {
+func (s *Server) StartWithContext(ctx context.Context) error {
 	addr := s.config.Addr()
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           setupHttpRoutes(s.db),
+		Handler:           setupHttpRoutes(s.db, s.log),
+		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelError),
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -46,49 +47,31 @@ func (s *QuxServer) StartWithContext(ctx context.Context) error {
 		},
 	}
 
-	errCh := make(chan error, 1)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("quxdb server: %w", err)
 	}
 
+	// buffered so Serve's return after Shutdown doesn't block
+	errCh := make(chan error, 1)
 	go func() {
-		fmt.Printf("quxdb server: http://%s\n", addr)
-		if srvErr := srv.Serve(ln); srvErr != nil && srvErr != http.ErrServerClosed {
-			errCh <- srvErr
-		}
-	}()
-
-	go func() {
-		err := s.db.Start(ctx)
-		if err != nil {
-			errCh <- err
-		}
+		s.log.Info("listening", "addr", "http://"+addr)
+		errCh <- srv.Serve(ln)
 	}()
 
 	select {
 	case <-ctx.Done():
-		var errs []error
-
-		fmt.Println("server context cancelled")
+		s.log.Info("shutting down")
 
 		stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-
-		// stop the server before the db
 		if err := srv.Shutdown(stopCtx); err != nil {
 			_ = srv.Close()
-			errs = append(errs, err)
+			return err
 		}
-		fmt.Println("server stopped")
-
-		if err := s.db.Stop(stopCtx); err != nil {
-			errs = append(errs, err)
-		}
-
-		return errors.Join(errs...)
+		s.log.Info("stopped")
+		return nil
 	case err := <-errCh:
-		close(errCh)
 		return err
 	}
 }

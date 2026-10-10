@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -111,13 +112,13 @@ func (s *SST) close() error {
 }
 
 const (
-	tablesDir    = "sst"
-	sstNameWidth = 20 // digits in max uint64
+	tablesDir      = "sst"
+	tableNameWidth = 20 // digits in max uint64
 )
 
 // fixed width keeps names sorted by id.
 func sstName(id uint64) string {
-	return fmt.Sprintf("%0*d", sstNameWidth, id)
+	return fmt.Sprintf("%0*d", tableNameWidth, id)
 }
 
 func sstBlockDataName(id uint64) string {
@@ -138,7 +139,7 @@ func sstDirPath(baseDir string, id uint64) string {
 }
 
 // RemoveOrphans deletes table dirs not in live, call only while no builder runs.
-func RemoveOrphans(baseDir string, live []*Metadata) error {
+func RemoveOrphans(baseDir string, live []*Metadata, log *slog.Logger) error {
 	dir := filepath.Join(baseDir, tablesDir)
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -156,7 +157,7 @@ func RemoveOrphans(baseDir string, live []*Metadata) error {
 	var errs []error
 	for _, entry := range entries {
 		name, tmp := strings.CutSuffix(entry.Name(), ".tmp")
-		if len(name) != sstNameWidth {
+		if len(name) != tableNameWidth {
 			continue
 		}
 		id, err := strconv.ParseUint(name, 10, 64)
@@ -171,7 +172,7 @@ func RemoveOrphans(baseDir string, live []*Metadata) error {
 			errs = append(errs, err)
 			continue
 		}
-		fmt.Printf("sst: removed orphan table %s\n", path)
+		log.Info("removed orphan table", "path", path)
 	}
 	return errors.Join(errs...)
 }

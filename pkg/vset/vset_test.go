@@ -167,7 +167,7 @@ func TestApplyRejectsCheckpointRegression(t *testing.T) {
 
 	checkpoint := Checkpoint{LastSeq: 17, LastLSN: 42}
 	require.NoError(t, vs.Apply([]Change{{Op: OpCheckpoint, Checkpoint: checkpoint}}))
-	before, err := os.Stat(filepath.Join(dir, catFilename))
+	before, err := os.Stat(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 
 	err = vs.Apply([]Change{{
@@ -176,7 +176,7 @@ func TestApplyRejectsCheckpointRegression(t *testing.T) {
 	}})
 	require.ErrorIs(t, err, ErrRecordCorrupt)
 	assert.Equal(t, checkpoint, vs.CurrentVersion().Checkpoint())
-	after, err := os.Stat(filepath.Join(dir, catFilename))
+	after, err := os.Stat(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	assert.Equal(t, before.Size(), after.Size())
 }
@@ -208,7 +208,7 @@ func TestNewDiscardsTornCheckpoint(t *testing.T) {
 	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
 	assert.Zero(t, vs.CurrentVersion().Checkpoint())
 
-	st, err := os.Stat(filepath.Join(dir, catFilename))
+	st, err := os.Stat(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(add)), st.Size())
 }
@@ -224,9 +224,27 @@ func TestNewTruncatesTornCatalogTail(t *testing.T) {
 	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
 	require.NoError(t, vs.Close())
 
-	st, err := os.Stat(filepath.Join(dir, catFilename))
+	st, err := os.Stat(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(first)), st.Size())
+}
+
+func TestCatalogReplayReportsTornBytes(t *testing.T) {
+	dir := t.TempDir()
+	first := mustEncodeRecord(t, addRecord(testTable(1, 0)))
+	torn := mustEncodeRecord(t, addRecord(testTable(2, 0)))
+	writeCatalog(t, dir, first, torn[:len(torn)-1])
+
+	cat, err := openCatalog(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cat.close() })
+	cut, err := cat.replay(func(catalogRecord) error { return nil })
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(torn)-1), cut)
+
+	cut, err = cat.replay(func(catalogRecord) error { return nil })
+	require.NoError(t, err)
+	assert.Zero(t, cut, "a clean catalog cuts nothing")
 }
 
 func TestNewReturnsErrorForCorruptCatalogLine(t *testing.T) {
@@ -240,7 +258,7 @@ func TestNewReturnsErrorForCorruptCatalogLine(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, vs)
 
-	st, err := os.Stat(filepath.Join(dir, catFilename))
+	st, err := os.Stat(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(first)+len(corrupt)+len(third)), st.Size())
 }
@@ -260,7 +278,7 @@ func TestCatalogAppendAfterReplayUsesFileSize(t *testing.T) {
 	second := mustEncodeRecord(t, secondRec)
 	require.NoError(t, vs.Apply([]Change{{Op: secondRec.Op, Table: secondRec.Table}}))
 
-	st, err := os.Stat(filepath.Join(dir, catFilename))
+	st, err := os.Stat(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(first)+len(second)), st.Size())
 }
@@ -273,7 +291,8 @@ func TestAppendRollbackUsesFileSize(t *testing.T) {
 	cat, err := openCatalog(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cat.close() })
-	require.NoError(t, cat.replay(func(catalogRecord) error { return nil }))
+	_, err = cat.replay(func(catalogRecord) error { return nil })
+	require.NoError(t, err)
 
 	fw := &failAfterWriter{w: cat.fd, remaining: 8}
 	cat.bw = bufio.NewWriterSize(fw, catalogBufferSize)
@@ -282,7 +301,7 @@ func TestAppendRollbackUsesFileSize(t *testing.T) {
 	err = cat.appendAll([]catalogRecord{addRecord(testTable(2, 0))})
 	require.ErrorIs(t, err, errInjectedCatalogWrite)
 
-	st, err := os.Stat(filepath.Join(dir, catFilename))
+	st, err := os.Stat(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(first)), st.Size())
 }
@@ -338,11 +357,11 @@ func TestSnapshotPreservesLiveStateAcrossReopen(t *testing.T) {
 		{Op: OpCheckpoint, Checkpoint: checkpoint},
 	}))
 	before := catalogLines(t, dir)
-	for id := uint64(1000); id < 1000+maxStaleRecords/2; id++ {
+	for id := uint64(1000); id < 1000+defaultMaxStaleRecords/2; id++ {
 		require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(id, 0)}}))
 		require.NoError(t, vs.Apply([]Change{{Op: OpDelete, Table: &sst.Metadata{ID: id}}}))
 	}
-	assert.Greater(t, before+maxStaleRecords, catalogLines(t, dir), "catalog was rewritten")
+	assert.Greater(t, before+defaultMaxStaleRecords, catalogLines(t, dir), "catalog was rewritten")
 
 	require.NoError(t, vs.Apply([]Change{{Op: OpAdd, Table: testTable(70, 1)}}))
 	require.NoError(t, vs.Close())
@@ -355,25 +374,25 @@ func TestSnapshotPreservesLiveStateAcrossReopen(t *testing.T) {
 	assertLevelIDs(t, version.Level(1), 3, 70)
 	assertLevelIDs(t, version.Level(2), 9)
 	assert.Equal(t, checkpoint, version.Checkpoint())
-	assert.Greater(t, reopened.NextTableID(), uint64(1000+maxStaleRecords/2-1))
+	assert.Greater(t, reopened.NextTableID(), uint64(1000+defaultMaxStaleRecords/2-1))
 }
 
 func TestStaleSnapshotTmpIsDiscardedOnOpen(t *testing.T) {
 	dir := t.TempDir()
 	writeCatalog(t, dir, mustEncodeRecord(t, addRecord(testTable(1, 0))))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, catFilename+".tmp"), []byte("{torn"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, catalogFilename+".tmp"), []byte("{torn"), 0o644))
 
 	vs, err := New(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = vs.Close() })
 	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
-	assert.NoFileExists(t, filepath.Join(dir, catFilename+".tmp"))
+	assert.NoFileExists(t, filepath.Join(dir, catalogFilename+".tmp"))
 }
 
 func TestOversizedCatalogIsSnapshottedOnOpen(t *testing.T) {
 	dir := t.TempDir()
 	records := [][]byte{mustEncodeRecord(t, addRecord(testTable(1, 0)))}
-	for id := uint64(2); id < 2+maxStaleRecords; id++ {
+	for id := uint64(2); id < 2+defaultMaxStaleRecords; id++ {
 		records = append(records,
 			mustEncodeRecord(t, addRecord(testTable(id, 1))),
 			mustEncodeRecord(t, catalogRecord{Op: OpDelete, Table: &sst.Metadata{ID: id}}),
@@ -386,12 +405,12 @@ func TestOversizedCatalogIsSnapshottedOnOpen(t *testing.T) {
 	t.Cleanup(func() { _ = vs.Close() })
 	assert.Equal(t, 2, catalogLines(t, dir))
 	assertLevelIDs(t, vs.CurrentVersion().Level(0), 1)
-	assert.Equal(t, uint64(2+maxStaleRecords), vs.NextTableID())
+	assert.Equal(t, uint64(2+defaultMaxStaleRecords), vs.NextTableID())
 }
 
 func catalogLines(t *testing.T, dir string) int {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(dir, catFilename))
+	data, err := os.ReadFile(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	return bytes.Count(data, []byte("\n"))
 }
@@ -423,7 +442,7 @@ func mustEncodeRecord(t *testing.T, rec catalogRecord) []byte {
 
 func writeCatalog(t *testing.T, dir string, records ...[]byte) {
 	t.Helper()
-	file, err := os.Create(filepath.Join(dir, catFilename))
+	file, err := os.Create(filepath.Join(dir, catalogFilename))
 	require.NoError(t, err)
 	defer file.Close()
 

@@ -1,8 +1,7 @@
-package db
+package quxdb
 
 import (
 	"errors"
-	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -18,33 +17,37 @@ import (
 type lsmState struct {
 	versions *vset.VersionSet
 	registry *sst.Registry
+	memtable MemtableOptions
 	current  atomic.Pointer[lsmView]
 	mu       sync.Mutex // serializes publishers
 }
 
-func newLsmState(dataDir string) (*lsmState, error) {
-	versions, err := vset.New(dataDir)
+func newLsmState(dataDir string, opts Options) (*lsmState, error) {
+	catalogOpts := opts.Catalog
+	catalogOpts.Logger = opts.Logger.With("mod", "vset")
+	versions, err := vset.NewWithOptions(dataDir, catalogOpts)
 	if err != nil {
 		return nil, err
 	}
 
 	version := versions.CurrentVersion()
 	tables := version.All()
-	registry := sst.NewRegistry()
+	sstLog := opts.Logger.With("mod", "sst")
+	registry := sst.NewRegistry(sstLog)
 	if err := registry.Open(tables); err != nil {
 		return nil, errors.Join(err, registry.Close(), versions.Close())
 	}
 
 	// after Open, so every live table is known good before anything is deleted
-	if err := sst.RemoveOrphans(dataDir, tables); err != nil {
-		fmt.Printf("db: orphan table cleanup error %v\n", err)
+	if err := sst.RemoveOrphans(dataDir, tables, sstLog); err != nil {
+		sstLog.Warn("orphan table cleanup failed", "err", err)
 	}
 
-	state := &lsmState{versions: versions, registry: registry}
+	state := &lsmState{versions: versions, registry: registry, memtable: opts.Memtable}
 	state.current.Store(&lsmView{
 		version:   version,
 		tables:    registry.View(tables),
-		memtables: []*quxMemtable{newQuxMemtable()},
+		memtables: []*quxMemtable{state.newMemtable()},
 	})
 	publishLevelMetrics(version)
 	return state, nil
@@ -118,7 +121,7 @@ func (s *lsmState) rolloverMemtable(lastSeq quxSeq, lastLSN wal.LSN) *quxMemtabl
 	previous.lastLSN = lastLSN
 
 	memtables := make([]*quxMemtable, 0, len(current.memtables)+1)
-	memtables = append(memtables, newQuxMemtable())
+	memtables = append(memtables, s.newMemtable())
 	memtables = append(memtables, current.memtables...)
 	s.current.Store(&lsmView{
 		version:   current.version,
@@ -223,6 +226,8 @@ type quxMemtable struct {
 	lastSeq quxSeq
 }
 
-func newQuxMemtable() *quxMemtable {
-	return &quxMemtable{Memtable: memtable.New(memTableType)}
+func (s *lsmState) newMemtable() *quxMemtable {
+	return &quxMemtable{
+		Memtable: memtable.New(s.memtable.Type, memtable.WithCapacityBytes(s.memtable.CapacityBytes)),
+	}
 }

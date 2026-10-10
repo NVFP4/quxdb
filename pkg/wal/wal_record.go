@@ -46,19 +46,19 @@ All fixed-size int fields are stored in LE byte-order, except for `magic`.
 */
 
 const (
-	walRecordHeaderLen = 4 + 4 + 2 + 8 + 4 + 4
-	walRecordMetaLen   = 4 // record crc
+	recordHeaderLen = 4 + 4 + 2 + 8 + 4 + 4
+	recordMetaLen   = 4 // record crc
 
-	walRecordMagic32 uint32 = 'Q'<<24 | 'R'<<16 | 'E'<<8 | 'C'
+	recordMagic32 uint32 = 'Q'<<24 | 'R'<<16 | 'E'<<8 | 'C'
 )
 
 // partial record position, stored in recFlags bits 14-15
 const (
-	walRecFull          uint16 = 0 << 14
-	walRecPartialMask   uint16 = 3 << 14
-	walRecPartialStart  uint16 = 1 << 14
-	walRecPartialMiddle uint16 = 2 << 14
-	walRecPartialEnd    uint16 = 3 << 14
+	recordFull          uint16 = 0 << 14
+	recordPartialMask   uint16 = 3 << 14
+	recordPartialStart  uint16 = 1 << 14
+	recordPartialMiddle uint16 = 2 << 14
+	recordPartialEnd    uint16 = 3 << 14
 )
 
 var (
@@ -86,17 +86,17 @@ type walRecordHeader struct {
 }
 
 func (h *walRecordHeader) partial() uint16 {
-	return h.recFlags & walRecPartialMask
+	return h.recFlags & recordPartialMask
 }
 
 func (h *walRecordHeader) starts() bool {
 	p := h.partial()
-	return p == walRecFull || p == walRecPartialStart
+	return p == recordFull || p == recordPartialStart
 }
 
 func (h *walRecordHeader) ends() bool {
 	p := h.partial()
-	return p == walRecFull || p == walRecPartialEnd
+	return p == recordFull || p == recordPartialEnd
 }
 
 type walRecord struct {
@@ -108,7 +108,7 @@ type walRecord struct {
 func encodeRecordHeader(dst []byte, h *walRecordHeader) (int, error) {
 	off := 0
 
-	binary.BigEndian.PutUint32(dst[off:], walRecordMagic32)
+	binary.BigEndian.PutUint32(dst[off:], recordMagic32)
 	off += 4
 
 	binary.LittleEndian.PutUint32(dst[off:], h.recLen)
@@ -132,7 +132,7 @@ func encodeRecordHeader(dst []byte, h *walRecordHeader) (int, error) {
 
 func decodeRecordHeader(src []byte) (walRecordHeader, int, error) {
 	var h walRecordHeader
-	if len(src) < walRecordHeaderLen {
+	if len(src) < recordHeaderLen {
 		return h, 0, ErrRecordTorn
 	}
 
@@ -151,10 +151,10 @@ func decodeRecordHeader(src []byte) (walRecordHeader, int, error) {
 	if magic == 0 {
 		return h, 0, io.EOF
 	}
-	if magic != walRecordMagic32 {
+	if magic != recordMagic32 {
 		return h, 0, ErrRecordInvalidFormat
 	}
-	if h.recLen < walRecordHeaderLen+walRecordMetaLen || h.recLen%8 != 0 {
+	if h.recLen < recordHeaderLen+recordMetaLen || h.recLen%8 != 0 {
 		return h, 0, ErrRecordTorn
 	}
 	if encodedRecordSize(int(h.dataLen)) != int(h.recLen) {
@@ -196,7 +196,7 @@ func decodeRecord(src []byte) (walRecord, int, error) {
 
 func readRecordBytes(src []byte, off uint64) (walRecord, error) {
 	boff := int(off)
-	if off > uint64(len(src)) || len(src)-boff < walRecordHeaderLen {
+	if off > uint64(len(src)) || len(src)-boff < recordHeaderLen {
 		return walRecord{}, ErrRecordTorn
 	}
 
@@ -218,7 +218,7 @@ func readRecordBytes(src []byte, off uint64) (walRecord, error) {
 }
 
 func encodedRecordSize(size int) int {
-	return alignUp8(walRecordHeaderLen + walRecordMetaLen + size)
+	return alignUp8(recordHeaderLen + recordMetaLen + size)
 }
 
 func alignUp8(n int) int {

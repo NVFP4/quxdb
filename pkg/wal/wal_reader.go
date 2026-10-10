@@ -8,21 +8,22 @@ import (
 )
 
 type walReader struct {
-	segments *segmentSet
-	buf      []byte // reassembles Records from partial walRecords during replay
+	segments  *segmentSet
+	readAhead int
+	buf       []byte // reassembles Entries from partial walRecords during replay
 }
 
-func newWalReader(segments *segmentSet) *walReader {
-	return &walReader{segments: segments}
+func newWalReader(segments *segmentSet, readAhead int) *walReader {
+	return &walReader{segments: segments, readAhead: readAhead}
 }
 
-// read returns the Record at lsn and the lsn after it, partial walRecords are reassembled into buf.
+// read returns the Entry at lsn and the lsn after it, partial walRecords are reassembled into buf.
 func (r *walReader) read(lsn LSN, buf []byte) (data, asm []byte, next LSN, err error) {
 	seg, err := r.segments.segmentForLSN(lsn)
 	if err != nil {
 		return nil, buf, 0, err
 	}
-	rec, next, err := seg.read(lsn)
+	rec, next, err := seg.read(lsn, r.readAhead)
 	if err != nil {
 		return nil, buf, 0, err
 	}
@@ -40,7 +41,7 @@ func (r *walReader) read(lsn LSN, buf []byte) (data, asm []byte, next LSN, err e
 		if seg == nil {
 			return nil, buf, 0, fmt.Errorf("%w: lsn=%d is missing its next partial record", ErrRecordTorn, lsn)
 		}
-		rec, next, err = seg.read(seg.startLSN)
+		rec, next, err = seg.read(seg.startLSN, r.readAhead)
 		if errors.Is(err, io.EOF) {
 			err = fmt.Errorf("%w: lsn=%d is missing its next partial record", ErrRecordTorn, lsn)
 		}
@@ -57,8 +58,8 @@ func (r *walReader) read(lsn LSN, buf []byte) (data, asm []byte, next LSN, err e
 	}
 }
 
-// replayAfter feeds callback each Record after last and returns the log end or the failing Record's lsn.
-func (r *walReader) replayAfter(last LSN, callback func(Record) error) (LSN, error) {
+// replayAfter feeds callback each Entry after last and returns the log end or the failing Entry's lsn.
+func (r *walReader) replayAfter(last LSN, callback func(Entry) error) (LSN, error) {
 	segments := r.segments.segments
 	defer r.segments.active.dropWindow()
 
@@ -85,17 +86,24 @@ func (r *walReader) replayAfter(last LSN, callback func(Record) error) (LSN, err
 	if err := closeSegments(segments[:i]); err != nil {
 		return lsn, err
 	}
+	r.segments.log.Debug("replay start", "segment", seg.segId, "offset", startOffset, "lsn", lsn)
 
-	// the oldest segment may open with the tail of a pruned Record
+	// the oldest segment may open with the tail of a pruned Entry
 	orphan := last == 0
+	var skipped int
 	for {
 		if orphan {
-			rec, next, err := seg.read(lsn)
+			rec, next, err := seg.read(lsn, r.readAhead)
 			if err == nil && !rec.starts() {
 				lsn = next
+				skipped++
 				continue
 			}
 			orphan = errors.Is(err, io.EOF)
+			if skipped > 0 {
+				r.segments.log.Debug("skipped pruned entry tail", "segment", seg.segId, "walRecords", skipped)
+				skipped = 0
+			}
 		}
 
 		data, asm, next, err := r.read(lsn, r.buf)
@@ -114,7 +122,7 @@ func (r *walReader) replayAfter(last LSN, callback func(Record) error) (LSN, err
 		if err != nil {
 			return lsn, err
 		}
-		if err := callback(Record{Data: data, LSN: lsn}); err != nil {
+		if err := callback(Entry{Data: data, LSN: lsn}); err != nil {
 			return lsn, err
 		}
 

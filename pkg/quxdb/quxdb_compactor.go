@@ -1,9 +1,10 @@
-package db
+package quxdb
 
 import (
 	"bytes"
+	"context"
 	"errors"
-	"fmt"
+	"log/slog"
 	"math"
 	"slices"
 	"sync"
@@ -15,16 +16,6 @@ import (
 	"github.com/yashgorana/quxdb/pkg/vset"
 )
 
-const (
-	l0FileTarget = 4
-	levelFanout  = 10
-	// l1 holds a few tables so picking by overlap has a choice
-	l1TargetBytes = 256 << 20
-)
-
-// compaction outputs split at this size, l0 tables take the memtable's size.
-var tableTargetBytes int64 = 64 << 20
-
 type compactionPlan struct {
 	sourceLevel int
 	inputs      []*sst.Metadata
@@ -34,15 +25,21 @@ type compactionPlan struct {
 type lsmCompactor struct {
 	dataDir     string
 	state       *lsmState
+	opts        CompactionOptions
+	sstOpts     sst.Options
+	log         *slog.Logger
 	notify      chan struct{}
 	workers     sync.WaitGroup
 	onCompacted func() // runs after each compaction pass
 }
 
-func newLsmCompactor(dataDir string, state *lsmState, onCompacted func()) *lsmCompactor {
+func newLsmCompactor(dataDir string, state *lsmState, opts Options, onCompacted func()) *lsmCompactor {
 	return &lsmCompactor{
 		dataDir:     dataDir,
 		state:       state,
+		opts:        opts.Compaction,
+		sstOpts:     opts.SST,
+		log:         opts.Logger.With("mod", "compactor"),
 		notify:      make(chan struct{}, 1),
 		onCompacted: onCompacted,
 	}
@@ -71,7 +68,7 @@ func (c *lsmCompactor) compactionLoop() {
 	for range c.notify {
 		if err := c.compact(); err != nil {
 			metrics.DbCompactionErrors.Inc()
-			fmt.Printf("db: compaction error %v\n", err)
+			c.log.Error("compaction failed", "err", err)
 		}
 		c.onCompacted()
 	}
@@ -91,7 +88,10 @@ func (c *lsmCompactor) compact() error {
 
 func (c *lsmCompactor) plan() *compactionPlan {
 	view := c.state.acquire()
-	sourceLevel, inputs := pickCompaction(view.version)
+	sourceLevel, inputs := pickCompaction(view.version, c.opts)
+	if c.log.Enabled(context.Background(), slog.LevelDebug) {
+		c.logPlan(view.version, sourceLevel, inputs)
+	}
 	if len(inputs) == 0 {
 		view.release()
 		return nil
@@ -103,17 +103,47 @@ func (c *lsmCompactor) plan() *compactionPlan {
 	}
 }
 
-func pickCompaction(version *vset.Version) (int, []*sst.Metadata) {
+// logPlan reports the picked inputs, or that none were picked, against each level's size and target.
+func (c *lsmCompactor) logPlan(version *vset.Version, sourceLevel int, inputs []*sst.Metadata) {
+	var sizes [vset.MaxLevels]int64
+	for level := range vset.MaxLevels {
+		sizes[level] = tablesSize(version.Level(level))
+	}
+	targets := levelTargets(version, c.opts)
+	l0 := len(version.Level(0))
+	if len(inputs) == 0 {
+		c.log.Debug("nothing to compact", "l0Tables", l0, "l0FileTarget", c.opts.L0FileTarget,
+			"levelBytes", sizes, "levelTargets", targets)
+		return
+	}
+	ids := make([]uint64, len(inputs))
+	for i, table := range inputs {
+		ids[i] = table.ID
+	}
+	minKey, maxKey := tableRange(inputs)
+	c.log.Debug("compaction picked", "from", sourceLevel, "inputs", ids, "minKey", shortKey(minKey),
+		"maxKey", shortKey(maxKey), "l0Tables", l0, "levelBytes", sizes, "levelTargets", targets)
+}
+
+// shortKey keeps at most 32 bytes of a user key for logs, handlers quote and escape it.
+func shortKey(key []byte) string {
+	if len(key) > 32 {
+		return string(key[:32]) + "…"
+	}
+	return string(key)
+}
+
+func pickCompaction(version *vset.Version, opts CompactionOptions) (int, []*sst.Metadata) {
 	// cap l0 jobs so a flush burst isn't one huge compaction
 	l0 := version.Level(0)
-	if len(l0) >= l0FileTarget {
-		inputs := slices.Clone(l0[:l0FileTarget])
+	if len(l0) >= opts.L0FileTarget {
+		inputs := slices.Clone(l0[:opts.L0FileTarget])
 		minKey, maxKey := tableRange(inputs)
 		inputs = append(inputs, overlapping(version.Level(1), minKey, maxKey)...)
 		return 0, inputs
 	}
 
-	targets := levelTargets(version)
+	targets := levelTargets(version, opts)
 	for level := 1; level < vset.MaxLevels-1; level++ {
 		tables := version.Level(level)
 		if tablesSize(tables) <= targets[level] {
@@ -133,16 +163,16 @@ func pickCompaction(version *vset.Version) (int, []*sst.Metadata) {
 
 // static targets grow by the fanout from l1, and once the bottom outgrows them each level
 // tracks a fanout fraction of the one below, so no level pair drifts past the fanout.
-func levelTargets(version *vset.Version) [vset.MaxLevels]int64 {
+func levelTargets(version *vset.Version, opts CompactionOptions) [vset.MaxLevels]int64 {
 	var targets [vset.MaxLevels]int64
-	static := int64(l1TargetBytes)
+	static := opts.L1TargetBytes
 	for level := 1; level < vset.MaxLevels-1; level++ {
 		targets[level] = static
-		static *= levelFanout
+		static *= int64(opts.LevelFanout)
 	}
 	scaled := tablesSize(version.Level(vset.MaxLevels - 1))
 	for level := vset.MaxLevels - 2; level >= 1; level-- {
-		scaled /= levelFanout
+		scaled /= int64(opts.LevelFanout)
 		targets[level] = max(targets[level], scaled)
 	}
 	return targets
@@ -170,8 +200,9 @@ func (c *lsmCompactor) execute(plan *compactionPlan) error {
 		if err := c.state.moveTables(plan.inputs, uint8(targetLevel)); err != nil {
 			return err
 		}
-		metrics.DbCompactionMove.Observe(time.Since(start).Seconds())
-		fmt.Printf("db: moved L%d -> L%d tables=%d\n", plan.sourceLevel, targetLevel, len(plan.inputs))
+		took := time.Since(start)
+		metrics.DbCompactionMove.Observe(took.Seconds())
+		c.log.Info("moved tables", "from", plan.sourceLevel, "to", targetLevel, "tables", len(plan.inputs), "took", took)
 		return nil
 	}
 
@@ -182,12 +213,14 @@ func (c *lsmCompactor) execute(plan *compactionPlan) error {
 	if err := c.state.replaceSSTs(plan.inputs, toAdd); err != nil {
 		return err
 	}
-	metrics.DbCompactionMerge.Observe(time.Since(start).Seconds())
-	metrics.DbCompactionBytesRead.Add(float64(tablesSize(plan.inputs)))
-	metrics.DbCompactionBytesWritten.Add(float64(tablesSize(toAdd)))
+	took := time.Since(start)
+	read, written := tablesSize(plan.inputs), tablesSize(toAdd)
+	metrics.DbCompactionMerge.Observe(took.Seconds())
+	metrics.DbCompactionBytesRead.Add(float64(read))
+	metrics.DbCompactionBytesWritten.Add(float64(written))
 
-	fmt.Printf("db: compacted L%d -> L%d inputs=%d outputs=%d\n",
-		plan.sourceLevel, plan.sourceLevel+1, len(plan.inputs), len(toAdd))
+	c.log.Info("compacted", "from", plan.sourceLevel, "to", targetLevel, "inputs", len(plan.inputs), "outputs", len(toAdd),
+		"bytesRead", read, "bytesWritten", written, "took", took)
 	return nil
 }
 
@@ -210,8 +243,9 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 	}
 
 	targetLevel := plan.sourceLevel + 1
-	targetSize := tableTargetBytes
+	targetSize := c.opts.TableTargetBytes
 	drop := canDropTombstones(plan.view.version, plan.sourceLevel, plan.inputs)
+	c.log.Debug("merging", "from", plan.sourceLevel, "to", targetLevel, "dropTombstones", drop)
 	cur := newSnapshotIterator(newMergeIterator(sources), math.MaxUint64, drop)
 	opts := sst.BuilderOpts{
 		Dir:       c.dataDir,
@@ -226,6 +260,7 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 		}
 		builder = nil
 		outputs = append(outputs, output)
+		c.log.Debug("compaction output", "id", output.ID, "level", output.Level, "keys", output.Keys, "bytes", output.SizeBytes)
 		return nil
 	}
 
@@ -246,7 +281,7 @@ func (c *lsmCompactor) buildSSTs(plan *compactionPlan) (outputs []*sst.Metadata,
 		}
 		if builder == nil {
 			opts.ID = c.state.nextTableID()
-			if builder, err = sst.NewBuilder(opts); err != nil {
+			if builder, err = sst.NewBuilderWithOptions(opts, c.sstOpts); err != nil {
 				return outputs, err
 			}
 			outputBytes = 0

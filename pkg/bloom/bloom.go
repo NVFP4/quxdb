@@ -13,11 +13,11 @@ import (
 
 const (
 	DefaultBitsPerKey = 10
+	MaxBitsPerKey     = 32 // cap at the 32 bits/key optimum to bound hit/add CPU.
 
-	slotBits      = 64
-	maxBitsPerKey = 32      // cap at the 32 bits/key optimum to bound hit/add CPU.
-	maxK          = 22      // k ~= maxBitsPerKey * ln(2)
-	maxSlots      = 1 << 29 // max 4GiB bitset
+	slotBits = 64
+	maxK     = 22      // k ~= MaxBitsPerKey * ln(2)
+	maxSlots = 1 << 29 // max 4GiB bitset
 )
 
 var (
@@ -48,7 +48,7 @@ func NewWithFalsePositiveRate(expectedKeys uint64, rate float64) (*BloomFilter, 
 	}
 
 	bitsPerKey := math.Ceil(-math.Log(rate) / (math.Ln2 * math.Ln2))
-	if bitsPerKey > maxBitsPerKey || math.IsInf(bitsPerKey, 0) {
+	if bitsPerKey > MaxBitsPerKey || math.IsInf(bitsPerKey, 0) {
 		return nil, ErrInvalidFalsePositiveRate
 	}
 
@@ -60,7 +60,7 @@ func NewWithBitsPerKey(expectedKeys uint64, bitsPerKey uint8) *BloomFilter {
 }
 
 func NewWithProbes(expectedKeys uint64, bitsPerKey uint8, kProbes uint8) *BloomFilter {
-	if bitsPerKey == 0 || bitsPerKey > maxBitsPerKey {
+	if bitsPerKey == 0 || bitsPerKey > MaxBitsPerKey {
 		panic(ErrInvalidBitsPerKey)
 	}
 

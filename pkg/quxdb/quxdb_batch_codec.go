@@ -1,4 +1,4 @@
-package db
+package quxdb
 
 import (
 	"encoding/binary"
@@ -8,15 +8,19 @@ import (
 )
 
 const (
-	batchRefValueMin = 4096         // values this long are referenced, not copied
-	batchBufRetain   = 1 << 20      // reset drops a buffer grown past this
-	batchPartsRetain = 4 * maxBatch // reset drops a parts slice grown past this
+	batchRefValueMin = 4096    // values this long are referenced, not copied
+	batchBufRetain   = 1 << 20 // reset drops a buffer grown past this
 )
 
 // batchEncoder encodes a commit batch as wal parts: a uvarint count, then each key and value.
 type batchEncoder struct {
-	buf   []byte
-	parts [][]byte
+	buf         []byte
+	parts       [][]byte
+	partsRetain int // reset drops a parts slice grown past this
+}
+
+func newBatchEncoder(maxBatch int) batchEncoder {
+	return batchEncoder{partsRetain: 4 * maxBatch}
 }
 
 // Encode returns the batch as parts, valid until Reset.
@@ -52,7 +56,7 @@ func (e *batchEncoder) Encode(reqs []*writeReq) [][]byte {
 func (e *batchEncoder) Reset() {
 	clear(e.parts)
 	e.parts = e.parts[:0]
-	if cap(e.parts) > batchPartsRetain {
+	if cap(e.parts) > e.partsRetain {
 		e.parts = nil
 	}
 	e.buf = e.buf[:0]

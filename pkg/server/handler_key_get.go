@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"net/http"
 
-	"github.com/yashgorana/quxdb/pkg/db"
+	"github.com/yashgorana/quxdb/pkg/quxdb"
 )
 
-func hGetKey(db *db.QuxDB) http.HandlerFunc {
+func hGetKey(db *quxdb.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
 		value, ok, err := db.Get([]byte(key))
@@ -23,7 +23,7 @@ func hGetKey(db *db.QuxDB) http.HandlerFunc {
 	}
 }
 
-func hGetKeys(db *db.QuxDB) http.HandlerFunc {
+func hGetKeys(db *quxdb.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 

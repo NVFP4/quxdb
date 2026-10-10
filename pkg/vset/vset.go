@@ -2,7 +2,9 @@ package vset
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -29,14 +31,25 @@ type Change struct {
 
 // VersionSet tracks table versions in an append-only catalog.
 type VersionSet struct {
-	catalog     *catalog
-	latest      *Version
-	lastTableID atomic.Uint64
-	mu          sync.RWMutex
+	catalog         *catalog
+	latest          *Version
+	lastTableID     atomic.Uint64
+	maxStaleRecords int
+	log             *slog.Logger
+	mu              sync.RWMutex
 }
 
-// New replays the catalog in dir.
-func New(dir string) (*VersionSet, error) {
+// New replays the catalog in dir with DefaultOptions changed by opts.
+func New(dir string, opts ...Option) (*VersionSet, error) {
+	o := DefaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return NewWithOptions(dir, o)
+}
+
+// NewWithOptions replays the catalog in dir configured by o.
+func NewWithOptions(dir string, o Options) (*VersionSet, error) {
 	catalog, err := openCatalog(dir)
 	if err != nil {
 		return nil, err
@@ -48,7 +61,7 @@ func New(dir string) (*VersionSet, error) {
 
 	// include deleted tables so ids are never reused
 	var lastTableID uint64
-	err = catalog.replay(func(rec catalogRecord) error {
+	torn, err := catalog.replay(func(rec catalogRecord) error {
 		if err := applyRecordLocked(ver, rec); err != nil {
 			return err
 		}
@@ -66,10 +79,17 @@ func New(dir string) (*VersionSet, error) {
 	}
 
 	vs := &VersionSet{
-		catalog: catalog,
-		latest:  ver,
+		catalog:         catalog,
+		latest:          ver,
+		maxStaleRecords: o.MaxStaleRecords,
+		log:             o.Logger,
 	}
 	vs.lastTableID.Store(lastTableID)
+	if torn > 0 {
+		vs.log.Warn("cut torn catalog tail", "bytes", torn)
+	}
+	vs.log.Info("catalog replayed", "records", catalog.records, "tables", ver.Len(), "lastTableID", lastTableID,
+		"checkpointSeq", ver.checkpoint.LastSeq, "checkpointLSN", ver.checkpoint.LastLSN)
 	vs.pruneRecordsLocked()
 	return vs, nil
 }
@@ -140,10 +160,19 @@ func (vs *VersionSet) Apply(changes []Change) error {
 	}
 
 	vs.latest = next
+	var adds, deletes int
 	for _, rec := range newRecords {
-		if rec.Op == OpAdd {
+		switch rec.Op {
+		case OpAdd:
+			adds++
 			vs.raiseTableID(rec.Table.ID)
+		case OpDelete:
+			deletes++
 		}
+	}
+	if vs.log.Enabled(context.Background(), slog.LevelDebug) {
+		vs.log.Debug("catalog edit", "adds", adds, "deletes", deletes, "tables", next.Len(),
+			"checkpointSeq", next.checkpoint.LastSeq, "checkpointLSN", next.checkpoint.LastLSN)
 	}
 	vs.pruneRecordsLocked()
 	return nil
@@ -152,7 +181,7 @@ func (vs *VersionSet) Apply(changes []Change) error {
 // snapshots the catalog once dead records reach the threshold.
 func (vs *VersionSet) pruneRecordsLocked() {
 	live := vs.latest.Len() + 1
-	if vs.catalog.records-live < maxStaleRecords {
+	if vs.catalog.records-live < vs.maxStaleRecords {
 		return
 	}
 
@@ -167,9 +196,12 @@ func (vs *VersionSet) pruneRecordsLocked() {
 	checkpoint.LastTableID = vs.lastTableID.Load()
 	records = append(records, catalogRecord{Op: OpCheckpoint, Checkpoint: &checkpoint})
 
+	before := vs.catalog.records
 	if err := vs.catalog.rewrite(records); err != nil {
-		fmt.Printf("vset: catalog snapshot error %v\n", err)
+		vs.log.Error("catalog snapshot failed", "err", err)
+		return
 	}
+	vs.log.Info("catalog snapshot", "recordsBefore", before, "recordsAfter", len(records))
 }
 
 func buildNextVersion(current *Version, newRecords []catalogRecord) (*Version, error) {

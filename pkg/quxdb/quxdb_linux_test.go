@@ -1,4 +1,4 @@
-package db
+package quxdb
 
 import (
 	"os"
@@ -16,7 +16,7 @@ import (
 
 func TestWALFailureMakesDBReadOnly(t *testing.T) {
 	dir := t.TempDir()
-	db, err := New(dir)
+	db, err := New(WithDataDir(dir))
 	require.NoError(t, err)
 	require.NoError(t, db.Start(t.Context()))
 	t.Cleanup(func() { _ = db.Stop(t.Context()) })

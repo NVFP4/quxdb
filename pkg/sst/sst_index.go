@@ -246,7 +246,7 @@ func decodeSparseIndex(src []byte) (SparseIndex, int, error) {
 func WriteSparseIndex(w io.Writer, idx *SparseIndex) (int, error) {
 	buf := make([]byte, 0, indexBufCap)
 	buf = encodeSparseIndex(buf, idx)
-	buf = appendFooter(buf, sstFooter{sstTypeIndex, sstVersion, time.Now()})
+	buf = appendFooter(buf, sstFooter{fileTypeIndex, footerVersion, time.Now()})
 
 	n, err := w.Write(buf)
 	if err != nil {
@@ -261,12 +261,12 @@ func OpenSparseIndex(path string) (*MappedSparseIndex, error) {
 		return nil, err
 	}
 
-	if _, err := decodeFooter(mmapBytes, sstTypeIndex); err != nil {
+	if _, err := decodeFooter(mmapBytes, fileTypeIndex); err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("sparse index decode %w", err)
 	}
 
-	idx, _, err := decodeSparseIndex(mmapBytes[:len(mmapBytes)-sstFooterLen])
+	idx, _, err := decodeSparseIndex(mmapBytes[:len(mmapBytes)-footerLen])
 	if err != nil {
 		_ = fs.Unmap(mmapBytes)
 		return nil, fmt.Errorf("sparse index decode %w", err)

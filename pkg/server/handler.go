@@ -9,7 +9,7 @@ import (
 	"net/http"
 
 	"github.com/yashgorana/quxdb/pkg/bufpool"
-	"github.com/yashgorana/quxdb/pkg/db"
+	"github.com/yashgorana/quxdb/pkg/quxdb"
 )
 
 var (
@@ -53,15 +53,15 @@ func readValue(w http.ResponseWriter, r *http.Request, buf *bufpool.Buf) ([]byte
 	var body []byte
 	var err error
 	switch n := r.ContentLength; {
-	case n > db.MaxValueSize:
-		err = &http.MaxBytesError{Limit: db.MaxValueSize}
+	case n > quxdb.MaxValueSize:
+		err = &http.MaxBytesError{Limit: quxdb.MaxValueSize}
 	case n > 0:
 		*buf = bufpool.Get(uint(n))
 		_, err = io.ReadFull(r.Body, buf.B)
 		body = buf.B
 	case n < 0:
 		// chunked
-		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, db.MaxValueSize))
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, quxdb.MaxValueSize))
 	}
 	if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		http.Error(w, fmt.Sprintf("value exceeds %d bytes limit", maxErr.Limit), http.StatusRequestEntityTooLarge)

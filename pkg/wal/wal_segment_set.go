@@ -1,8 +1,10 @@
 package wal
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,18 +18,19 @@ import (
 
 const (
 	segmentOpenMaxWorkers = 8
-	walMaxSpares          = 2 // pruned segments kept for reuse
+	segmentMaxSpares      = 2 // pruned segments kept for reuse
 
-	walDir       = "wal"
-	walTmpSuffix = ".tmp"
+	segmentDir       = "wal"
+	segmentTmpSuffix = ".tmp"
 	// a full-size file outside the log, free to reuse as a segment
-	walPreparedSuffix = ".prepared"
+	segmentPreparedSuffix = ".prepared"
 )
 
 // segmentSet owns the segment files, mu guards membership.
 type segmentSet struct {
 	dir     string
 	segSize uint64
+	log     *slog.Logger
 
 	mu         sync.Mutex
 	segments   []*walSegment
@@ -43,12 +46,13 @@ type segmentSet struct {
 	done      chan struct{}
 }
 
-func newSegmentSet(dir string, segSize uint64) *segmentSet {
+func newSegmentSet(dir string, segSize uint64, log *slog.Logger) *segmentSet {
 	s := &segmentSet{
 		dir:      dir,
 		segments: make([]*walSegment, 0),
 		byID:     make(map[segID]*walSegment),
 		segSize:  segSize,
+		log:      log,
 	}
 	s.prepared.L = &s.mu
 	return s
@@ -60,7 +64,7 @@ func (s *segmentSet) open() error {
 	}
 
 	// Segment names are ordered by (createdAt ASC, segID ASC).
-	segments, spares, err := scanSegments(s.dir, s.segSize)
+	segments, spares, err := scanSegments(s.dir, s.segSize, s.log)
 	if err != nil {
 		return fmt.Errorf("wal open: %w", err)
 	}
@@ -127,9 +131,9 @@ func (s *segmentSet) rollover() error {
 	defer s.mu.Unlock()
 
 	// the preparer is building the segment this rollover needs
-	observe := metrics.WalRolloverPrepared
+	observe, source := metrics.WalRolloverPrepared, "prepared"
 	for s.preparing {
-		observe = metrics.WalRolloverStalled
+		observe, source = metrics.WalRolloverStalled, "stalled"
 		s.prepared.Wait()
 	}
 
@@ -150,7 +154,7 @@ func (s *segmentSet) rollover() error {
 			return errors.Join(err, seg.close(), old.openReadWrite())
 		}
 	} else {
-		observe = metrics.WalRolloverUnprepared
+		observe, source = metrics.WalRolloverUnprepared, "unprepared"
 		var err error
 		if seg, err = s.buildSegment(s.takeSpareLocked(), nextID, ""); err != nil {
 			if old == nil {
@@ -160,7 +164,7 @@ func (s *segmentSet) rollover() error {
 		}
 	}
 
-	fmt.Printf("wal: segment active sid=%d\n", seg.segId)
+	s.log.Info("segment active", "segment", seg.segId, "startLSN", seg.startLSN, "source", source)
 	s.segments = append(s.segments, seg)
 	s.byID[seg.segId] = seg
 	s.active = seg
@@ -211,7 +215,7 @@ func (s *segmentSet) prepareLoop() {
 // prepareNext builds segment active+1 unless it is ready, preferring a spare over a new file.
 func (s *segmentSet) prepareNext() {
 	if err := s.prune(); err != nil {
-		fmt.Printf("wal: prune before prepare: %v\n", err)
+		s.log.Error("prune before prepare failed", "err", err)
 	}
 
 	s.mu.Lock()
@@ -224,14 +228,16 @@ func (s *segmentSet) prepareNext() {
 	s.preparing = true
 	s.mu.Unlock()
 
-	seg, err := s.buildSegment(spare, id, walPreparedSuffix)
+	start := time.Now()
+	seg, err := s.buildSegment(spare, id, segmentPreparedSuffix)
 
 	s.mu.Lock()
 	s.preparing = false
 	if err != nil {
-		fmt.Printf("wal: prepare segment id=%d: %v\n", id, err)
+		s.log.Error("prepare segment failed", "segment", id, "err", err)
 	} else {
 		s.next = seg
+		s.log.Debug("segment prepared", "segment", id, "fromSpare", spare != "", "took", time.Since(start))
 	}
 	s.prepared.Broadcast()
 	s.mu.Unlock()
@@ -250,19 +256,24 @@ func (s *segmentSet) takeSpareLocked() string {
 // buildSegment recycles spare into segment id named with suffix, or creates a new one without a spare.
 func (s *segmentSet) buildSegment(spare string, id segID, suffix string) (*walSegment, error) {
 	if spare != "" {
-		seg, err := recycleSegment(spare, s.dir, id, s.segSize, suffix)
+		seg, err := recycleSegment(spare, s.dir, id, s.segSize, suffix, s.log)
 		if err == nil {
 			return seg, nil
 		}
-		fmt.Printf("wal: dropping spare: %v\n", errors.Join(err, os.Remove(spare)))
+		s.log.Warn("dropping spare", "path", spare, "err", errors.Join(err, os.Remove(spare)))
 	}
-	return newSegment(s.dir, id, s.segSize, suffix)
+	return newSegment(s.dir, id, s.segSize, suffix, s.log)
 }
 
 // prune retires segments before the retain point's segment, their file io runs outside mu.
 func (s *segmentSet) prune() error {
 	s.mu.Lock()
 	retired := s.detachRetiredLocked()
+	if len(retired) == 0 && s.log.Enabled(context.Background(), slog.LevelDebug) {
+		from := LSN(s.retainFrom.Load())
+		s.log.Debug("prune freed nothing", "retainFrom", from, "retainSegment", lsnSegID(from, s.segSize),
+			"segments", len(s.segments))
+	}
 	s.mu.Unlock()
 	return s.retire(retired)
 }
@@ -289,32 +300,40 @@ func (s *segmentSet) detachRetiredLocked() []*walSegment {
 	return retired
 }
 
-// retire keeps detached segments for reuse up to walMaxSpares and deletes the rest.
+// retire keeps detached segments for reuse up to segmentMaxSpares and deletes the rest.
 func (s *segmentSet) retire(segs []*walSegment) error {
 	var errs []error
+	var reused, deleted int
 	for _, seg := range segs {
 		if err := seg.close(); err != nil {
 			errs = append(errs, fmt.Errorf("wal: close segment id=%d before prune: %w", seg.segId, err))
 			continue
 		}
-		spare := seg.path + walPreparedSuffix
+		spare := seg.path + segmentPreparedSuffix
 		if err := os.Rename(seg.path, spare); err != nil {
 			errs = append(errs, fmt.Errorf("wal: prune segment id=%d: %w", seg.segId, err))
 			continue
 		}
 
 		s.mu.Lock()
-		kept := len(s.spares) < walMaxSpares
+		kept := len(s.spares) < segmentMaxSpares
 		if kept {
 			s.spares = append(s.spares, spare)
 		}
 		s.mu.Unlock()
 
-		if !kept {
-			if err := os.Remove(spare); err != nil {
-				errs = append(errs, fmt.Errorf("wal: prune segment id=%d: %w", seg.segId, err))
-			}
+		if kept {
+			reused++
+			continue
 		}
+		if err := os.Remove(spare); err != nil {
+			errs = append(errs, fmt.Errorf("wal: prune segment id=%d: %w", seg.segId, err))
+			continue
+		}
+		deleted++
+	}
+	if reused+deleted > 0 {
+		s.log.Info("pruned segments", "reused", reused, "deleted", deleted)
 	}
 	return errors.Join(errs...)
 }
@@ -356,7 +375,7 @@ func (s *segmentSet) truncateTail(lsn LSN) error {
 	return errors.Join(errs...)
 }
 
-// tornTail reports whether no Record starts after the one at lsn.
+// tornTail reports whether no Entry starts after the one at lsn.
 func (s *segmentSet) tornTail(lsn LSN) (bool, error) {
 	seg, err := s.segmentForLSN(lsn)
 	if err != nil {
@@ -373,14 +392,14 @@ func (s *segmentSet) tornTail(lsn LSN) (bool, error) {
 	return true, nil
 }
 
-func scanSegments(dir string, segmentSize uint64) ([]*walSegment, []string, error) {
-	files, err := filepath.Glob(filepath.Join(dir, walDir, "*.quxwal"))
+func scanSegments(dir string, segmentSize uint64, log *slog.Logger) ([]*walSegment, []string, error) {
+	files, err := filepath.Glob(filepath.Join(dir, segmentDir, "*.quxwal"))
 	if err != nil {
 		return nil, nil, fmt.Errorf("wal: discover segments %w", err)
 	}
-	spares, _ := filepath.Glob(filepath.Join(dir, walDir, "*.quxwal"+walPreparedSuffix))
+	spares, _ := filepath.Glob(filepath.Join(dir, segmentDir, "*.quxwal"+segmentPreparedSuffix))
 	// segments that never finished zero-filling
-	stale, _ := filepath.Glob(filepath.Join(dir, walDir, "*.quxwal"+walTmpSuffix))
+	stale, _ := filepath.Glob(filepath.Join(dir, segmentDir, "*.quxwal"+segmentTmpSuffix))
 	for _, path := range stale {
 		if err := os.Remove(path); err != nil {
 			return nil, nil, fmt.Errorf("wal: remove stale segment %w", err)
@@ -410,7 +429,7 @@ func scanSegments(dir string, segmentSize uint64) ([]*walSegment, []string, erro
 		go func() {
 			defer workers.Done()
 			for task := range tasks {
-				seg, err := openSegment(task.path, segmentSize, task.mode)
+				seg, err := openSegment(task.path, segmentSize, task.mode, log)
 				results <- result{index: task.index, seg: seg, err: err}
 			}
 		}()

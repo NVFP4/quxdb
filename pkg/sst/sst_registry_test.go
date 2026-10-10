@@ -19,7 +19,7 @@ func TestFailedOpenAndRetirementStillRemovesTable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid-table")
 	require.NoError(t, os.Mkdir(path, 0o755))
 	meta := &Metadata{ID: 7, Path: path}
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 
 	require.Error(t, registry.Open([]*Metadata{meta}))
 
@@ -29,7 +29,7 @@ func TestFailedOpenAndRetirementStillRemovesTable(t *testing.T) {
 }
 
 func TestRetiredTableStaysReadableUntilViewRelease(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	meta := testTable(t, t.TempDir())
 	view := requireView(t, registry, []*Metadata{meta})
 
@@ -43,7 +43,7 @@ func TestRetiredTableStaysReadableUntilViewRelease(t *testing.T) {
 }
 
 func TestRetirementWaitsForEveryView(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	meta := testTable(t, t.TempDir())
 	first := requireView(t, registry, []*Metadata{meta})
 	second := registry.View([]*Metadata{meta})
@@ -57,7 +57,7 @@ func TestRetirementWaitsForEveryView(t *testing.T) {
 }
 
 func TestRetiringUnpinnedTableRemovesItImmediately(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	meta := testTable(t, t.TempDir())
 
 	registry.Retire([]*Metadata{meta})
@@ -66,7 +66,7 @@ func TestRetiringUnpinnedTableRemovesItImmediately(t *testing.T) {
 }
 
 func TestViewPinsMultipleTablesIndependently(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	first := testTable(t, t.TempDir())
 	second := testTable(t, t.TempDir())
 	view := requireView(t, registry, []*Metadata{first, second})
@@ -83,7 +83,7 @@ func TestViewPinsMultipleTablesIndependently(t *testing.T) {
 }
 
 func TestCloseWaitsForBackgroundRemoval(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	meta := testTable(t, t.TempDir())
 	view := requireView(t, registry, []*Metadata{meta})
 

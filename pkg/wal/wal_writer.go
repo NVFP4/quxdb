@@ -10,26 +10,26 @@ import (
 	"github.com/yashgorana/quxdb/pkg/metrics"
 )
 
-// Durability is how far a Record must get before Append returns.
+// Durability is how far an Entry must get before Append returns.
 type Durability uint8
 
 const (
-	// DurabilityWritten returns once the OS has the Record, a crash can still lose it.
+	// DurabilityWritten returns once the OS has the Entry, a crash can still lose it.
 	DurabilityWritten Durability = iota
-	// DurabilitySynced returns once the Record survives a crash.
+	// DurabilitySynced returns once the Entry survives a crash.
 	DurabilitySynced
 )
 
-// walWriter frames and writes Records on the appending goroutine, one walRecord per pwritev.
+// walWriter frames and writes Entries on the appending goroutine, one walRecord per pwritev.
 type walWriter struct {
 	segments *segmentSet
 
 	recovered bool
 	err       error // sticky, set by the first io error
 
-	hdr     [walRecordHeaderLen]byte
-	trailer [walRecordMetaLen + 7]byte // crc and padding
-	iovecs  [][]byte                   // one record in write order
+	hdr     [recordHeaderLen]byte
+	trailer [recordMetaLen + 7]byte // crc and padding
+	iovecs  [][]byte                // one record in write order
 }
 
 func newWalWriter(segments *segmentSet) *walWriter {
@@ -86,14 +86,14 @@ func (w *walWriter) writeRecord(parts [][]byte, d Durability) (LSN, error) {
 		if first {
 			lsn = recLSN
 		}
-		flags := walRecFull
+		flags := recordFull
 		switch {
 		case first && n < left:
-			flags = walRecPartialStart
+			flags = recordPartialStart
 		case !first && n < left:
-			flags = walRecPartialMiddle
+			flags = recordPartialMiddle
 		case !first:
-			flags = walRecPartialEnd
+			flags = recordPartialEnd
 		}
 		h := walRecordHeader{
 			lsn:      uint64(recLSN),
@@ -117,15 +117,15 @@ func (w *walWriter) writeRecord(parts [][]byte, d Durability) (LSN, error) {
 			}
 		}
 
-		trailer := w.trailer[:int(h.recLen)-walRecordHeaderLen-n]
+		trailer := w.trailer[:int(h.recLen)-recordHeaderLen-n]
 		binary.LittleEndian.PutUint32(trailer, crc)
-		clear(trailer[walRecordMetaLen:])
+		clear(trailer[recordMetaLen:])
 		w.iovecs = append(w.iovecs, trailer)
 
 		end := seg.cursor + uint64(h.recLen)
 		if recordCapacity(seg.segMaxSize-end) >= 0 {
 			// overwritten by the next record
-			w.iovecs = append(w.iovecs, endMarker[:])
+			w.iovecs = append(w.iovecs, segmentEndMarker[:])
 		}
 		start := time.Now()
 		written, err := fs.Pwritev(seg.file, w.iovecs, int64(seg.cursor))

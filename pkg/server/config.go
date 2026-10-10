@@ -6,41 +6,25 @@ import (
 )
 
 const (
-	DefaultHost    = "0.0.0.0"
-	DefaultPort    = 7129
-	DefaultDataDir = "./quxdata"
+	DefaultHost = "0.0.0.0"
+	DefaultPort = 7129
 )
 
-type QuxServerConfig struct {
-	Host    string
-	Port    uint16
-	DataDir string
+// Config holds the http listener address.
+type Config struct {
+	Host string `yaml:"host"`
+	Port uint16 `yaml:"port"`
 }
 
-func NewConfig() QuxServerConfig {
-	return QuxServerConfig{
-		Host:    DefaultHost,
-		Port:    DefaultPort,
-		DataDir: DefaultDataDir,
+// DefaultConfig returns the default listener address.
+func DefaultConfig() Config {
+	return Config{
+		Host: DefaultHost,
+		Port: DefaultPort,
 	}
 }
 
-func (c QuxServerConfig) WithHost(host string) QuxServerConfig {
-	c.Host = host
-	return c
-}
-
-func (c QuxServerConfig) WithPort(port uint16) QuxServerConfig {
-	c.Port = port
-	return c
-}
-
-func (c QuxServerConfig) WithDataDir(dataDir string) QuxServerConfig {
-	c.DataDir = dataDir
-	return c
-}
-
-func (config QuxServerConfig) Addr() string {
+func (config Config) Addr() string {
 	if config.Host == "" {
 		config.Host = DefaultHost
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func TestViewReadsTable(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	meta := testTable(t, t.TempDir())
 	view := requireView(t, registry, []*Metadata{meta})
 
@@ -23,7 +23,7 @@ func TestViewReadsTable(t *testing.T) {
 }
 
 func TestRetainedViewOutlivesCreatorRelease(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	meta := testTable(t, t.TempDir())
 	view := requireView(t, registry, []*Metadata{meta})
 	registry.Retire([]*Metadata{meta})
@@ -40,7 +40,7 @@ func TestRetainedViewOutlivesCreatorRelease(t *testing.T) {
 }
 
 func TestNextViewDropsTableForDeletion(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	kept := testTable(t, t.TempDir())
 	removed := testTable(t, t.TempDir())
 	added := testTable(t, t.TempDir())
@@ -62,7 +62,7 @@ func TestNextViewDropsTableForDeletion(t *testing.T) {
 }
 
 func TestFailedOpenLeavesExistingViewUsable(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	kept := testTable(t, t.TempDir())
 	invalid := &Metadata{ID: 9, Path: filepath.Join(t.TempDir(), "missing")}
 	base := requireView(t, registry, []*Metadata{kept})
@@ -77,7 +77,7 @@ func TestFailedOpenLeavesExistingViewUsable(t *testing.T) {
 }
 
 func TestConcurrentRetainReleaseDelaysRetirementUntilAllRelease(t *testing.T) {
-	registry := NewRegistry()
+	registry := NewRegistry(testLogger)
 	meta := testTable(t, t.TempDir())
 	view := requireView(t, registry, []*Metadata{meta})
 	registry.Retire([]*Metadata{meta})
